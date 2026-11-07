@@ -845,7 +845,7 @@ $ ip6tables -t nat -S
 -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
 -A OUTPUT ! -d ::1/128 -m addrtype --dst-type LOCAL -j DOCKER
                                    <-- the DOCKER chain is EMPTY. No DNAT rules whatsoever.
-$ docker network inspect aikserver_default | grep EnableIPv6
+$ docker network inspect webapp_default | grep EnableIPv6
 "EnableIPv6": false
 $ sysctl net.ipv6.conf.all.forwarding
 net.ipv6.conf.all.forwarding = 0
@@ -1142,7 +1142,7 @@ This is a genuinely elegant design and it is worth restating as the general prin
 ### 6.4 Name resolution: user-defined networks vs the default bridge vs `--link`
 
 `[C]` **HIGH** — Docker's docs are explicit about the asymmetry: on **user-defined** networks containers *"can communicate with each other using container IP addresses or container names"*; on the **default** bridge they *"have unrestricted network access to each other using container IP addresses. They cannot refer to each other by name."*
-`[O]` **HIGH** — Consistent with the host: all five containers are on the user-defined `aikserver_default`, and the compose app relies on name resolution (`aikserver-redis-1`, `aikserver-web-1`, …). Nothing is on the default bridge.
+`[O]` **HIGH** — Consistent with the host: all five containers are on the user-defined `webapp_default`, and the compose app relies on name resolution (`webapp-redis-1`, `webapp-web-1`, …). Nothing is on the default bridge.
 
 `[C]` **HIGH** — **`--link` is the legacy mechanism and it worked completely differently**: it injected `/etc/hosts` entries (and environment variables) into the *dependent* container at start time. Its fatal flaws: static — if the target container restarted with a new IP, the entries were stale; unidirectional; required declaring the dependency at `docker run` time, so it could not express a cycle; and it polluted the environment with `<NAME>_PORT_80_TCP_ADDR`-style variables. It is deprecated.
 `[R]` **HIGH** — **Do not implement `--link`.** It is strictly worse than a resolver and it is deprecated in the thing we are copying. The `/etc/hosts` injection trick is, however, *exactly the right MVP* (below) — the mistake in `--link` was making it a user-facing dependency declaration, not the file-writing itself.
@@ -1484,7 +1484,7 @@ $ ip route | grep 172.19
 
 $ docker network ls
 NETWORK ID     NAME                DRIVER    SCOPE
-5e08a4608e57   aikserver_default   bridge    local
+5e08a4608e57   webapp_default   bridge    local
 b71690695ed7   bridge              bridge    local
 daf6e4530759   host                host      local
 6a0da1cea444   none                null      local
@@ -1679,7 +1679,7 @@ globalScopeDefaultNetworks = []*NetworkToSplit{
 }
 ```
 `NetworkToSplit{Base, Size}` means "chop `Base` into subnets of length `Size`". So local scope is **31 × /16 out of 172.17–172.31, then 4096 × /20 out of 192.168.0.0/16** — 4127 networks maximum, each holding 65 534 or 4094 usable addresses. Global scope (Swarm overlay) is 10.0.0.0/8 in /24s. `[C]` — the widely-quoted `{"base":"172.17.0.0/12","size":16}` in `daemon.json` is the *equivalent user-facing spelling*, not the literal built-in list.
-`[O]` **HIGH** — `host-a` runs with no `/etc/docker/daemon.json` at all and has allocated `172.17.0.0/16` (docker0), `172.18.0.0/16` (`aikserver_default`) and `172.19.0.0/16` (the orphan, §9.3) — first-fit, in order.
+`[O]` **HIGH** — `host-a` runs with no `/etc/docker/daemon.json` at all and has allocated `172.17.0.0/16` (docker0), `172.18.0.0/16` (`webapp_default`) and `172.19.0.0/16` (the orphan, §9.3) — first-fit, in order.
 
 `[F]` **HIGH** — **The scarce resource is subnets, not addresses.** A /16 per network means address exhaustion inside a network is a non-event (65 534 containers). Running out of *networks* at 31 is entirely plausible on a CI box that creates a compose project per branch — and each leaked network like §9.3's permanently consumes one.
 

@@ -294,14 +294,14 @@ nothing written, no pulls):
 | `alpine:latest` | 1 | 1/1 | all | all (no `parent` at i=0, correct) |
 | `nginx:stable` | 7 | 7/7 | all | all |
 | `redis:7-alpine` | 8 | 8/8 | all | all |
-| `ghcr.io/aikynetix/aikpy-backend:latest` | 9 | 9/9 | all | all |
+| `ghcr.io/example-org/backend:latest` | 9 | 9/9 | all | all |
 
 Zero misses, zero mismatches. The formula, the space separator, the `sha256:`-prefixed inputs, and
 the bare-hex directory name are all exactly as described. A nice free cross-check fell out:
 `alpine:latest`'s single chain ID is `21ee5abca34e63fce933…`, identical to the `diff_ids[0]` I read
 out of the config blob over the network in the §2.9 trace — registry and local store agree.
 
-Note the 9-layer image the document cites is `ghcr.io/aikynetix/aikpy-backend`, a **GHCR-hosted,
+Note the 9-layer image the document cites is `ghcr.io/example-org/backend`, a **GHCR-hosted,
 non-Hub** image, which the document does not mention. That is worth saying out loud because §15
 claims "GHCR untested" — at least the *stored* form of a GHCR image was in fact exercised.
 

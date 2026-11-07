@@ -38,11 +38,11 @@ profile change. Where an experiment would have required a write, the experiment 
 Live containers observed (read-only `docker ps`):
 
 ```
-c087abc73246 aikserver-web-1      ghcr.io/aikynetix/aikpy-backend:v2.25.1
-4a820bcb9df9 aikserver-nginx-1    nginx:stable
-7bfda1b6dda9 aikserver-frontend-1 ghcr.io/aikynetix/aikweb-frontend:latest
-ed133d1fe199 aikserver-certbot-1  certbot/certbot
-12d16acf9cc0 aikserver-redis-1    redis:7-alpine
+c087abc73246 webapp-web-1      ghcr.io/example-org/backend:v2.25.1
+4a820bcb9df9 webapp-nginx-1    nginx:stable
+7bfda1b6dda9 webapp-frontend-1 ghcr.io/example-org/frontend:latest
+ed133d1fe199 webapp-certbot-1  certbot/certbot
+12d16acf9cc0 webapp-redis-1    redis:7-alpine
 ```
 
 **ROCKY** — `old-host` (`OLD-HOST`, the university ARCC Slurm login node),
@@ -1497,7 +1497,7 @@ to be one". Substituting into the formula: `P'(permitted) = P(bounding)`, `P'(ef
 `execve`, whatever we set P and E to beforehand.** This is exactly why Docker's numbers
 look the way they do.
 
-`[O]` HOST-A, HIGH — measured on the live `aikserver-web-1` container:
+`[O]` HOST-A, HIGH — measured on the live `webapp-web-1` container:
 
 ```
 $ ssh host-a 'grep -E "^(Uid|Cap|NoNewPrivs|Seccomp)" /proc/2590614/status'
@@ -1520,7 +1520,7 @@ P = E = B, I = A = 0. Fourteen capabilities.
 
 ### 7.3 The non-root case — measured, and it is the interesting one
 
-`[O]` HOST-A, HIGH — `aikserver-redis-1` runs `USER redis` (uid 999):
+`[O]` HOST-A, HIGH — `webapp-redis-1` runs `USER redis` (uid 999):
 
 ```
 $ ssh host-a 'grep -E "^(Uid|Gid|Cap)" /proc/82271/status'

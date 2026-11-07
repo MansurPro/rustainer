@@ -888,7 +888,7 @@ Verified after the final experiment:
 mounts under /tmp                 -> only the system tmpfs
 overlay mounts in /proc/mounts    -> 5, all under /var/lib/docker/   (0 foreign)
 /var/lib/docker/overlay2 entries  -> 107   (unchanged from session start)
-docker ps                         -> aikserver-{web,nginx,frontend,certbot,redis} all Up
+docker ps                         -> webapp-{web,nginx,frontend,certbot,redis} all Up
 uptime                            -> 189 days, load 0.02
 ```
 

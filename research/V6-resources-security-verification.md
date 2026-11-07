@@ -268,7 +268,7 @@ is set", and it is a cheap extra hardening knob worth an `[R]`.
 Re-ran on HOST-A; identical to the document, byte for byte:
 
 ```
-/proc/2590614/status (aikserver-web-1)      /proc/82271/status (aikserver-redis-1)
+/proc/2590614/status (webapp-web-1)      /proc/82271/status (webapp-redis-1)
 Uid: 0 0 0 0                                 Uid: 999 999 999 999
 CapInh: 0000000000000000                     Gid: 1000 1000 1000 1000
 CapPrm: 00000000a80425fb                     CapInh: 0000000000000000
@@ -291,7 +291,7 @@ AUDIT_WRITE(29), SETFCAP(31) — **exactly 14**, and exactly the set in moby v28
 21 (SYS_ADMIN). `CAP_LAST_CAP` on 6.11 is 40, so 41 total and 27 dropped — the document's
 arithmetic is right.
 
-**CORRECTED — the attribution of redis's uid 999.** The document says "`aikserver-redis-1`
+**CORRECTED — the attribution of redis's uid 999.** The document says "`webapp-redis-1`
 runs `USER redis` (uid 999)". `docker inspect -f '{{.Config.User}}'` is **empty** for all
 five containers on the host, and `redis:7-alpine` has no `USER` directive — its
 `docker-entrypoint.sh` does `exec su-exec redis "$0" "$@"`. So the uid change is an
@@ -1589,7 +1589,7 @@ trap the brief asked me to check for, and it is not present.
    client-visible warning.
 8. **§10.3** — "only **7** [masked paths] appear in the live mountinfo": it is **8**
    (12 − 4 absent). Re-counted from mountinfo.
-9. **§7.3** — `aikserver-redis-1` does **not** run `USER redis`. `Config.User` is empty on
+9. **§7.3** — `webapp-redis-1` does **not** run `USER redis`. `Config.User` is empty on
    all five containers; the uid change is `su-exec` in `redis:7-alpine`'s entrypoint. The
    measurement is evidence about the kernel's uid-change rule, not about runtime behaviour.
 10. **§8.5** — `syslog` is gated on `CAP_SYS_ADMIN` **or `CAP_SYSLOG`**; `reboot` on
