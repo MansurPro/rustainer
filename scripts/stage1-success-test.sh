@@ -29,12 +29,31 @@ if [ "$(uname -s)" != "Linux" ]; then
     echo "This test needs a Linux kernel; see the header for the one-liner." >&2
     exit 2
 fi
-if [ "$(id -u)" != "0" ]; then
-    echo "This test needs root: CLONE_NEWPID requires CAP_SYS_ADMIN." >&2
+# Express the requirement as "this operation, in this namespace, needs this
+# capability" rather than "we are root" (RND.md section 18.6). The difference
+# is not pedantry: it is what lets this same test run unprivileged inside a
+# user namespace, which is stage 11's whole premise. Code that assumes root
+# does not announce itself - it simply omits this branch.
+have_cap_sys_admin() {
+    local eff low
+    eff=$(awk '/^CapEff:/{print $2}' /proc/self/status) || return 1
+    low=${eff: -8}            # CAP_SYS_ADMIN is bit 21, so the low word is enough
+    (( (0x$low >> 21) & 1 ))
+}
+if ! have_cap_sys_admin; then
+    cat >&2 <<'MSG'
+This test needs CAP_SYS_ADMIN in the current user namespace, because
+CLONE_NEWPID does. Two ways to get it:
+
+  sudo bash scripts/stage1-success-test.sh
+
+  unshare --user --map-root-user bash scripts/stage1-success-test.sh
+      (no root needed, if /proc/sys/user/max_user_namespaces > 0)
+MSG
     exit 2
 fi
 
-echo "kernel $(uname -r) $(uname -m), uid $(id -u)"
+echo "kernel $(uname -r) $(uname -m), uid $(id -u), userns $(readlink /proc/self/ns/user)"
 # CI builds as the unprivileged runner and passes the binary in, because
 # rustup has no default toolchain for root and installing one just to build
 # is slower than not needing to.
@@ -134,7 +153,9 @@ fi
 
 echo
 echo "6. Unsupported options refuse, and say what would support them"
-"$B" run --rootfs /tmp --network host /bin/true 2>&1 | grep -q 'stage 2'  && ok "--rootfs <dir> refuses"   || bad "--rootfs <dir> did not refuse"
+# A directory rootfs is stage 2's job and is supported now; what must still
+# refuse is a rootfs that is not a directory at all.
+"$B" run --rootfs /etc/hostname --network host /bin/true 2>&1 | grep -q 'not a directory' && ok "a non-directory rootfs refuses" || bad "a non-directory rootfs did not refuse"
 "$B" run --rootfs / --network bridge /bin/true 2>&1 | grep -q 'stage 9'   && ok "--network bridge refuses" || bad "--network bridge did not refuse"
 "$B" run --rootfs / --network host sh 2>&1 | grep -q 'absolute path'      && ok "relative command refuses" || bad "relative command did not refuse"
 
