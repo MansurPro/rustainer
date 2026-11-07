@@ -424,7 +424,7 @@ is the well-known one and the `[R]` MED ("acceptable only until we support `-v �
 
 ### D7. §4.4 the Docker mount table — **CONFIRMED, re-measured on the same container**
 
-Re-read `/proc/82271/mountinfo` (container `12d16acf9cc0` / `aikserver-redis-1`, still running):
+Re-read `/proc/82271/mountinfo` (container `12d16acf9cc0` / `webapp-redis-1`, still running):
 ```
 /               overlay   rw,relatime                                    <- none of the three
 /proc           proc      rw,nosuid,nodev,noexec,relatime

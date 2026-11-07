@@ -1780,7 +1780,7 @@ overlay mount:  lowerdir = Ln : Ln-1 : ... : L1 : L0
 **`lowerdir` is the REVERSE of `diff_ids`.**
 
 `[O]` HOST-A 6.11.0-29, Docker 28.3.1 HIGH — **verified end-to-end against a live production
-container** (a 9-layer `ghcr.io/aikynetix/aikpy-backend:v2.25.1`). I took the image config's
+container** (a 9-layer `ghcr.io/example-org/backend:v2.25.1`). I took the image config's
 `diff_ids`, computed all nine chain IDs with the §4.5 formula, read each
 `layerdb/sha256/<chainID>/cache-id` to get the overlay2 directory name, then resolved the running
 container's `lowerdir` entries through the `l/` symlinks and compared:

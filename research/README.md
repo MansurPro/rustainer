@@ -7,6 +7,13 @@ runtime core, not shelling out to runc/crun/containerd).
 [`../RND.md`](../RND.md) — start there; it is the digest and the router into this folder.
 No code has been written, and none should be until a specification session has read `RND.md`.
 
+> **A second, independent run of this same brief exists** in
+> [`pass-2/`](pass-2/README.md): the plan in `00-RESEARCH-PLAN.md` was executed twice by
+> separate sessions with no visibility into each other. `00-RESEARCH-PLAN.md` and
+> `D1-kernel-isolation.md` are byte-identical between the two; everything after them
+> diverged. Neither run supersedes the other, and `pass-2/README.md` lists the four points
+> where they substantively disagree.
+
 **Read order for a fresh session:** `RND.md` Priority Index → the individual `RND.md` section
 you need → only then the `research/` file that section points to.
 
