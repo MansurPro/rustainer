@@ -1419,3 +1419,1037 @@ host value AFTER: 1024        # unchanged
 `[R]` **MED** — For rootless port publishing, implement the **`builtin`-style accept-and-relay proxy ourselves** (§8.4) rather than depending on RootlessKit: it is ~100 lines, it is the same accept/connect/copy loop we already need for the IPv4-loopback and IPv6 cases in §4.4, and it is 4× faster than routing ports through the usermode stack. Skip `IP_TRANSPARENT` initially; add it when someone needs real client IPs, and only for TCP.
 
 ---
+
+## 9. Host state that outlives our process
+
+> **Numbering note.** §1.6, §2.6, §3.3, §4.4 and §5.4 all forward-reference "§10" for cleanup / partial state / reconciliation, and §6.5 references "§11" for sticky IPAM. Those references land on **this section (§9)** and on **§10 (IPAM)** respectively. The stale pointers are listed in §14 for the verification pass; I have not edited the earlier text.
+
+This is the section that changes the shape of our design rather than adding a feature. Every other section describes what to build; this one describes what happens when we don't finish building it.
+
+### 9.1 The inventory: what dies with us, what doesn't
+
+`[F]` **HIGH** — Complete accounting of the host state a single container start touches, and who frees it:
+
+| Object | Freed when our process dies? | Freed by | Cost of leaking it |
+|---|---|---|---|
+| container-side veth (`eth0`) | **yes** | kernel, when netns is freed (§1.6) | none |
+| host-side veth | **yes** | kernel, deleting either end deletes both (`veth(4)`) | none |
+| the netns itself | **only if nothing pins it** | last process exit / last fd close / **umount of the bind mount** | *the* leak: pins veth, ifindexes, sysctls, nft tables forever |
+| nsfs bind mount at `/run/mydocker/netns/<id>` | **no** | `umount2()` + `unlink()`, by us, explicitly | pins the netns above |
+| the bridge | **no** | `RTM_DELLINK`, by us, explicitly | a permanently-UP device holding an address and an on-link route |
+| the bridge's address + kernel connected route | **no** | dies with the bridge | burns a subnet from our pool (§10.3) |
+| `nat/POSTROUTING` MASQUERADE for the subnet | **no** | rule delete, by us | masquerades a subnet nobody owns |
+| `raw/PREROUTING` anti-spoof rule per container IP (§4.5) | **no** | rule delete, by us | drops traffic to an address that may be reassigned |
+| DNAT + filter ACCEPT per published port | **no** | rule delete, by us | **security-relevant**: see §9.4 |
+| IPAM allocation | depends entirely on where we put it | see §10 | pool exhaustion, or worse, double-allocation |
+| userland-proxy helper process | **no** — reparented to pid 1 | kill, by us | holds a host port hostage; `EADDRINUSE` forever |
+| `net.ipv4.ip_forward = 1` | **no** | never; we must not revert it blindly (§1.1) | the host is now a router |
+| `filter/FORWARD` policy DROP (§3.3) | **no** | never | can break the admin's own routing |
+| generated `/etc/hosts`, `/etc/resolv.conf` + their bind mounts | **no** | umount + unlink, by us | mount-table clutter, D3's domain |
+| **conntrack entries** | **no** | timeout, or explicit flush | see §9.5 — silently defeats *correct* rules |
+
+`[R]` **HIGH** — Two conclusions fall straight out of that table and they should drive the code:
+1. **veth needs no cleanup code at all** (already established in §1.6). Do not write it. Every line of veth teardown you write is a line that can fail and leave you in a worse state than doing nothing.
+2. **Every remaining row is a thing we wrote and only we can unwrite.** That means our teardown path is not a nicety — it is the only garbage collector on the host. And a teardown path that only runs on the happy path is not a garbage collector, it is a hope.
+
+### 9.2 A live leak, on the production host, found by accident
+
+`[O]` **HIGH** — `my-droplet` (`AIKYNETIX-PROD-NY`, Ubuntu 24.10, kernel 6.11.0-29-generic, Docker 28.3.1), read-only inspection. §3.1 recorded three bridges without remarking on it. Here is what the third one actually is:
+
+```
+$ docker network ls
+NETWORK ID     NAME                DRIVER    SCOPE
+9d68a0cc943b   aikserver_default   bridge    local     -> 172.18.0.0/16
+f8b0597542e5   bridge              bridge    local     -> 172.17.0.0/16 (docker0)
+7d220e3d8bb1   host                host      local
+81f2952c2508   none                null      local
+                                             ^^^ nothing owns 172.19.0.0/16
+
+$ ip -d link show br-0d4cf39c58f7
+26: br-0d4cf39c58f7: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 state DOWN
+    bridge ... stp_state 0 ageing_time 30000 fdb_n_learned 0 ...
+$ ip -o addr show br-0d4cf39c58f7
+26: br-0d4cf39c58f7    inet 172.19.0.1/16 brd 172.19.255.255 scope global
+$ bridge link show
+    ... five ports, ALL master br-9d68a0cc943b, none on br-0d4cf39c58f7
+
+$ iptables -t nat -S POSTROUTING
+-A POSTROUTING -s 172.19.0.0/16 ! -o br-0d4cf39c58f7 -j MASQUERADE     <-- ORPHAN
+
+$ iptables -t raw -S
+-A PREROUTING -d 172.19.0.2/32 ! -i br-0d4cf39c58f7 -j DROP            <-- ORPHAN
+-A PREROUTING -d 172.19.0.3/32 ! -i br-0d4cf39c58f7 -j DROP            <-- ORPHAN
+(plus the five live 172.18.x rules)
+
+$ iptables -t filter -S | grep -E '172\.19|br-0d4cf39c58f7'
+(empty)
+```
+
+Read that carefully, because the pattern is the finding:
+
+- A **bridge device** exists, administratively UP, holding `172.19.0.1/16` and therefore an on-link route, with **zero ports** and `fdb_n_learned 0`.
+- **No Docker network claims that subnet.** The network `0d4cf39c58f7` is gone from Docker's store.
+- The **nat MASQUERADE** rule for the dead subnet is still installed.
+- **Two `raw/PREROUTING` anti-spoof rules survive for two container IPs** (`172.19.0.2`, `172.19.0.3`) belonging to containers that no longer exist on a network that no longer exists. These are per-container rules (§4.5), so this is not one leak, it is one leak *per container that ever ran on that network*.
+- The **filter-table** rules for that bridge are **gone**.
+
+`[O]` **HIGH** — and the daemon is not configured for live-restore, which matters for §9.3: `docker info` → `ServerVersion = 28.3.1`, `LiveRestoreEnabled = False`, `FirewallBackend = {Driver: iptables}`, `DefaultAddressPools = None`.
+
+`[R]` **HIGH** — The asymmetry (filter cleaned, nat + raw + device leaked) is the whole lesson, and §9.3 explains the mechanism. **Docker's filter chains are rebuilt from scratch at daemon start, so anything that is not in the store disappears from them; the nat rules, the raw rules, and the bridge device are written once at network-create time and are only removed by an explicit network-delete that reaches completion.** Once the store record is gone, nothing can ever find them again.
+
+`[LOW→MED]` on the *provenance* of this particular orphan — I did not establish whether it came from a `docker network rm` that partially failed, a daemon kill during removal, or a `docker-compose down` race. **What would settle it:** `journalctl -u docker | grep -i '0d4cf39c58f7'`, which I did not run (read-only budget, and the logs have almost certainly rotated since; the bridge's ifindex 26 vs. the live bridge's 67 says it is old). The *state* is `[O]` HIGH regardless of how it got there, and the state is the point: **this is what a naive implementation leaves behind, observed in production, on a host that has never had a networking outage.**
+
+### 9.3 What Docker actually does about it — primary source
+
+`[C]` **HIGH** — Docker has no background reconciler. It has a **startup GC**, and its shape is worth copying almost exactly. From `libnetwork.New()`, `moby/daemon/libnetwork/controller.go`, verbatim and in order:
+
+```go
+	// Reserve pools first before doing cleanup. Otherwise the
+	// cleanups of endpoint/network and sandbox below will
+	// generate many unnecessary warnings
+	c.reservePools()
+
+	if err := c.sandboxRestore(c.cfg.ActiveSandboxes); err != nil {
+		log.G(ctx).WithError(err).Error("error during sandbox cleanup")
+	}
+
+	// Cleanup resources
+	if err := c.cleanupLocalEndpoints(); err != nil {
+		log.G(ctx).WithError(err).Warnf("error during endpoint cleanup")
+	}
+	c.networkCleanup()
+	...
+	c.setupPlatformFirewall()
+```
+Source: <https://github.com/moby/moby/blob/master/daemon/libnetwork/controller.go>
+
+Four distinct mechanisms, and each answers a different question:
+
+**1. `reservePools()` — rebuild derived state by replay.** It walks the persisted networks, re-runs `ipamAllocate()` for each pool, then walks each network's *persisted endpoints* and re-reserves each address. The IPAM index is not persisted; it is reconstructed. Details in §10.2.
+
+**2. `sandboxRestore(activeSandboxes)` — the liveness join.** For every persisted sandbox: if its id is in `activeSandboxes` (populated by the daemon only under live-restore, from containers found still running), restore it; **otherwise**, `moby/daemon/libnetwork/sandbox_store.go`:
+```go
+		if !isRestore {
+			log.G(ctx).Info("Removing stale sandbox")
+			if err := sb.delete(context.WithoutCancel(ctx), true); err != nil {
+				log.G(ctx).WithError(err).Warn("Failed to delete sandbox while trying to clean up")
+			}
+			continue
+		}
+```
+Note `sb.delete(ctx, true)` — the `true` is `force`. `[F]` **HIGH** — the consequence, which explains a great deal of real-world Docker behaviour: **without live-restore, every sandbox is "stale" at daemon start and is force-deleted.** That is why restarting `dockerd` tears down and rebuilds container networking, and it is why the `--live-restore` failure reports in §9.6 are all about the network.
+
+**3. `cleanupLocalEndpoints()` — mark and sweep.** `moby/daemon/libnetwork/endpoint.go`: build the set of endpoint ids referenced by *restored* sandboxes, then for every network, delete every persisted endpoint **not** in that set, logging `Removing stale endpoint`. This is a mark-and-sweep GC whose root set is the live sandboxes. Structurally identical to CNI's `GC` verb (§9.4).
+
+**4. `networkCleanup()` — tombstone retry.** `moby/daemon/libnetwork/store.go`, in full:
+```go
+func (c *Controller) networkCleanup() {
+	for _, n := range c.getNetworksFromStore(context.TODO()) {
+		if n.inDelete {
+			log.G(context.TODO()).Infof("Removing stale network %s (%s)", n.Name(), n.ID())
+			if err := n.delete(true, true); err != nil {
+				log.G(context.TODO()).Debugf("Error while removing stale network: %v", err)
+			}
+		}
+	}
+}
+```
+
+`[F]` **HIGH** — **And there is the bug that produced §9.2's orphan.** `networkCleanup` can only retry a delete for a network whose record still exists with `inDelete` set. The record is the *only* handle on the bridge name, the subnet, and therefore the rules. If the record is removed while host state remains, the garbage is **unreachable**: there is no tombstone, no name, nothing to sweep. `docker network ls` cannot show it, `docker network rm` cannot target it, `docker network prune` cannot find it. The only recovery is a human with `ip link delete` and `iptables -D`.
+
+`[R]` **HIGH** — **The invariant, stated as a rule we will actually enforce: the record must outlive the host state it describes.** Concretely: write the tombstone *before* the first host mutation of a teardown, and delete the record *after* the last host mutation succeeds. A delete that removes the record first is not "optimistic", it is a leak generator. This is one `if` in the right order and it is the difference between recoverable and unrecoverable garbage.
+
+`[C]` **MED** — On live-restore's actual limits, from Docker's own docs: *"The live restore option only works to restore containers if the daemon options, such as bridge IP addresses and graph driver, didn't change"* and it is *"only supported when installing patch releases (`YY.MM.x`), not for major (`YY.MM`) daemon upgrades"*. Source: <https://docs.docker.com/engine/daemon/live-restore/>. The docs are conspicuously silent on iptables. `[C]` **LOW→MED** — the field reports are not: rule recreation dominating restart time on hosts with many published ports, duplicated `nat/POSTROUTING` rules across restarts, and container-netns NAT tables (the §6.1 DNS rules) coming back broken. Sources: <https://github.com/moby/moby/issues/34906>, <https://github.com/moby/moby/issues/31647>, <https://forums.docker.com/t/live-restore-does-not-restore-iptables-rules/136677>. `[LOW]` because these are issue reports, not measured by me. **What would settle it:** a local VM with 50 published ports, `systemctl restart docker` with and without live-restore, timing the gap and diffing `iptables-save` before/after.
+
+### 9.4 What CNI mandates, and the verb it had to add
+
+`[F]` **HIGH** — The CNI spec's cleanup contract, verbatim (<https://github.com/containernetworking/cni/blob/main/SPEC.md>):
+- *"DEL command invocations are always considered best-effort - plugins should always complete a DEL action without error to the fullest extent possible, even if some resources or state are missing."*
+- *"Plugins MUST accept multiple DEL calls for the same (CNI_CONTAINERID, CNI_IFNAME) pair, and return success if the interface in question, or any modifications added, are missing."*
+- *"The container runtime is responsible for cleanup of the container's network namespace."*
+- *"The container runtime must ensure that add is eventually followed by a corresponding delete. The only exception is in the event of catastrophic failure, such as node loss."*
+- and on DEL after the namespace is gone: *"The plugin MAY assume that the isolation domain (e.g. network namespace) has been deleted, and thus any resources (e.g. network interfaces) therein have been removed."*
+
+Four things to extract:
+1. **`DEL` is idempotent by *specification*, not by politeness.** "MUST accept multiple DEL calls … and return success if the interface is missing." A teardown that returns an error because the thing is already gone is a spec violation in CNI and a bug in us: the retry loop above it will spin forever on garbage it has already collected.
+2. **The netns is the *runtime's* to destroy, never the network layer's.** Which matches §1.6's finding exactly: destroy the netns and the interfaces garbage-collect themselves, so the plugin genuinely does not need to touch them.
+3. **`DEL` is *required* to eventually happen** — the runtime owns that guarantee, and the spec names exactly one exception (node loss). So "the supervisor was SIGKILLed" is not an excuse the spec grants; it is a case we must handle.
+4. **Best-effort means partial success is the normal outcome.** DEL must therefore not stop at the first failure. Ours must run every step, collect the errors, and report them together.
+
+`[F]` **HIGH** — And CNI, after a decade of this, concluded that idempotent DEL is **not sufficient** and added a garbage-collection verb in spec **1.1.0**: *"The GC command provides a way for runtimes to specify the expected set of attachments to a network. The network plugin may then remove any stale resources related to attachments that do not exist in this set."* Same source.
+
+`[R]` **HIGH** — **That is the single most important design signal in this section.** The de-facto standard for container networking, written by people who had DEL-must-be-idempotent from day one, still had to add a *mark-and-sweep pass driven by the runtime's live set* — because idempotent DEL only helps when someone calls DEL, and the interesting failures are precisely the ones where nobody does. Note also that CNI's GC and Docker's `cleanupLocalEndpoints()` are the same algorithm arrived at independently: **hand the network layer the authoritative live set; it deletes everything else it owns.** We should build that from the start, not after the first leak. It is cheaper than it sounds — see §9.7.
+
+`[C]` **MED** — host-local's own leak, as a warning about how fine-grained this gets: <https://github.com/containernetworking/plugins/issues/498> reports that when the `O_EXCL` create of an allocation file succeeds but the subsequent write and the compensating `os.Remove` both fail, an **empty** allocation file is left behind, and kubelet's retry loop then creates one per attempt until the range is exhausted. The reporter's fix is the right instinct and worth stealing: *"We should check if IP file is empty to determine whether an IP can be allocated. This not only prevents exhausting all free IPs, but also helps to recover leaked IP files."* i.e. **make the half-written state self-identifying so the sweep can recognise it.**
+
+### 9.5 The leak nobody mentions: conntrack entries defeat correct rules
+
+`[F]` **HIGH** — This one is not about teardown at all, and it is the subtlest item in §9.1's table. From §4.2 we already know that NAT rules are consulted **only when a conntrack entry is created**; every subsequent packet of a flow is translated from the existing entry without re-traversing the `nat` table. The corollary is unpleasant: **a conntrack entry created *before* our rules existed will keep bypassing them for the entry's whole lifetime.**
+
+`[C]` **HIGH** — Docker hit this three times and now flushes conntrack explicitly. From `moby/daemon/libnetwork/drivers/bridge/bridge_linux.go`, verbatim comment:
+```
+// clearConntrackEntries flushes conntrack entries matching endpoint IP address
+// or matching one of the exposed UDP port.
+// In the first case, this could happen if packets were received by the host
+// between userland proxy startup and iptables setup.
+// In the latter case, this could happen if packets were received whereas there
+// were nowhere to route them, as netfilter creates entries in such case.
+// This is required because iptables NAT rules are evaluated by netfilter only
+// when creating a new conntrack entry. When Docker latter adds NAT rules,
+// netfilter ignore them for any packet matching a pre-existing conntrack entry.
+// As such, we need to flush all those conntrack entries to make sure NAT rules
+// are correctly applied to all packets.
+// See: #8795, #44688 & #44742.
+```
+and on the narrower variant, used when ports change on a running container:
+```
+// Unlike [clearConntrackEntries], it does not flush by the endpoint's IP
+// address, because that would tear down established flows to the endpoint's
+// other, unmodified ports. It's used when ports are added to or removed from an
+// endpoint that's already joined to a sandbox. Only UDP entries need clearing;
+// a stale TCP flow to a just-changed port is reset by its peer.
+```
+Source: <https://github.com/moby/moby/blob/master/daemon/libnetwork/drivers/bridge/bridge_linux.go>
+
+`[R]` **HIGH** — **Flush conntrack for the container's addresses at the end of setup, not (only) at teardown.** Reasoning: the failure this prevents is a container that is configured perfectly and still unreachable, or reachable-but-unmasqueraded, with a completely clean ruleset — the worst possible debugging experience. Note the two race windows Docker names: a packet arriving between our helper's `bind()` and our rule install, and a packet arriving at an address that has nothing listening (netfilter creates an entry anyway). Both windows exist in our design too.
+`[R]` **MED** — **UDP only for the port-change case, IP-wide for setup and teardown.** Docker's reasoning is sound and worth copying verbatim: an obsolete TCP flow gets an RST from its peer and heals itself; a UDP "flow" has no such mechanism and will happily keep translating to a dead address until it times out.
+`[R]` **MED** — Mechanism: `NETLINK_NETFILTER` / ctnetlink `IPCTNL_MSG_CT_DELETE` with a filter, which is a *fourth* netlink family beyond the three in §2.6. Crate coverage is thin (§12.4). **Cheapest honest MVP: shell out to `conntrack -D -d <ip>`**, mark it as a shortcut, and note the ceiling (an exec, and the `conntrack` binary is not installed by default on minimal images — detect and warn rather than fail).
+
+### 9.6 Stale netns bind mounts, empirically
+
+`[O]` **HIGH** — `uc-arcc` (Rocky 8.8, kernel 4.18.0-425.3.1.el8, unprivileged uid 780140869). Everything below runs inside `unshare -Urmn` with a private tmpfs on `/run`, so nothing touches the real host and it all vanishes on exit. This simulates dying in the two-syscall window §1.3 describes: `open(O_CREAT|O_EXCL)` has created the placeholder, the `mount --bind` has not happened yet.
+
+```
+$ unshare -Urmn sh -c '
+    mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+    ip netns add good              # a real one, bind-mounted
+    : > /run/netns/crashed         # simulate death after placeholder, before bind mount
+    ...'
+
+[A] ip netns list:
+    Error: Peer netns reference is invalid.
+    Error: Peer netns reference is invalid.
+    crashed
+    good
+[B] ip netns add crashed:      rc=1   Cannot create namespace file "/var/run/netns/crashed": File exists
+[C] ip netns exec crashed true: rc=255 setting the network namespace "crashed" failed: Invalid argument
+[D] ip netns delete crashed:   rc=0   (no output)
+[E] ls /run/netns after delete: good
+[F] nsfs mounts in mountinfo:  1
+```
+
+Five things to read off this, all of which map onto our design:
+
+1. **`ip netns list` reports the corpse as a namespace.** `crashed` and `good` are listed identically. The directory listing cannot distinguish a live namespace from a zero-byte placeholder — because `ip netns list` is `readdir()` and nothing more (§1.2).
+2. **It is not silently identical, though: `ip netns list` also emits `Error: Peer netns reference is invalid.`** — once per entry, because it tries to resolve each file's nsid and fails on the non-nsfs one. So the *detection signal* exists; it is just delivered as noise on stderr that nobody reads.
+3. **The retry is blocked.** `ip netns add crashed` fails `rc=1` with `File exists` — this is the `O_EXCL` in iproute2's own sequence biting the next attempt. A naive implementation that retries container creation with a deterministic name (which we want, for §9.7's self-describing naming) **wedges permanently** on its own corpse.
+4. **Using it fails differently and worse.** `ip netns exec crashed` → `Invalid argument`, i.e. `setns(2)` returning `EINVAL` because the fd refers to a tmpfs regular file, not an nsfs inode. `[R]` — a plain `EINVAL` from `setns` on a path we ourselves created is a **positive identification of a stale placeholder**, and it is exactly the check our recovery path should make: `open` the path, `setns(fd, CLONE_NEWNET)`, and treat `EINVAL` as "this is garbage, unlink it and proceed" versus success as "this namespace is real".
+5. **`ip netns delete` recovers it, rc=0.** It attempts the umount (which fails, harmlessly) and then unlinks. `[F]` **HIGH** — so `umount2()` failing with `EINVAL`/`ENOENT` **must not abort our teardown**; it is the expected result on a placeholder, and treating it as fatal converts a recoverable leak into a permanent one. Note `[F]`'s ordering requirement: `umount2` then `unlink`, and unlink must run even if umount failed. This is the concrete shape of CNI's "best-effort DEL".
+
+`[O]` **HIGH** — For contrast, the healthy case on `my-droplet`: five bind mounts in `/run/docker/netns/`, five running containers (`docker ps -q | wc -l` = 5), `lsns -t net` = 6 rows (five plus the host). No leak. `[R]` — **that count comparison is our cheapest possible health check**, and it belongs in `mydocker info`: `#nsfs mounts under our directory` vs `#containers in our store with a network`. A mismatch is a leak, in either direction, and it is two `readdir`s.
+
+### 9.7 What this means for our lifecycle design
+
+`[R]` **HIGH** — **Ownership: exactly one owner per object, and it is never "the container".** Three owners, and the distinction is load-bearing:
+
+| Object | Owner | Lifetime |
+|---|---|---|
+| netns + its bind mount, veths, container addresses/routes | the **network sandbox** (already a first-class entity per §7.3) | refcounted; last detach frees it |
+| bridge, subnet, MASQUERADE rule, `ip_forward` | the **network** | created on first use, freed on explicit network delete only |
+| DNAT/filter rules, proxy helper, anti-spoof rule, conntrack flush | the **attachment** (sandbox × network) | strictly inside the sandbox's lifetime |
+
+The container is a *user* of a sandbox, not the owner of one. §7.3 already reached this conclusion for pod semantics; §9 reaches it again for cleanup, which is a good sign it is right.
+
+`[R]` **HIGH** — **Setup must be idempotent, because the recovery path is "run setup again".** This is not a theoretical nicety; it is precisely what netavark does. `netavark firewall-reload` reads its persisted intent and re-runs the *same* `setup_network` / `setup_port_forward` calls used for a fresh container (`netavark/src/commands/firewall_reload.rs`):
+```rust
+    let conf = read_fw_config(config_dir).wrap("read firewall config")?;
+    if let Some(conf) = conf {
+        let fw_driver = get_supported_firewall_driver(Some(conf.driver))?;
+        for net in conf.net_confs { fw_driver.setup_network(net, conn)?; }
+        for port in &conf.port_confs { fw_driver.setup_port_forward(port.into(), conn)?; }
+    }
+```
+Source: <https://github.com/containers/netavark/blob/main/src/commands/firewall_reload.rs>
+There is no separate "restore" code path. There is one setup path, and it is safe to call twice. `[R]` — **we should have exactly one setup path too.** A second, subtly-different restore path is the classic way to get a system that works on first boot and corrupts itself on recovery.
+
+`[R]` **HIGH** — **Persist declarative intent, separately from and *before* the host mutation.** netavark's layout, from `netavark/src/firewall/state.rs`, is a good model and it is deliberately dumb — files, not a database:
+```
+$config/firewall/
+    firewall-driver          -> name of the firewall driver
+    networks/$netID          -> network config setup
+    ports/$netID_$conID      -> port config
+    firewall-reload.lock     -> flock, held while reading/removing
+```
+and the lock's rationale, verbatim from the source comment, is exactly the race we will have:
+```rust
+    /// This file is required to ensure that remove_fw_config is not racing against
+    /// the firewall reload service, i.e. without it would be possible that we read
+    /// the config files and then during re-adding the rules the file got removed.
+    /// This leaves a chance that the service will add rules that should not be added
+    /// anymore.
+```
+Source: <https://github.com/containers/netavark/blob/main/src/firewall/state.rs>
+`[R]` — steal all three ideas: **(a) intent as one small file per object, keyed by id; (b) the driver name recorded alongside, so recovery knows which backend wrote the rules; (c) a single flock held across "read intent + apply" and across "remove intent + unapply", so a concurrent reconcile cannot resurrect a container we are deleting.** Point (c) is the non-obvious one and it is a real bug we would otherwise ship.
+
+`[R]` **HIGH** — **Make the host self-describing, so we can find our garbage without our own state.** This is the belt to the intent-file's braces, and it is what would have saved §9.2's orphan. Every object we create carries our identity and the id of the thing it belongs to:
+- netns bind mount: `/run/mydocker/netns/<container-id>` — already decided in §1.2, and now doing real work.
+- host veth: `mdk-<12 hex of container id>`. `[F]` **HIGH** — the budget is tight: `IFNAMSIZ` is 16 *including* the NUL, so **15 usable characters**. `[O]` — Docker uses exactly all of it for bridges: `br-0d4cf39c58f7` is 3 + 12 = 15. Our `mdk-` + 11 hex = 15. Pick the prefix once and never change it, because it is a data format.
+- bridge: `mdk-br-<8 hex of network id>`.
+- nft: **one table, `inet mydocker`, and nothing outside it** (§5.4). This is where native nftables pays off twice: `nft delete table inet mydocker` is a complete, atomic, total reset of every rule we ever wrote, with no rule-text matching and no risk of deleting somebody else's rule. There is no iptables equivalent.
+- proxy helper: `argv[0]` contains the container id, and it dies when its socket closes.
+
+`[R]` **HIGH** — **The reconcile pass, and it is small.** On daemon start (or on the first CLI invocation after boot, if D2 goes daemonless), with the intent lock held:
+1. Enumerate reality: `readdir /run/mydocker/netns/`; `RTM_GETLINK` dump filtered to names matching `mdk-*`; `nft list table inet mydocker`; `readdir` our intent directory; grep `/proc/*/cmdline` for our proxy helpers. Every one of these is cheap and none of them needs our state to be intact.
+2. For each netns bind mount: `open` + `setns` probe. `EINVAL` ⇒ stale placeholder ⇒ `unlink`. Success ⇒ real; check whether the container id is in our live set.
+3. Compute the live set from the container store (D2 owns this), then **sweep**: any netns/veth/rule/helper whose id is not live gets torn down with the ordinary idempotent teardown. This is CNI's `GC` and Docker's `cleanupLocalEndpoints`, in about 80 lines.
+4. Rebuild the nft table from intent for the live set, atomically. Because the table is ours alone and the transaction is atomic (§5.4), the correct implementation is **delete the table and re-add it from intent in one transaction** — not a diff. Diffing rules is where everyone else's bugs live.
+`[R]` **MED** — Do **not** sweep the *bridge* on the same trigger. A bridge with zero ports is normal (`[O]`: `docker0`, §3.1) and deleting a network's bridge because it is momentarily idle would break `docker run` on the very next command. Bridges are freed by network delete only — but a `mydocker network prune` should then be able to find them by our naming convention *even when the record is gone*, which is exactly the recovery §9.2's Docker cannot do.
+
+`[R]` **HIGH** — **Ordering, written out, because the order is the whole design.**
+
+Setup (each step idempotent, each recording intent before mutating):
+```
+1. flock the network            5. veth pair, peer directly into the netns (§2.6 op 4)
+2. allocate IP (§10)            6. addresses, routes, lo up
+3. write intent record          7. nft transaction: masq + publish + anti-spoof  (ATOMIC)
+4. create netns + bind mount    8. flush conntrack for the address (§9.5)
+                                9. mark the record ready
+```
+Teardown (best-effort, never abort early, collect all errors):
+```
+1. flock; mark record deleting   4. kill proxy helpers
+2. umount2(netns, MNT_DETACH)    5. flush conntrack for the address
+   + unlink  <-- FIRST, and it   6. free the IPAM allocation
+   garbage-collects both veths    7. delete the record  <-- LAST
+   (§1.6)
+3. nft transaction removing this
+   attachment's rules (ATOMIC)
+```
+`[R]` **HIGH** — Step 2 being first is §1.6's corollary and it is counter-intuitive enough to be worth a comment in the code: the unmount is not filesystem hygiene, it is the operation that deletes the interfaces. Step 7 being last is §9.3's invariant. Everything between them can fail and be retried, because a record in `deleting` state is a tombstone the reconcile pass will find.
+
+`[R]` **HIGH** — **`mydocker rm` on a container whose supervisor died mid-setup: the requirement is that it does not need the supervisor.** Spelled out, because this was the explicit question:
+- The record exists and is `ready` ⇒ ordinary teardown.
+- The record exists and is `creating` or `deleting` ⇒ **run the ordinary teardown anyway.** Every step tolerates its object being absent (`ENOENT` from unlink, `EINVAL` from umount, "no such table/rule" from nft, "no such link" from `RTM_DELLINK`, an IPAM release of an address that is already free). This is the *entire* payoff of idempotent teardown, and it is why CNI made it mandatory.
+- No record at all, but host state matching our naming convention ⇒ the reconcile sweep (§9.7 step 3) handles it, and `mydocker network prune` must be able to trigger it on demand.
+- **`mydocker rm` must never return an error merely because something was already gone.** Per CNI: *"return success if the interface in question, or any modifications added, are missing."* It should return an error only if something we still own could not be removed — and then it must leave the tombstone in place so the next attempt can retry.
+
+`[R]` **MED** — **What we will still not recover, stated honestly.** `ip_forward=1` and a `FORWARD` policy of DROP are global host mutations we deliberately do not revert (§1.1, §3.3): we cannot distinguish "we set this" from "the admin set this", and guessing wrong breaks the host's own routing. `[R]` — record in our own state that *we* were the one to change them, log loudly at the time, and surface it in `mydocker info` — but never auto-revert. A container engine that quietly turns off IP forwarding on uninstall is worse than one that leaves it on.
+
+---
+
+## 10. IPAM
+
+Two separate allocation problems that get conflated. **Pool allocation**: picking a subnet for a network, once, where the adversary is the *host's own* routing table and the user's VPN. **Address allocation**: picking an address inside that subnet, per container, where the adversary is our own concurrency. They have different failure modes, different state, and different correct answers.
+
+### 10.1 What Docker allocates from — the actual default pools
+
+`[C]` **HIGH** — Verbatim from `moby/daemon/libnetwork/ipamutils/utils.go`:
+```go
+	localScopeDefaultNetworks = []*NetworkToSplit{
+		{netip.MustParsePrefix("172.17.0.0/16"), 16},
+		{netip.MustParsePrefix("172.18.0.0/16"), 16},
+		{netip.MustParsePrefix("172.19.0.0/16"), 16},
+		{netip.MustParsePrefix("172.20.0.0/14"), 16},
+		{netip.MustParsePrefix("172.24.0.0/14"), 16},
+		{netip.MustParsePrefix("172.28.0.0/14"), 16},
+		{netip.MustParsePrefix("192.168.0.0/16"), 20},
+	}
+	globalScopeDefaultNetworks = []*NetworkToSplit{
+		{netip.MustParsePrefix("10.0.0.0/8"), 24},
+	}
+```
+Source: <https://github.com/moby/moby/blob/master/daemon/libnetwork/ipamutils/utils.go>
+
+`[F]` **HIGH** — `NetworkToSplit{Base, Size}` means "chop `Base` into chunks of prefix length `Size`". So the local pool set is: `172.17.0.0/16`, `172.18.0.0/16`, `172.19.0.0/16`, then `172.20.0.0/14`–`172.31.0.0/14` chopped into /16s (that is `172.20`–`172.31`, twelve more /16s), then `192.168.0.0/16` chopped into **/20s** (sixteen of them, `192.168.0.0/20` … `192.168.240.0/20`). Total: **15 × /16 + 16 × /20**, allocated in that order. `[O]` **HIGH** — consistent with `my-droplet`: `docker0` = `172.17.0.0/16` (first), `aikserver_default` = `172.18.0.0/16` (second), and the §9.2 orphan = `172.19.0.0/16` (third). Allocation is strictly first-fit in list order, and the observed history reads straight off it.
+
+`[F]` **HIGH** — Reserved addresses inside a pool, from `moby/daemon/libnetwork/ipams/defaultipam/allocator.go`:
+```go
+	// Reserve the first address in the range for the:
+	// - IPv4 network address
+	//   - Except in a /31 point-to-point link, https://datatracker.ietf.org/doc/html/rfc3021
+	// - IPv6 Subnet-Router anycast address, https://datatracker.ietf.org/doc/html/rfc4291#section-2.6.1
+	bits := pool.Addr().BitLen() - pool.Bits()
+	if !pool.Addr().Is4() || bits > 1 { h.Add(pool.Addr()) }
+	// For IPv4, reserve the broadcast address.
+	// - Except in a /31 point-to-point link
+	if pool.Addr().Is4() && bits > 1 { h.Add(netiputil.LastAddr(pool)) }
+```
+So IPAM itself reserves exactly two addresses: network and broadcast (with the RFC 3021 /31 exception). **The gateway is not special-cased.** `[O]` **HIGH** — on `my-droplet`, `docker network inspect aikserver_default` → `{"Driver":"default","Config":[{"Subnet":"172.18.0.0/16","Gateway":"172.18.0.1"}]}`, and the containers hold `.2 .3 .4 .5 .6` in creation order. The gateway is `.1` simply because the **bridge driver is the first thing to request an address** from a fresh pool, and first-fit after the reserved `.0` yields `.1`. `[R]` **MED** — do the same rather than hardcoding `.1`: it means `--gateway` works for free, and it means a `/31` or a subnet with an unusual gateway needs no special case. Tradeoff: the gateway address depends on allocation order, so it must be recorded in the network's record, not recomputed.
+
+### 10.2 Where the state lives — and the answer is surprising
+
+`[F]` **HIGH** — **Docker's IPAM allocator is pure in-memory state, guarded by a mutex, and it is not persisted at all.** `moby/daemon/libnetwork/ipams/defaultipam/address_space.go`:
+```go
+type addrSpace struct {
+	allocated  []netip.Prefix                  // ordered list of allocated subnets
+	subnets    map[netip.Prefix]*PoolData      // allocations, indexed by prefix
+	predefined []*ipamutils.NetworkToSplit
+	mu         sync.Mutex
+}
+```
+and the driver registers itself with:
+```go
+	cps := &ipamapi.Capability{RequiresRequestReplay: true}
+```
+where that capability is documented in `ipamapi/contract.go` as:
+```go
+	// Whether of daemon start, libnetwork must replay the pool
+	// request and the address request for current local networks
+	RequiresRequestReplay bool
+```
+Sources: <https://github.com/moby/moby/blob/master/daemon/libnetwork/ipams/defaultipam/address_space.go>, <https://github.com/moby/moby/blob/master/daemon/libnetwork/ipamapi/contract.go>
+
+`[F]` **HIGH** — The replay is `reservePools()` (§9.3), and it is worth reading for what it *derives from*: for each persisted network it calls `n.ipamAllocate()` to re-reserve the pool, then `n.getEndpointsFromStore()` and re-requests **each endpoint's recorded address** as a preferred address. Source: <https://github.com/moby/moby/blob/master/daemon/libnetwork/controller.go>
+
+`[R]` **HIGH** — **This is the correct architecture and we should copy it exactly: IPAM is an index, not a database.** The authoritative record of "who holds 172.18.0.4" is the *endpoint/container record* — the same record that holds the container's id, its network, and its config. The allocator is a derived acceleration structure that answers "what is free" quickly, and it is rebuilt by replay at startup. Reasoning, in order of weight:
+1. **It makes double-booking structurally impossible.** With two stores (a container record *and* an allocation bitmap) you have a two-phase commit and therefore a window where they disagree; every crash in that window produces either a leaked address or, far worse, an address allocated twice. With one store there is no window.
+2. **It makes the §9.7 sweep free.** "Which addresses are allocated" and "which containers exist" are the same query, so a container that vanished cannot leak an address — it stops existing and the address is simply free on the next replay.
+3. **It is less code.** No bitmap serialization format, no schema migration, no compaction.
+Tradeoff: replay is O(containers) at startup, and a corrupted container record loses an address rather than being independently recoverable. Both are fine at our scale; the first is a few thousand `RequestAddress` calls at worst.
+
+`[O]` **MED** — What *is* persisted, on `my-droplet`: `/var/lib/docker/network/files/local-kv.db`, a single 131072-byte file (a bolt database), last written 2026-08-25. That holds networks, endpoints and sandboxes — the things §9.3's replay and sweep read. `[MED]` on the contents specifically; I did not open it (production host, read-only, and it is a live database). **What would settle it:** `bbolt buckets` on a copy taken from a scratch host.
+
+### 10.3 Restart, and the subnet the orphan burned
+
+`[F]` **HIGH** — On daemon restart the pool set is empty, then `reservePools()` re-reserves exactly the pools of networks in the store. §9.2's orphaned `172.19.0.0/16` is **not** in the store, so IPAM considers it free.
+
+So does the next `docker network create` collide with the orphaned bridge that still owns `172.19.0.1/16`? `[F]` **HIGH** — **No, and the mechanism is the interesting part: Docker asks the kernel routing table, not its own bookkeeping.** From `moby/daemon/libnetwork/netutils/utils_linux.go`:
+```go
+// InferReservedNetworks returns a list of network prefixes that seem to be
+// used by the system and that would likely break it if they were assigned to
+// some Docker networks. It uses two heuristics to build that list:
+//
+// 1. Nameservers configured in /etc/resolv.conf ;
+// 2. On-link routes ;
+```
+and the second heuristic, in full:
+```go
+func queryOnLinkRoutes() []netip.Prefix {
+	routes, err := ns.NlHandle().RouteList(nil, netlink.FAMILY_V4)
+	...
+	for _, route := range routes {
+		if route.Scope == netlink.SCOPE_LINK && route.Dst != nil && !route.Dst.IP.IsUnspecified() {
+			...
+		}
+	}
+}
+```
+The result is passed as `PoolRequest.Exclude`, documented as *"a list of prefixes the requester wish to not be dynamically allocated"*. Source: <https://github.com/moby/moby/blob/master/daemon/libnetwork/netutils/utils_linux.go>
+
+`[R]` **HIGH** — **Implement both heuristics. They are ~30 lines against `RTM_GETROUTE` + a `resolv.conf` parse we are already writing (§6.5), and they prevent the two most-reported Docker networking complaints there are** — "Docker broke my VPN" and "Docker broke my office LAN". Note the second-order benefit for §9: because the orphaned bridge's address creates an on-link route, the kernel *itself* tells us that subnet is in use, so the orphan is **safe but permanent** — it silently burns one /16 of the 15 available and nothing will ever reclaim it. That is the mild version of the leak; the raw/PREROUTING rules are the sharp version.
+
+`[F]` **MED–HIGH** — The same source file carries a long comment explaining why the heuristic is limited to *on-link* routes, and it is the best short writeup of this problem I found. Compressed: checking all non-default routes broke split-tunnel VPNs (which push large aggregates covering subnets nobody uses), and it broke OpenVPN full-tunnel entirely, because `def1` mode installs `0.0.0.0/1` + `128.0.0.0/1` — *"functionally indistinguishable from a default route, yet the Engine was treating them differently. With those routes, there was no way to use dynamic subnet allocation at all."* The conclusion is the useful part: *"The type of route says little about the availability of subnets it covers, except for on-link routes as they specifically define what subnet the current host is part of."* Narrowed in PR #42598, first released in v23.0. Also `[F]`: **the heuristic is IPv4-only**, because *"there's no such thing as on-link routes for IPv6"*.
+
+`[R]` **MED** — Two consequences for us: (a) an on-link route is *evidence*, not proof, so when we skip a pool because of it, **log which route caused the skip** — otherwise "why did my network get 172.24 instead of 172.17" is unanswerable; (b) IPv6 pool selection has no such safety net, which is one more reason IPv6 is a stage-6 item (§4.4).
+
+### 10.4 The other design: CNI host-local, file-per-IP
+
+Worth reading closely because it is the daemonless answer, and D2 may well pick daemonless.
+
+`[F]` **HIGH** — `dataDir` defaults to `/var/lib/cni/networks/<network name>`, and the docs note *"Environments where IPs are released automatically on reboot … may wish to specify `/var/run/cni` or another tmpfs mounted directory instead."* Source: <https://cni.dev/plugins/current/ipam/host-local/>
+
+`[F]` **HIGH** — The whole allocator, from `containernetworking/plugins/plugins/ipam/host-local/backend/disk/backend.go`:
+```go
+const (
+	lastIPFilePrefix = "last_reserved_ip."
+	LineBreak        = "\r\n"
+)
+// Store is a simple disk-backed store that creates one file per IP
+// address in a given directory. The contents of the file are the container ID.
+
+func (s *Store) Reserve(id string, ifname string, ip net.IP, rangeID string) (bool, error) {
+	fname := GetEscapedPath(s.dataDir, ip.String())
+	f, err := os.OpenFile(fname, os.O_RDWR|os.O_EXCL|os.O_CREATE, 0o600)
+	if os.IsExist(err) { return false, nil }               // <-- taken; try the next address
+	if err != nil { return false, err }
+	if _, err := f.WriteString(strings.TrimSpace(id) + LineBreak + ifname); err != nil {
+		f.Close(); os.Remove(f.Name()); return false, err
+	}
+	if err := f.Close(); err != nil { os.Remove(f.Name()); return false, err }
+	// store the reserved ip in lastIPFile
+	ipfile := GetEscapedPath(s.dataDir, lastIPFilePrefix+rangeID)
+	return true, os.WriteFile(ipfile, []byte(ip.String()), 0o600)
+}
+```
+and the mutual exclusion, from `.../disk/lock.go` — `flock(2)` via `go-filemutex` on a file named `lock` inside the same directory:
+```go
+	if fi.IsDir() { lockPath = path.Join(lockPath, "lock") }
+	f, err := filemutex.New(lockPath)
+```
+Sources: <https://github.com/containernetworking/plugins/blob/main/plugins/ipam/host-local/backend/disk/backend.go>, <https://github.com/containernetworking/plugins/blob/main/plugins/ipam/host-local/backend/disk/lock.go>
+
+`[F]` **HIGH** — So there are **two** independent correctness mechanisms stacked, and understanding why is the point:
+- **`flock` on `<dir>/lock`** serializes whole allocation *transactions*, so the "scan for a free address" step sees a stable view.
+- **`O_EXCL` on the per-IP file** makes the *claim itself* atomic against anything the lock misses — a second CNI implementation, a stale process holding a fd, a plugin that forgot the lock. It is defence in depth, and it costs nothing.
+- **`last_reserved_ip.<rangeID>`** is a hint, not state: it makes allocation round-robin rather than always-lowest-free, which matters because reusing a just-released address immediately collides with stale ARP/FDB entries and lingering conntrack (§9.5).
+
+`[F]` **HIGH** — The properties that follow, and they are excellent: the store is **self-describing** (the filename is the address, the content is the container id, so `grep -r <container-id> /var/lib/cni/networks/` is a complete reverse index), needs **no schema**, and **releases by content match** (`ReleaseByKey` walks the directory comparing file contents), so releasing works even if the caller has forgotten which address it held.
+`[C]` **MED** — and the failure mode, per §9.4: an empty file (create succeeded, write failed, remove failed) is an unreleasable allocation, because nothing matches its content.
+
+### 10.5 Concurrency: two `mydocker run`s must not collide
+
+This was the explicit question, so here is the option set with the reasoning, then a verdict.
+
+`[F]` **HIGH** — First, the constraint that rules out the clever answers: **the kernel cannot arbitrate this for us.** There is no "allocate me an address from this subnet" syscall. The kernel learns of an address only when we `RTM_NEWADDR` it, and by then we have already chosen it — and we choose it *inside the container's netns*, where the address is invisible to any other netns, so a duplicate assignment succeeds silently on both sides and produces two containers with the same IP on one bridge. There is no `EEXIST` to catch. **The collision is undetectable after the fact and must be prevented before it.**
+
+| Mechanism | Correct? | Cost | Verdict |
+|---|---|---|---|
+| **`flock` a single allocation file, read-modify-write a list** | yes | one open + one flock per run | correct, trivially; but the file is a second source of truth (§10.2) |
+| **`flock` the network dir + `O_EXCL` file per address** (host-local) | yes, doubly | two opens | self-describing, no schema, releases by content |
+| **In-process mutex** (Docker) | yes **iff one process ever allocates** | free | correct only with a daemon; catastrophic if `mydocker run` is a plain process |
+| **Derive from a hash of the container id** | **no** | free | see below |
+| **Ask the kernel / probe with ARP** | **no** | slow | see below |
+| **Sequential from a counter file, no lock** | **no** | free | classic lost-update; two readers get the same value |
+
+`[R]` **HIGH** — **Reject derive-from-something-unique, explicitly, because it is the tempting one.** Hashing the container id into the subnet fails on four counts, any one of which is disqualifying: (1) **birthday collisions** — a /24 has 253 usable addresses, so the expected first collision is around 19 containers, which is *routine*, not an edge case; (2) there is **no release**, so a restarted container cannot reliably get a different address and a colliding pair can never be separated; (3) it cannot honour the reservations — network address, broadcast, gateway, and the user's `--ip` — so it needs a fallback path anyway, and then the fallback needs a lock and we are back where we started; (4) the resulting addresses are unpredictable, which makes `/etc/hosts` snapshots (§6.5 stage 2) and debugging worse. The only defensible use of a hash is **choosing the *host-side veth name*** — 11 hex characters of container id, where a collision is detectable via `EEXIST` on `RTM_NEWLINK` and recoverable by retrying.
+
+`[R]` **HIGH** — **Reject probe-then-claim (ARP/ping the candidate address).** It cannot distinguish "free" from "allocated but the container has not started yet", which is precisely the window two concurrent `run`s are in. It also costs a timeout per candidate. `[C]` — for contrast, note that `lxc-user-nic` uses DHCP for exactly this and §8.6 already records the cost: *"DHCP-based addressing takes seconds"*.
+
+`[R]` **HIGH** — **Our answer: `flock` on the network's directory, held across the whole allocate-and-record transaction, with the container record as the source of truth and an `O_EXCL` per-address claim file as the lock-free backstop.** Concretely:
+```
+open("/run/mydocker/net/<netid>/lock", O_CREAT|O_RDWR, 0600)   # once
+flock(fd, LOCK_EX)                                             # blocking
+  scan  /run/mydocker/net/<netid>/addrs/            -> the taken set
+  pick  the next free after the recorded cursor     -> round-robin, not lowest-free
+  open(".../addrs/172.18.0.4", O_WRONLY|O_CREAT|O_EXCL, 0600)  # the claim
+  write(container-id); close                                   # self-describing
+  write the container record (address included)                # the truth
+  update  .../cursor
+flock(fd, LOCK_UN)   # or just close/drop
+```
+Reasoning: (1) `flock` is one syscall, is released automatically on process death *including `SIGKILL`* — which is exactly the failure mode §9 is about, and is the property no hand-rolled lockfile has; (2) `O_EXCL` gives us a claim that is atomic even against a buggy future version of ourselves that forgets the lock; (3) the claim file is self-describing, so §9.7's sweep can reconcile addresses by reading the directory, with no dependence on our container store being intact; (4) it works identically with or without a daemon, so it does not have to be rewritten when D2 decides.
+Tradeoffs, stated: **`flock` is advisory and per-open-file-description**, so it does not protect against a process that does not participate, and it does not work correctly over NFS-mounted state (irrelevant — our state is in `/run`). It also serializes container starts on one network; that is a global lock and it will be the throughput ceiling if we ever start hundreds of containers at once. `// ponytail: global per-network flock; shard by address range if start throughput ever matters.`
+`[R]` **MED** — Steal host-local's **round-robin cursor**, not lowest-free. It is one extra small file and it buys real robustness: an address that was just released does not come straight back into service with stale neighbour entries on the bridge, stale peer `/etc/hosts` lines (§6.5), and lingering conntrack (§9.5) pointing at it.
+
+`[R]` **HIGH** — **Interaction with D2's state model, which is the real decision here → Handoff to D2.** The choice above is deliberately the one that is correct under *both* of D2's options, so that this does not become a blocker:
+- **Daemon** (Docker's shape): an in-process mutex would suffice and `flock` is redundant — but harmless, and it keeps `mydocker network prune`, a recovery tool, and the daemon from racing.
+- **Daemonless CLI** (Podman/netavark's shape): `flock` is **mandatory**; there is no other candidate. Note that netavark itself carries `fs2 = "0.4.3"` as a direct dependency purely for `FileExt::lock_exclusive` on its firewall state (§9.7), so this is the shape the daemonless reference implementation actually uses.
+The one thing D2 must *not* choose is "the allocation bitmap is the source of truth, and the container record is a copy". §10.2 explains why: that is the two-phase commit that produces double-allocation on crash.
+
+`[R]` **MED** — **Sticky addresses, which §6.5 asked for.** With the container record as the source of truth this is nearly free: record the address on the record, and on restart pass it as the *preferred* address (Docker's `RequestAddress(poolID, prefAddress, opts)` has this parameter for exactly this reason). If it is still free, the container keeps its address and every peer's `/etc/hosts` snapshot stays correct — which is what makes §6.5's stage 2 last long enough to be worth shipping. If it is taken, fall back to a fresh allocation and rewrite the peers' files. Tradeoff: holding an address across a stop makes "stopped containers" quietly consume the pool; make that visible in `mydocker info` rather than surprising.
+
+### 10.6 MAC addresses, and why deriving them from the IP was abandoned
+
+`[O]` **HIGH** — `my-droplet`, `docker network inspect aikserver_default`:
+```
+aikserver-redis-1     172.18.0.2/16   6e:ee:20:71:68:37
+aikserver-frontend-1  172.18.0.3/16   32:fa:e6:8a:a4:eb
+aikserver-nginx-1     172.18.0.4/16   ee:47:c6:16:34:61
+aikserver-certbot-1   172.18.0.5/16   86:92:c3:83:35:99
+aikserver-web-1       172.18.0.6/16   ca:be:0b:2b:4b:76
+```
+`[C]` **HIGH** — The historic Docker convention was `02:42:` + the four bytes of the IPv4 address, so `172.18.0.4` would be `02:42:ac:12:00:04`. **None of these match**, and the local/unicast bits are set randomly per interface. Docker 28 does not derive the MAC from the IP.
+`[C]` **MED** — The change landed in the 25.0.x series and was messy: 25.0.1 *re-generated* an IP-derived MAC on restart *"in case the generated IP/MAC addresses have been reused"*; 25.0.3 settled on "a generated MAC is not restored on restart, a configured MAC is". Containers created on 25.0.0 could have **duplicate MACs** and had to be recreated. Sources: <https://docs.docker.com/engine/release-notes/25.0/>, <https://github.com/moby/moby/issues/47146>, <https://github.com/moby/moby/issues/47228>. `[MED]` on the exact version boundaries — the release notes and the issues disagree in detail. **What would settle it:** the moby commit that removed the derivation.
+
+`[R]` **HIGH** — **Let the kernel generate the MAC; do not derive it from the IP.** The reason is a direct §10.5 consequence and worth internalising: if MAC is a function of IP, then **reusing an address reuses the MAC**, so the bridge's FDB and every peer's ARP cache (§3.5) hold entries that are *still syntactically valid* but point at the wrong port for up to `ageing_time` (300s, `[O]` §3.1). The failure is intermittent, direction-dependent, and self-healing after five minutes — the worst diagnostic profile there is. A random MAC on a reused IP produces a clean ARP miss and immediate re-resolution instead. Tradeoff: `--mac-address` must then be recorded explicitly if we support it, and a restarted container gets a new MAC, which breaks MAC-based licensing inside containers (a real, if unsympathetic, complaint against Docker 25).
+
+### 10.7 The honest minimum for us
+
+`[R]` **HIGH** — In the same shape as §6.5, because the same "ship stage 1" logic applies.
+
+**Stage 1 — one network, one subnet, addresses from a locked directory. (~120 lines.)**
+- One hardcoded default subnet from a Docker-shaped pool list (§10.1), chosen at network-create time with the on-link-route and nameserver exclusions (§10.3). `--subnet` overrides.
+- Gateway = first free address after the reserved network address, recorded on the network record.
+- Per-address `flock` + `O_EXCL` claim as in §10.5, with the container record authoritative.
+- Reserve network + broadcast; skip the /31 special case entirely at this stage (we will not have point-to-point links).
+- Release on teardown; **rebuild the taken-set from the claim directory on start**, and cross-check it against the container store, warning on any disagreement (that warning is the leak detector from §9.7).
+
+**Stage 2 — multiple networks.** The pool list becomes real: allocate a subnet per network, first-fit, with the exclusion list. Add `mydocker network prune` able to find orphaned subnets *by our bridge naming convention* rather than only from records (§9.7) — this is the specific thing Docker cannot do and §9.2 is what it costs.
+
+**Stage 3 — replay instead of a persisted index.** Only if stage 1's directory-of-claims becomes a bottleneck or a correctness problem. Drop the claim files, derive the taken-set purely from container records at startup like `reservePools()` does. `[R]` — this is *simplification*, not a feature, and it is the right end state; it is stage 3 only because stage 1's claim files are also our crash-recovery evidence and we should not give those up until the reconcile pass is proven.
+
+**Never:** IPv6 IPAM before §4.4's dual-stack work; a pluggable IPAM driver interface (one implementation, no second caller — §0's CNI-shaped trait already gives us the seam if we ever need it); DHCP.
+
+---
+
+## 11. The minimal networking ladder
+
+The proposed progression is **validated with two corrections**. Numbering is 1-indexed so that "bridge + NAT" lands on stage 4, which is what §3.2 already calls it (*"bridge + NAT is our only stage-4 model"*).
+
+| # | Stage | What the user gets | Host state created | Success test |
+|---|---|---|---|---|
+| 1 | share the host netns | nothing isolated; a working container in every other dimension | **none** | `mydocker run alpine wget -qO- example.com` succeeds; `ip addr` inside == host's |
+| 2 | new netns, `lo` up | isolation; a private port space | one nsfs bind mount | `nc -l 127.0.0.1:8080` inside works; host `ss -ltn` does not show it |
+| 3 | veth to host, manual routes | container↔host only. **A detour** — see below | + one host veth, one host route, one host address | container pings the host's veth address; host pings the container |
+| 4 | + bridge + NAT | **the internet.** The first genuinely useful rung | + a bridge, a subnet, `ip_forward`, a MASQUERADE rule, a FORWARD policy | `apk add curl` succeeds inside; two containers ping each other by IP |
+| 5 | + published ports (DNAT) | inbound; the container is a *service* | + N DNAT + N filter-ACCEPT + N anti-spoof rules, ± a proxy helper, per port | `curl localhost:8080` from the host **and from another machine**; unpublished ports refused |
+| 6 | + DNS | names instead of addresses | + generated `resolv.conf`/`hosts` bind mounts (stage 1 of §6.5) | `nslookup example.com` inside; then peer-name resolution |
+
+### 11.1 Correction 1: stage 1 is real work, and it is not "no networking"
+
+`[R]` **HIGH** — **Sharing the host netns is not the degenerate case; it is a first-class feature with a real implementation and it should be built first.** §7.3 already establishes the mechanism (`namespaces[].path = /proc/1/ns/net`, i.e. the OCI spec's own "join an existing namespace" form) and establishes that it is *the absence of work*: no netns, no veth, no IPAM, no rules. Building it first buys three things disproportionate to its cost:
+1. It proves out the **whole rest of the container** — rootfs, exec, cgroups, signals, wait — with networking removed as a variable. Every "is my container broken or is my network broken" question during weeks 1–3 is answered for free.
+2. It is the **debugging tool** we will use to develop stages 2–6 (`nicolaka/netshoot` in the host netns, per §7.3).
+3. It is the code path that `--network=host` and `--network=container:X` and pod-sharing all reduce to, so it is not throwaway scaffolding.
+
+`[R]` **HIGH** — And stage 2 is not throwaway either: it is `--network=none`, it is the OCI spec's default meaning of a bare `{"type": "network"}` entry (§0), and it is genuinely used (batch jobs, build steps, untrusted code). §1.1's finding is the entire content of stage 2 and it is the highest value-per-byte line in the document: **`lo` must be brought up**, or a namespace-isolated container fails in ways that look nothing like a networking problem.
+
+### 11.2 Correction 2: stage 3 is the best learning rung and the worst product rung
+
+`[R]` **HIGH** — **Do stage 3, but do it as an afternoon's experiment, not as a shipped mode.** What "veth pair to host with manual routing" actually requires, spelled out, because the phrase hides the cost:
+- a host-side address to be the container's next hop, on the veth itself (a `/30`, or a `/32` plus an on-link route);
+- **a host route per container**, `<container-ip>/32 dev mdk-<id>` — because with no bridge there is no shared segment, so nothing is learned and everything must be routed explicitly;
+- `proxy_arp` on the host veth, or a link-scoped route inside the container, to make the container's ARP for its gateway resolve at all;
+- no container-to-container path whatsoever without a route per pair, i.e. **O(n²) host routes**.
+
+Compare with stage 4, which replaces all of that with: one bridge (`RTM_NEWLINK`, `INFO_KIND="bridge"`), one `IFLA_MASTER` on the veth, and one kernel-generated connected route for the whole subnet. `[R]` — **the bridge is not an optimisation over manual routing, it is less work than manual routing**, because the kernel's FDB does the per-container bookkeeping we would otherwise do by hand in the routing table. That is the actual reason every container engine uses a bridge, and it is not obvious until you have priced stage 3.
+
+`[R]` **HIGH** — The learning value, though, is high and specific: stage 3 is where you find out that `veth` transmit is a direct `netif_rx` into the peer (§4.2 step 8), that `ifi_change` matters (§2.6), that a veth is `LOWERLAYERDOWN` until its peer is up (§2.4), and that `RTM_NEWROUTE` needs the address to exist first (§2.6 op 10 note). Do it once, from netlink, by hand. Then delete it.
+
+### 11.3 Which rung is first genuinely useful: stage 4, and only stage 4
+
+`[R]` **HIGH** — **Stage 4 (veth + bridge + NAT).** The test is not "does a packet move" but "would a user pick this over `--network=host`", and the answer is no until egress works. Stages 2 and 3 give a container that cannot install a package, cannot fetch a dependency, cannot call an API, and cannot resolve a name — so anyone with real work to do runs stage 1 instead and gets no isolation at all. Stage 4 is the first rung where isolation stops costing the user something they need.
+
+`[R]` **HIGH** — Two supporting arguments worth keeping:
+- **Stage 4 is the whole of §3.2's decisive property**: bridge+NAT *"requires nothing whatsoever from the network the host sits on"*. Stage 3 shares that property but not the utility; stages 5–6 are refinements. So stage 4 is the unique point where usefulness and zero-infrastructure-dependency first coincide.
+- **`docker run -it alpine sh` followed by `apk add curl` is the actual acceptance test of a container engine**, and it needs exactly stage 4 plus §6.5-stage-1 DNS (~30 lines). Everything above that is a product, not a proof.
+`[R]` **MED** — Therefore the pragmatic first release is **stage 4 + the DNS `resolv.conf` rewrite** (a slice of stage 6 pulled forward), which is cheap and without which stage 4 *looks* broken: addresses work, names do not, and every user diagnoses it as "networking is broken". §6.5 already says the rewrite is ~30 lines; pull it in.
+
+### 11.4 Which rung carries the most host-state risk: two different answers, and both matter
+
+`[R]` **HIGH** — Separate the two questions, because conflating them is how people get this wrong.
+
+**Largest *irreversible, global* mutation: stage 4.** It is the only rung that changes what the host *is* rather than what it has:
+- `net.ipv4.ip_forward = 1` — **the host becomes a router.** Per §1.1 this also resets every per-interface parameter, so it must be first, read-then-write, and never blind-written.
+- `filter/FORWARD` policy DROP — §3.3's paired mitigation, which can break the admin's own routing and is why Docker made it opt-out-able.
+- a bridge holding an address and an on-link route, which per §10.3 **permanently reserves a subnet** as far as any future allocator is concerned, and which per §9.2 is the exact object that leaked in production.
+- Nothing on this list has an obvious inverse. There is no safe "undo `ip_forward`".
+
+**Highest *rate* of mutation, and the only rung where partial state is a security hole: stage 5.** Per §4.5 the anti-spoof rule is **one per container IP**, and per §4.1 a published port is **three coordinated rules** (`nat` DNAT, `filter` ACCEPT, `raw` DROP) plus possibly a helper process. So stage 5 mutates the host on every container start *and stop*, at O(containers × ports), for the entire life of the installation. And the partial states are not symmetric:
+- DNAT installed, filter ACCEPT missing ⇒ the port silently does not work. Annoying.
+- **filter ACCEPT installed, `raw` anti-spoof missing ⇒ §4.5's pre-Docker-28 hole is open**: anyone who can route to the container's address reaches *every* port on it, not just the published one. That is a security failure produced by a crash, and it is the specific reason §5.4's atomicity argument is the most important recommendation in this file.
+`[R]` **HIGH** — **So: stage 4 needs the loudest logging and the most conservative defaults; stage 5 needs the atomic transaction.** These are different mitigations for different risks and we need both. Stage 5 must not be started before the nftables transaction path from §5.4 works — implementing stage 5 on top of rule-at-a-time iptables means shipping a known security hole with a crash as its trigger.
+
+### 11.5 Where the OCI boundary sits, and whether networking should be a hook
+
+`[F]` **HIGH** — What the spec actually offers, and it is only this: a `linux.namespaces` entry, and six hook phases *"called in the listed order"* — `prestart` (deprecated), `createRuntime`, `createContainer`, `startContainer`, `poststart`, `poststop`. `createRuntime` runs *"during the create operation, after the runtime environment has been created and before the pivot root"* **in the runtime namespace**; `poststop` runs *"after the container is deleted but before the delete operation returns"*, also in the runtime namespace. Source: <https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-platform-hooks>
+
+A hooks-based `config.json` for stage 5 would look like this — and writing it out is what settles the question:
+```json
+{
+  "linux": { "namespaces": [ { "type": "network" }, { "type": "mount" }, ... ] },
+  "hooks": {
+    "createRuntime": [ { "path": "/usr/bin/mydocker-cni", "args": ["mydocker-cni","ADD"],
+                         "env": ["CNI_NETNS=/proc/self/ns/net", "..."] } ],
+    "poststop":      [ { "path": "/usr/bin/mydocker-cni", "args": ["mydocker-cni","DEL"] } ]
+  }
+}
+```
+The runtime creates the netns; the `createRuntime` hook receives the container's `state` JSON (including its pid) on stdin, reaches `/proc/<pid>/ns/net`, and configures it; the `poststop` hook tears it down. That is precisely how every CNI-based stack works and it is a genuinely good factoring.
+
+`[R]` **HIGH** — **Build networking in, not as a hook — confirming §0's recommendation, and §9 supplies the decisive new argument that §0 did not have.** §0's reasons were process isolation we do not want and JSON serialization we do not need. The stronger reason is the lifecycle:
+1. **`poststop` only runs if someone calls `delete`.** The spec's wording is exact: *"after the container is deleted but before the delete operation returns"*. If our supervisor is `SIGKILL`ed, `delete` is never invoked, `poststop` never runs, and **the hook contract has no answer at all** — while CNI's own contract does have one (the runtime *"must ensure that add is eventually followed by a corresponding delete"*, §9.4), it puts the burden right back on the runtime we were trying to keep thin. The hook boundary does not remove the reconciliation problem; it relocates it somewhere with *less* information.
+2. **The hook boundary makes §9.7's sweep harder, not easier.** The sweep needs to enumerate host reality and join it against the live container set. A hook process has the first half and not the second; our engine has both. Putting the network code behind a fork/exec means the component that knows what garbage exists is not the component that knows what is alive.
+3. **Errors get worse at the boundary.** §2.6 and §9.7 both depend on distinguishing `EEXIST` from `EPERM` from `ENOENT` to make setup idempotent and resumable. Across a process boundary those become an exit code and English on stderr — the same objection §2.6 raises against shelling out to `ip`, applied to ourselves.
+4. **§1.5's socket trick does not survive the boundary.** Our embedded DNS resolver is a socket created inside the container netns and served from a host-netns process — our own event loop. A hook process exits; whatever it created either dies with it or becomes a helper process to supervise (and to leak, §9.1).
+
+`[R]` **HIGH** — **But keep the CNI *shape*, and now for a second reason.** §0 wanted the ADD/DEL/CHECK factoring for future plugin compatibility. §9.4 adds **GC**: CNI 1.1's verb set is `ADD` / `DEL` / `CHECK` / `GC` / `STATUS`, and those five are, independently, exactly the five operations §9.7 concluded we need — attach, detach-idempotently, verify, sweep-against-a-live-set, and am-I-ready. **Copy all five into the internal trait.** That the standard converged on the same five after ten years of production is the best endorsement available, and it costs one trait definition:
+```rust
+trait NetworkDriver {
+    fn add(&self, sandbox: &Sandbox, cfg: &NetConf) -> Result<Attachment>;
+    fn del(&self, sandbox: &SandboxId, cfg: &NetConf) -> Result<()>;   // idempotent, best-effort
+    fn check(&self, att: &Attachment) -> Result<()>;
+    fn gc(&self, live: &HashSet<SandboxId>) -> Result<Vec<Removed>>;   // §9.7's sweep
+    fn status(&self) -> Result<()>;
+}
+```
+`[R]` **MED** — And keep the *runtime core* free of all of it, per §0: the runtime core creates and joins namespaces per the OCI `namespaces` array and does nothing else network-shaped. Networking lives in the layer that calls it. That keeps a future `mydocker-runtime` honestly OCI-compatible and keeps the possibility of shelling out to real CNI plugin binaries as a wrapper around the same trait rather than a rewrite.
+
+---
+
+## 12. Rust crates for networking
+
+All version and date data below was read from the crates.io API and the crates' own manifests on 2026-09-04, and the RUSTSEC data from a fresh clone of `rustsec/advisory-db` on the same day. `[O]` on every number in the tables in this sense.
+
+### 12.1 The netlink family, and where the async decision actually lives
+
+`[F]` **HIGH** — The `rust-netlink` org publishes a layered stack, and the layers matter because the async constraint enters at exactly one of them:
+
+| Layer | Crate | What it is | Async? |
+|---|---|---|---|
+| socket | `netlink-sys` 0.9.0 | `socket()/bind()/connect()/sendto()/recvfrom()` on `AF_NETLINK`, plus `setsockopt` helpers | **no** — `default = []` |
+| framing | `netlink-packet-core` 0.9.0 | `nlmsghdr`, `NetlinkMessage<T>`, `NetlinkPayload` (Done/Error/Noop/Overrun/InnerMessage), serialize/deserialize | **no** |
+| codec | `netlink-packet-route` 0.33.0 | the `RTM_*` messages and every attribute: link, addr, route, neighbour, rule, tc, … | **no** |
+| transport | `netlink-proto` 0.13.0 | futures `Sink`/`Stream` over a netlink socket, sequence demux, connection actor | **yes, inherently** |
+| API | `rtnetlink` 0.23.0 | ergonomic builders (`handle.link().add().veth(...)`) | **yes** |
+| other families | `genetlink` 0.3.0, `netlink-packet-generic` 0.5.0, `netlink-packet-netfilter` 0.4.0 | generic-netlink and nfnetlink | genetlink: yes |
+
+`[F]` **HIGH** — **`rtnetlink` forces an async executor and there is no escape hatch.** From its own `Cargo.toml`:
+```toml
+[features]
+default = ["tokio_socket"]
+tokio_socket = ["netlink-proto/tokio_socket", "tokio"]
+smol_socket  = ["netlink-proto/smol_socket", "async-global-executor"]
+[dependencies]
+netlink-proto = { default-features = false, version = "0.13" }
+futures-util = "0.3.11"
+futures-channel = "0.3.11"
+```
+Source: <https://github.com/rust-netlink/rtnetlink/blob/main/Cargo.toml>
+There is no `sync` feature. The dependency on `netlink-proto` is unconditional, its entire API is `Future`-returning, and the only choice offered is *which* executor (tokio or smol). So taking `rtnetlink` means either tokio or smol becomes a project-wide dependency, and every netlink call site becomes `.await`.
+
+`[F]` **HIGH** — **The layer below is completely async-free.** `netlink-sys`'s manifest: `default = []`, with `tokio`, `mio` and `async-io` all `optional = true` behind `tokio_socket` / `mio_socket` / `smol_socket`. Source: <https://github.com/rust-netlink/netlink-sys/blob/main/Cargo.toml>. Its default `Socket` is a plain blocking fd.
+
+`[R]` **HIGH** — **The constraint our domain imposes on D2 is therefore not "async or sync"; it is narrower and stranger, and it points the other way from `rtnetlink`.** Three facts from earlier in this document combine into it:
+1. **A netlink socket is permanently bound to the netns it was created in** (§2.6 item 4). We need one socket per container netns, opened *after* `setns`.
+2. **`setns` is per-thread** and there is no whole-process form (§1.4). So the socket must be created on a thread that is currently in the container's netns.
+3. **§1.5's socket trick** requires the same: create a socket inside the netns, then move the thread back out, and keep serving that socket.
+
+So the shape our domain needs is: **"run this closure on a dedicated OS thread pinned into netns X, then restore."** That is a *thread* primitive, not a task primitive. An async runtime actively fights it — a `tokio` task can be moved between worker threads between `.await` points, and a worker thread that has been `setns`'d is a landmine for every unrelated task the scheduler hands it. Getting this right under tokio means `spawn_blocking` or a dedicated single-threaded runtime per namespace, i.e. paying for the executor and then working around it.
+`[R]` **HIGH** — **Our recommendation to D2: nothing in D4 requires async, and D4's central primitive is hostile to a work-stealing executor. Do not let networking be the reason the project takes on tokio.** If D2 wants tokio for other reasons (an HTTP API, concurrent image pulls in D3), that is a legitimate decision D2 owns — but then **networking must run on dedicated `std::thread`s with blocking netlink sockets anyway**, not as tasks. Either way the netlink code is the same synchronous code. **→ Handoff to D2: the async call is yours; this is the constraint, not a vote.**
+
+`[F]` **MED** — One concrete gotcha from a production implementation that we would otherwise discover the hard way: netavark sets `NETLINK_GET_STRICT_CHK` on every socket, with the comment *"Needs to be enabled for dump filtering to work"*:
+```rust
+let mut socket = wrap!(netlink_sys::Socket::new(P::PROTOCOL), "open")?;
+let addr = &SocketAddr::new(0, 0);
+socket.set_netlink_get_strict_chk(true)?;
+wrap!(socket.bind(addr), "bind")?;
+wrap!(socket.connect(addr), "connect")?;
+```
+Source: <https://github.com/containers/netavark/blob/main/src/network/netlink.rs>. Without it, kernel dump requests ignore the filter fields in your request and hand you everything, so `RTM_GETLINK` filtered by ifindex silently returns the whole link table. `[R]` — set it; and note it is exposed by `netlink-sys`, which is a small argument for taking that crate rather than calling `libc::setsockopt` ourselves.
+
+### 12.2 The decisive evidence: what netavark actually depends on
+
+`[C]` **HIGH** — **netavark 2.1.0 is a production Rust container network stack — Podman's only supported backend as of Podman 6.0 — and its dependency list is a direct answer to this entire section.** Verbatim from its `Cargo.toml`:
+```toml
+netlink-packet-route = "0.33.0"
+netlink-packet-core  = "0.9.0"
+netlink-sys          = "0.9.0"
+nftables             = "0.6.3"
+nix     = { version = "0.31.3", features = ["net", "sched", "signal", "socket", "user"] }
+ipnet   = { version = "2.12.1", features = ["serde"] }
+fs2     = "0.4.3"
+tokio   = { version = "1.53.1", features = ["rt", "rt-multi-thread", "signal", "fs", "time"] }
+zbus    = "5.19.0"
+mozim   = "0.3.2"
+```
+Source: <https://github.com/containers/netavark/blob/main/Cargo.toml>
+
+Read what is *absent*: **no `rtnetlink`, no `netlink-proto`, no `nftnl`, no `rustables`, no `iptables`.** netavark uses the packet crates and writes its own ~200-line synchronous `Socket<P>` on top of `netlink_sys::Socket` — send, recv, sequence check, multipart loop — and that is the entirety of its netlink transport (§12.1's snippet, plus a `recv` loop that walks multipart messages and matches on `NetlinkPayload::{Done, Error, InnerMessage}`). Its `tokio` dependency is for the **DHCP proxy's gRPC server** (`tonic`), not for netlink. Its `fs2` dependency is for `flock` on firewall state (§9.7).
+
+`[R]` **HIGH** — **This is the single strongest signal available and we should follow it: take the packet crates, write the socket loop, skip `rtnetlink`.** It is also almost exactly what §2.6 independently concluded from first principles ("write it ourselves… the message set is tiny and frozen") — with one refinement. §2.6's argument was against libraries in general; the netavark evidence splits the decision cleanly: **the byte-level TLV encoding is worth taking from a library** (it is 47k lines of tedium with zero learning value beyond the first hour), while **the socket, the sequencing, and the error mapping are worth writing** (that is the part that is actually about how a container engine talks to the kernel, it is ~200 lines, and it is where all the interesting failure modes live).
+
+### 12.3 Crate-by-crate
+
+Health data from crates.io, 2026-09-04. `unsafe` counts are `grep -c unsafe` over `src/` from a fresh shallow clone — a crude but honest proxy.
+
+| Crate | ver / last release | recent dl (90d) | `unsafe` / src lines | RUSTSEC | Hides mechanics we want to learn? | Verdict |
+|---|---|---|---|---|---|---|
+| `netlink-sys` | 0.9.0 / 2026-08-18 | 8.87M | 22 / 1712 | none | barely — it is `libc::socket/bind/sendto` plus `setsockopt` | **take** |
+| `netlink-packet-core` | 0.9.0 / 2026-08-18 | 9.15M | **0** / 2653 | none | no — it *is* `nlmsghdr` in Rust types | **take** |
+| `netlink-packet-route` | 0.33.0 / 2026-08-18 | 8.43M | **0** / 47028 (286 files) | none | somewhat — hides the TLV byte layout, which is the one thing §2.6 says will bite. Read `link_info/veth.rs` once, then use it | **take** |
+| `netlink-proto` | 0.13.0 / 2026-08-18 | 7.20M | 1 / 1406 | none | yes — hides sequencing and demux, which we want to own | **avoid** |
+| `rtnetlink` | 0.23.0 / 2026-08-18 | 4.24M | 0 / 9916 | none | **yes, and the wrong ones** — hides the message construction *and* imposes an executor | **avoid** |
+| `neli` | 0.7.4 / 2026-01-28 | 10.07M | — | none | different design; has a real `sync` feature | **avoid** (see below) |
+| `genetlink` | 0.3.0 / 2026-08-18 | 213k | — | none | n/a — we need no generic-netlink family | **defer/never** |
+| `netlink-packet-netfilter` | 0.4.0 / 2026-08-22 | **680** | — | none | for conntrack (§9.5) | **defer** — 680 downloads is not a dependency, it is a prototype |
+| `nix` | 0.31.3 / 2026-05-11 | 170M | large but audited | RUSTSEC-2021-0119 (`getgrouplist`, patched ≤0.23) | no — thin typed syscall wrappers | **take** |
+| `ipnet` | 2.12.1 / 2026-08-02 | 136M | — | none | no — CIDR arithmetic | **take** |
+| `nftables` | 0.6.3 / 2025-08-15 | 546k | **0** / 3993 | none | partly — hides the nft expression *encoding*, not the semantics | **take (MVP)** |
+| `nftnl` (+`nftnl-sys`) | 0.9.4 / 2026-08-11 | 58k | 137 / 3007 **+ 8537 / 46288** | **RUSTSEC-2025-0126** (patched ≥0.9.0) | no, but see the C tax below | **defer** |
+| `rustables` | 0.8.8 / 2026-06-23 | 20k | 13 / 5753 | none | no — pure-Rust nft netlink | **defer** |
+| `iptables` | 0.6.0 / 2025-08-07 | 379k | — | none | it is `Command::new("iptables")` | **avoid** |
+| `fs2` | 0.4.3 / **2018-01-06** | 16.6M | — | none | no — `flock` | **avoid**, use `nix` (see below) |
+
+Notes on the entries that need them:
+
+`[R]` **MED** — **`neli` vs the rust-netlink stack.** `neli` 0.7.4 is healthy (10M downloads/90d, releases through Jan 2026) and is the only crate here that offers **both** `sync` and `async` as first-class features, which on paper is exactly our constraint. Take rust-netlink anyway, for one reason: **`netlink-packet-route` has the specific attributes we need, already typed, and `neli` leans more on you to build the attribute payloads.** Verified coverage — every item in §2.6's table plus every bridge-flag recommendation in §3.4/§3.5/§7.2:
+```
+InfoVeth::Peer(LinkMessage)          <- §2.6 op 4, the embedded ifinfomsg, the "genuinely fiddly encoding"
+LinkAttribute::NetNsFd(RawFd) | NetNsPid(u32)        <- §2.3, and the fd form that avoids the pid race
+LinkAttribute::Controller(u32)       <- IFLA_MASTER,  §2.6 op 5
+LinkAttribute::Link(u32)             <- IFLA_LINK, the peer's ifindex
+LinkAttribute::{IfName, Mtu, Address}, link_info/bridge.rs
+InfoBridgePort::Isolated(bool)       <- §3.4/§7.2's recommended --icc mechanism
+InfoBridgePort::HairpinMode(bool)    <- §3.5
+```
+Sources: <https://github.com/rust-netlink/netlink-packet-route/blob/main/src/link/attribute.rs>, `.../src/link/link_info/veth.rs`, `.../src/link/link_info/bridge_port.rs`. Also: netavark bets on rust-netlink, so bugs we hit are bugs Podman hits.
+
+`[F]` **MED** — A genuinely useful fact carried in `netlink-packet-route`'s own source comment on `InfoVeth`, which would otherwise cost us an afternoon:
+```rust
+// This data is not for querying/dumping as in kernel 6.5.8,
+// because the `struct rtnl_link_ops veth_link_ops` does not have `fill_info`.
+// Only for create veth
+```
+i.e. **you cannot read a veth's peer back out of `IFLA_LINKINFO`/`INFO_DATA`** — the kernel never fills it in. The peer is discoverable only as `IFLA_LINK` (an ifindex, which is why §1.6 saw `hostend@if2`). That matters for §9.7's reconcile pass: to find our veths on the host we match on the **name prefix**, not on peer information.
+
+`[R]` **HIGH** — **`fs2`: last release January 2018.** netavark uses it; we should not. It is eight years unmaintained and it does nothing `nix` does not: `nix::fcntl::{Flock, FlockArg}` gives `flock(2)` with an RAII guard, and we are taking `nix` regardless. One fewer dependency for zero lines of code. (`fs4` is the maintained fork if a guard-shaped API is wanted, but this is not worth a crate.)
+
+`[R]` **HIGH** — **What `nix` covers, so we do not go looking elsewhere.** With features `["sched","mount","socket","net","fs","signal","user","process"]`: `sched::{unshare, setns, CloneFlags}` (§1.3, §1.4), `mount::{mount, umount2, MsFlags, MntFlags}` (§1.2's bind mount and §9.7's `MNT_DETACH`), `fcntl::Flock` (§10.5), `net::if_::if_nametoindex`, `sys::socket::*`, `unistd::{fork, pipe, dup2}`. `[F]` — **what `nix` does *not* cover is any netlink message encoding at all.** It gets us every syscall in §1 and §9 and none of §2. That division is the reason the answer is "`nix` + the packet crates", not "one or the other".
+
+### 12.4 nftables and iptables crates
+
+Three genuinely different designs, and the differences are more interesting than the version numbers.
+
+**`nftables` 0.6.3 (`nftables-rs`) — typed Rust structs → nft's JSON API → the `nft` binary.** `[F]` **HIGH** — `helper::apply_ruleset` builds JSON with serde and pipes it to a subprocess:
+```rust
+const NFT_EXECUTABLE: &str = "nft"; // search in PATH
+...
+let default_args = ["-j", "-f", "-"];
+let process = nft_cmd.args(args).args(default_args)
+    .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn();
+```
+and reads back with `get_current_ruleset_with_args(..., ["list","table","inet","netavark"])` → `serde_json::from_str::<Nftables>`. Errors are `NftFailed { program, hint, stdout, stderr }`. Source: <https://github.com/nftables-rs/nftables-rs/blob/main/src/helper.rs>
+`[C]` **HIGH** — **This is what netavark uses**, via `nftables::batch::Batch` + `helper::apply_ruleset`, in its `src/firewall/nft.rs`, for a table named `netavark` with chains at explicit priorities `DNATPRIO = -100`, `SRCNATPRIO = 100`, `FILTERPRIO = 0`. Source: <https://github.com/containers/netavark/blob/main/src/firewall/nft.rs>
+`[R]` **HIGH** — **Take it for the MVP.** It gets us the four things §5.4 actually asked for: **atomicity** (one `nft -j -f -` per operation is one kernel transaction), **typed rule construction** (a serde struct, checked at compile time, not a formatted string), **named sets and maps**, and **`inet`-family single-table rules** — with zero `unsafe`, zero C linkage, and 546k downloads/90d behind Podman's production use. Tradeoffs, stated plainly: (1) a **runtime dependency on the `nft` binary**, which on a minimal host may be absent — detect at startup and fail with a clear message, do not discover it mid-setup; (2) **errors arrive as stdout/stderr strings**, so we cannot switch on an errno — which §2.6 correctly calls a trap for `ip`, but is far less costly here because §5.4's design has exactly one nft operation per container (a whole-table transaction) rather than twelve; (3) one `fork`+`exec` per container start; (4) `nftables-rs`'s last release is 2025-08-15, about a year old — slow, but not dead, and Podman's dependence on it is meaningful insurance.
+`[R]` **MED** — Note this **partly contradicts §5.4's `[R] MED` recommendation of `nftnl`.** §5.4 framed `nft -f -` as "an honest stopgap"; the new evidence is that it is what the reference production implementation ships permanently. Flagged in §14 for the verification pass.
+
+**`nftnl` 0.9.4 + `nftnl-sys` — FFI to `libnftnl` (+`libmnl`).** `[R]` **MED** — **Defer, and the reason is a concrete tax rather than a vibe.** `nftnl-sys` carries **26 checked-in bindgen outputs, one per libnftnl release** (`nftnl_1_0_6.rs` … `nftnl_1_3_0.rs`, 46288 lines total, 8537 `unsafe`), selected by 24 cumulative Cargo features (`nftnl-1-1-0 = ["nftnl-1-0-9"]`, …). You choose at *build* time which libnftnl ABI you are compiling against, and it must agree with the `libnftnl.so` on the *host* at run time. Source: <https://github.com/mullvad/nftnl-rs>. For a project that wants to ship one binary that works on Ubuntu 24.10 and Rocky 8.8 alike, that is a real distribution problem, not a footnote.
+`[F]` **HIGH** — And the safety record is the argument §5.4 could not have made, because both advisories postdate it being written into a recommendation:
+- **RUSTSEC-2025-0126** (2025-10-18), `nftnl`, category `memory-corruption`: *"A heap-buffer-overflow vulnerability exists in the Rust wrapper for libnftnl, triggered via the nftnl::Batch::with_page_size constructor."* Patched in ≥0.9.0.
+- **RUSTSEC-2025-0142** (2025-10-18), `mnl` (the `libmnl` wrapper underneath), also `memory-corruption`: *"The function `mnl::cb_run` is marked as safe but exhibits unsound behavior when processing malformed Netlink message buffers… The underlying issue is a bug in `libmnl` where during validation `nlh->nlmsg_len` is cast to an `int` and becomes negative if `nlmsg_len` is greater than `INT_MAX`."* Patched in ≥0.3.1.
+Sources: <https://github.com/rustsec/advisory-db/blob/main/crates/nftnl/RUSTSEC-2025-0126.md>, <https://github.com/rustsec/advisory-db/blob/main/crates/mnl/RUSTSEC-2025-0142.md>
+`[R]` **MED** — Both are patched and neither is exploitable by an attacker in our threat model (we control the page size and the buffers). The signal is not "these crates are dangerous"; it is that **two memory-corruption advisories landed on the same day against the C-FFI layer of a firewall stack, and one of them was a `safe` function that segfaults on malformed input we would be feeding it from the kernel.** For a project whose stated premise is owning the mechanism, taking on 8500 lines of generated `unsafe` to write firewall rules is the wrong trade when a zero-`unsafe` option with the same atomicity exists.
+
+**`rustables` 0.8.8 — pure Rust, its own nftables netlink implementation.** `[R]` **LOW→MED** — **Defer, but revise the earlier assessment upward slightly.** §5.4 called it "too thin to bet on" at ~44k lifetime downloads; it is now 47.5k lifetime / 20k in 90 days, so it is being used a little. The interesting datum §5.4 did not have: it is **5753 lines with 13 `unsafe`** — a genuine pure-Rust nft netlink stack, no C, and structurally the thing we would eventually want. It is still ~2% of `nftables-rs`'s usage and it moved to GitLab. `[R]` — the right posture is §5.4's: keep the firewall trait, revisit later, migrate behind it if it matures. Migration is contained precisely because §5.4 put the trait there.
+
+**`iptables` 0.6.0 — a subprocess wrapper, and a nice illustration of the trap.** `[F]` **HIGH** — it is `std::process::Command`, it parses `iptables --version` with a regex to discover the version, and it branches on the result:
+```rust
+let cmd = if is_ipv6 { "ip6tables" } else { "iptables" };
+let version_output = Command::new(cmd).arg("--version").output()?;
+...
+fn exists(...) { if <old version> { return self.exists_old_version(table, chain, rule); } ... }
+...
+output = output_cmd.args(args).arg("--wait").output()?;   // --wait only on new enough versions
+```
+Source: <https://github.com/yaa110/rust-iptables/blob/master/src/lib.rs>
+`[R]` **HIGH** — **Avoid, and note that the crate's own existence is the evidence for §5.4's argument.** A well-maintained wrapper (379k downloads/90d) still has to sniff the binary's version and keep two code paths for "does this build support `-C`", plus conditional `--wait` for the xtables lock. That is version skew as a permanent, structural cost — on top of §5.1's finding that `iptables` on any modern host is *already* a translation layer onto nftables. Using this crate means: our Rust talks to a subprocess, which parses a syntax, which translates to nft expressions, which reach the same kernel subsystem `nftables-rs` addresses in one hop.
+
+`[R]` **MED** — **Conntrack (§9.5) has no good crate.** `netlink-packet-netfilter` 0.4.0 has **680 downloads in 90 days**; `conntrack` 0.1.5 has 12.8k. Neither is a dependency I would take for a security-relevant flush. `[R]` — **shell out to `conntrack -D -d <ip>` for the MVP**, treat a missing binary as a warning not an error, and hand-roll ctnetlink later if it matters (`IPCTNL_MSG_CT_DELETE` is a small message and we will already own a netlink socket loop by then).
+
+### 12.5 Is shelling out an acceptable MVP shortcut, or a trap?
+
+`[R]` **HIGH** — **It depends entirely on the tool, and the deciding question is: "is the thing I need back from this tool an error I have to branch on?"** That single test sorts all four cases, and it explains why §2.6 and §5.4 reach opposite conclusions about `ip` and `nft` without contradicting each other.
+
+| Tool | Ops per container start | What we need back | Verdict |
+|---|---|---|---|
+| `ip` | ~12 | **typed errors** — `EEXIST` vs `EPERM` vs `ENODEV` is what makes §9.7's setup idempotent and resumable | **trap.** §2.6 settled this; §9 strengthens it |
+| `nft` | **1** (a whole-table transaction) | success or failure, atomically | **acceptable, and it is what production Rust ships** |
+| `iptables` | ~6, non-atomic | typed errors, on a translation layer, with version skew | **trap, twice over** |
+| `conntrack` | 1, best-effort | nothing; failure is a warning | **acceptable** |
+
+The asymmetry is not about taste. §2.6's four objections to `ip` are (1) English errors, (2) the pid-not-fd race, (3) the `/var/run/netns` convention we reject, (4) `~12` execs. **Only objection (1) transfers to `nft`, and §5.4's atomicity turns 12 operations into 1, which shrinks the cost of a stringly-typed error by an order of magnitude** — a single failed transaction means "nothing happened", which is a complete and actionable answer even without an errno. Conversely, `ip`'s per-operation failures each need a *different* recovery decision, which is exactly what a parsed English string cannot give us.
+
+`[R]` **HIGH** — **Does this contradict "own the mechanism"? No, and the distinction is worth naming, because it will come up for every dependency decision in this project.** Our premise is understanding and owning the **interface between a container engine and the kernel**. For networking that interface is:
+- **rtnetlink** — a frozen, ~14-attribute, 3-message-type protocol (§2.6). Owning it is a weekend and it *is* the learning. **Own it.**
+- **nftables expressions** — a large, evolving bytecode-like encoding where `nft` is the reference compiler. Owning it is a month and teaches us about nftables' internal representation, not about containers. **Do not own it.** What we must own — and do own, completely, under §5.4 — is **the ruleset's semantics**: which chains, which priorities, which hooks, which sets, in what order, and why. That knowledge is in §4 and §5 and it is unaffected by whether the last hop is `libnftnl` or `nft -j -f -`.
+The honest line is: **we own every design decision and every packet path; we decline to own two byte-encodings, one of which we take a library for (TLV, `netlink-packet-route`) and one of which we take a compiler for (nft expressions, the `nft` binary).** Both are marked as such, with an upgrade path.
+`// ponytail: nft(8) as the firewall backend; swap in nftnl or rustables behind the firewall trait if the exec cost or the string errors ever bite.`
+
+### 12.6 Recommended set
+
+**Take:**
+```toml
+netlink-sys          = "0.9"    # blocking AF_NETLINK socket + setsockopt (NETLINK_GET_STRICT_CHK)
+netlink-packet-core  = "0.9"    # nlmsghdr framing, NetlinkMessage<T>
+netlink-packet-route = "0.33"   # RTM_* codec: veth peer, NetNsFd, Controller, bridge-port flags
+nftables             = "0.6"    # typed nft JSON -> `nft -j -f -`, one atomic transaction per op
+nix     = { version = "0.31", features = ["sched","mount","socket","net","fs","signal","user","process"] }
+ipnet   = { version = "2",   features = ["serde"] }   # CIDR arithmetic, subnet/host iteration
+```
+Six crates, no C linkage, no async runtime, no `unsafe` of our own except what `nix` and `netlink-sys` already encapsulate.
+
+**Avoid, implement ourselves (~250 lines total, and this is the part with the learning in it):**
+- **the netlink socket loop** — bind, connect, sequence numbers, multipart/`NLMSG_DONE` walking, `NLM_F_DUMP_INTR` restart, `ENOBUFS`, and mapping the `NetlinkPayload::Error` code onto a typed error our setup path can branch on (§2.6's long tail). Model on netavark's `Socket<P>`; ~200 lines.
+- **the setns-pinned-thread primitive** — `std::thread` + `setns(userns)` then `setns(netns)` (§1.4's order, non-negotiable), a socket created inside, restore-on-panic. ~50 lines and the single most architecturally important thing in this document (§1.5, §12.1).
+- **the userland proxy** for the three cases in §4.4 and the rootless case in §8.4 — accept/connect/copy, ~100 lines, no crate.
+- **IPAM** (§10) — no crate exists that is worth the dependency; it is a locked directory and a cursor.
+- **file locking** — `nix::fcntl::Flock`, not `fs2`.
+- **the firewall trait** — one trait, two eventual impls, per §5.4.
+
+**Defer:**
+- `nftnl` / `rustables` — behind the firewall trait, if `nft`'s exec cost or string errors ever measurably hurt. Revisit `rustables` specifically; it is the pure-Rust end state.
+- `netlink-packet-netfilter` / `conntrack` — for §9.5's flush. `conntrack -D` until then.
+- `genetlink` / `netlink-packet-generic` — nothing in stages 1–6 needs a generic-netlink family.
+- `rtnetlink` — only reconsider if D2 independently adopts tokio *and* we discover the pinned-thread model is unworkable, which §12.1 argues it will not be.
+- `neli` — the fallback if rust-netlink's release cadence ever stalls; it has the sync story and comparable reach.
+
+---
+
+## 13. Handoff
+
+Consolidating the inline handoff notes (§0, §1.3, §1.5, §2.6, §6.2, §8.1, §8.2) plus what §9–§12 added. Ordered by how much each item constrains the other domain's design rather than merely informing it.
+
+### 13.1 → D1 (kernel mechanics & isolation)
+
+1. **A newborn netns has `lo` DOWN with no `127.0.0.1`** (§1.1, `[O]`). `127.0.0.1/8` is added by the kernel in response to `NETDEV_UP` on a loopback device, not at namespace creation. Bringing `lo` up is mandatory in every mode including `--network=none`. If D1 owns namespace creation, this line belongs there.
+2. **`setns(2)` for a netns requires `CAP_SYS_ADMIN` in *two* user namespaces** — the target netns's owning userns *and* the caller's current userns (`netns_install()`, §1.4, kernel source quoted). **The order is always `setns(userns)` then `setns(netns)`.** This is the single most confusing `EPERM` in the whole domain and it is a general namespace fact, not a networking one.
+3. **`setns` is per-thread with no whole-process form** (§1.4). Combined with §2.6 item 4 (a netlink socket is permanently bound to its creating netns) and §1.5 (a socket's netns is fixed at `socket(2)` time), this produces the primitive D2 must provide (§13.2 item 1).
+4. **`/proc/sys/net/**` is entirely per-netns and writable by userns-root** (§1.1, §8.1, both `[O]`). So `ping_group_range` and `ip_unprivileged_port_start` are fixable *inside* the container with no host change — which is why §8.5's "rootless can't bind :80" folklore is wrong.
+5. **Writing `net.ipv4.ip_forward` resets all other IP configuration to defaults** (`ip-sysctl.txt`, §1.1, `[F]` HIGH). Any sysctl-setting code D1 owns must order `ip_forward` first and must read-then-write, never blind-write.
+6. **Device migration on netns death is asymmetric**: physical devices move back to the initial netns, virtual devices (veth) are destroyed (`network_namespaces(7)`, §1.6). This is the fact that makes veth cleanup unnecessary and it is worth stating in D1's namespace-lifecycle section.
+7. **`dev->netns_immutable` (was `NETIF_F_NETNS_LOCAL`)** blocks moving `lo` and many physical drivers between namespaces even with full privilege (§8.1). Ext-ack text: `"The interface netns is immutable"`.
+8. **nsfs identity**: `stat().st_ino` on a netns fd *equals* the namespace id printed in `net:[...]` (§1.2, `[O]`). Cheap identity comparison with no string parsing — useful anywhere D1 needs to answer "same namespace?".
+9. **New in §12.1**: `NETLINK_GET_STRICT_CHK` must be set on a netlink socket or the kernel ignores dump filters and returns everything. A general netlink fact, easy to lose a day to.
+
+### 13.2 → D2 (runtime architecture, the async decision, the state model)
+
+**The four hard constraints, in order of cost-if-ignored:**
+
+1. **We need "run this closure on a dedicated OS thread pinned into netns X, then restore".** Forced by §1.4 (setns is per-thread), §1.5 (socket netns is fixed at creation), and §2.6 item 4 (netlink socket is netns-bound). It must be a *thread* primitive with a `Drop`/panic-safe restore, and it must be usable both transiently (create a socket, come back) and for the whole duration of a setup sequence. Everything in D4 is built on it.
+2. **The async decision is D2's, and D4 does not vote for async — it votes against work-stealing.** (§12.1, with manifest evidence.) `rtnetlink` is the only crate that would force tokio and we recommend not taking it; the packet crates are async-free. More important than the crate choice: **a work-stealing executor is actively hostile to constraint 1**, because a `setns`'d worker thread will later be handed unrelated tasks. If D2 adopts tokio for D3/API reasons, networking must still run on dedicated `std::thread`s with blocking sockets. State this explicitly in D2 so nobody "fixes" it later.
+3. **A synchronization point before the container's `execve`.** §1.3 established that networking setup happens *after* the container process exists (we pin `/proc/<pid>/ns/net`), so the container must block until setup completes or its first instruction runs without `eth0`. Docker/CNI use a socket or a completed `createRuntime` hook. D2 needs this barrier anyway; D4 depends on it.
+4. **The network sandbox is a first-class entity with its own refcount, distinct from the container** (§7.3, reinforced by §9.7). It owns the netns, the bind mount, and the veths; containers attach to it. Getting this wrong is a painful refactor and getting it right costs one struct. It is also why we need no pause container: the nsfs bind mount is a better primitive than "a process holds the namespace".
+
+**The state model, which §9 and §10 turn into requirements:**
+
+5. **One source of truth, and it is the container/endpoint record — not a separate allocation store.** (§10.2, following Docker's `RequiresRequestReplay` + `reservePools()`.) IPAM is an index rebuilt by replay, not a database. This eliminates the two-phase commit whose crash window produces double-allocated addresses. **D2 must not model the IPAM store as authoritative.**
+6. **The record must outlive the host state it describes.** (§9.3, and §9.2's production leak is what violating it costs.) Write the tombstone *before* the first host mutation of a teardown; delete the record *after* the last one succeeds. Docker's `networkCleanup()` can only retry deletes for records that still exist with `inDelete` set — the orphan in §9.2 is unreachable precisely because its record went first.
+7. **Setup must be idempotent, and there must be exactly one setup path.** (§9.7, following netavark's `firewall-reload`, which recovers by re-running the ordinary `setup_network`/`setup_port_forward`.) No separate "restore" code path. This is a constraint on how D2 structures create/start/restore.
+8. **Teardown must be best-effort and must never error merely because something is already gone.** (§9.4, CNI: *"Plugins MUST accept multiple DEL calls … and return success if the interface in question, or any modifications added, are missing."*) Every step runs, errors are collected, not short-circuited.
+9. **We need a reconcile/GC entry point that D2 calls with the live container set.** (§9.7, §11.5.) CNI 1.1 added a `GC` verb for exactly this and Docker's `cleanupLocalEndpoints()` is the same algorithm. D2 owns "what is alive"; D4 owns "what exists on the host". Neither can do it alone. Trigger it on daemon start, or on first CLI invocation after boot if daemonless.
+10. **The daemon/daemonless choice determines the IPAM concurrency mechanism** (§10.5). Daemon ⇒ an in-process mutex suffices; daemonless ⇒ `flock` is mandatory. We recommend `flock` either way (correct under both, and it protects the daemon from its own recovery tooling), but D2 should know this is the coupling.
+11. **Rootless: any network helper must be launched from a process already inside the container's userns**, never from the daemon (§8.2, verified `EPERM` on `uc-arcc`). A process-topology constraint that is invisible until it fails.
+12. **Never `unshare(CLONE_NEWNET)` on a thread of a multi-threaded daemon** (§1.3). Prefer letting container creation make the netns and pinning it afterwards.
+13. **Our state directory is `/run/mydocker/` rootful and `$XDG_RUNTIME_DIR/mydocker/` rootless** (§8.1, `[O]`: `mkdir` in `/run` fails even as root-in-userns, because file ownership is not namespaced). Netns bind-mount paths, the IPAM lock, and the firewall intent files all live there.
+
+### 13.3 → D3 (images & storage)
+
+1. **`/etc/resolv.conf` and `/etc/hosts` are generated per container on the host and bind-mounted over the image's copies** (§6.2, `[F]` HIGH). They are not image content and never enter a layer. D3 owns the file lifecycle and the mount; D4 owns the content. Docker's paths: `/var/lib/docker/containers/<id>/{resolv.conf,hosts}`.
+2. **Both files are mutable after creation and must be rewritable while the container runs.** §6.5 stage 2 appends peer entries to `/etc/hosts` as containers join and leave a network, which means the bind-mount source must be a real file we can rewrite in place — not a copy baked at create time. This constrains D3's mount plan.
+3. **`/etc/hostname` must agree with the `/etc/hosts` line for the container's own IP** (§6.2, `[O]`: `172.18.0.4 301b2be6f7c8`). A large amount of software calls `gethostname()` then resolves it.
+4. **These bind mounts are host state that outlives us** (§9.1) — unmounting them is our teardown's job, and a leaked one is a stale mount-table entry pointing into a deleted container directory.
+5. **Nothing in D4 needs the image at all.** Worth stating: networking is entirely independent of image format, layers and the storage driver. There is no ordering dependency between D3 and D4 beyond items 1–4.
+
+### 13.4 → D5 (cgroups, security, rootless)
+
+1. **`CAP_NET_ADMIN` in the userns owning the target netns is the whole gate** (§8.1, kernel source). The permission decision lives in the rtnetlink layer, not in `veth.c` — so it is uniform across every device operation, and there is no per-device policy to discover.
+2. **The rootless wall, precisely**: everything works *inside* an unprivileged netns (bridges, veths, addresses, enslaving, nft `nat` chains, network sysctls — all `[O]` verified on `uc-arcc`); the *only* thing that fails is connecting that netns to the host stack (`ip link set <peer> netns <host-pid>` → `EPERM`). That single `EPERM` is why usermode networking exists.
+3. **"Rootless containers can't bind port 80" is wrong** (§8.5, kernel source + `[O]`). `ip_unprivileged_port_start` and the `CAP_NET_BIND_SERVICE` check are both evaluated against the *socket's* netns and its owning userns, so a rootless container binds `:80` internally with no change at all. Only a **host-side** port < 1024 is blocked. D5 should not carry the folklore.
+4. **Do not build a setuid helper** (§8.6). For a project whose premise is understanding the machinery, a setuid binary is the one component where a mistake is a local root exploit. `--network=host` or the usermode cost are honest answers.
+5. **Shell out to `pasta`; do not write a usermode TCP/IP stack** (§8.3, §8.7). ~5000 LoC, seccomp-sandboxed (34/43 syscalls), Podman's default since 5.0 and now its *only* rootless option (§14 item 3). Its `splice()` local bypass measures 64–71 Gbps, i.e. at or above kernel veth.
+6. **Per-netns sysctls we should set for the container and the security reasoning**: `ping_group_range` (so `ping` works without `CAP_NET_RAW`; free and per-netns) and, only if asked, `ip_unprivileged_port_start`. Never `route_localnet` (§4.4: it re-introduces the pre-Docker-28 L2 leak where hosts on the same switch reach ports published to localhost).
+7. **New in §11.4: enabling `ip_forward` is a security change the admin did not request.** If we set it we must also install a default-deny on `filter/FORWARD` (Docker 28's `ip-forward-no-drop` pairing), and log both loudly. And per §9.7 we must never auto-revert either on uninstall.
+8. **New in §9**: partial firewall state is a *security* failure, not just a cosmetic one — a `filter` ACCEPT without the matching `raw` anti-spoof rule reopens §4.5's pre-28 hole (any host that can route to a container address reaches every port on it). This is the security argument for §5.4's atomic-transaction requirement, and it is why stage 5 must not ship on rule-at-a-time iptables.
+9. **`MYDOCKER-USER`**: create an empty chain jumped to first, never write into it, never flush it (§4.6) — it is the only mechanism by which a host admin can override us. And warn on first `-p` when we detect a foreign firewall manager (`ufw-*`, `firewalld`, `f2b-*`), because `ufw deny 80` does not stop `-p 80:80` and nothing anywhere tells the admin that.
+10. **Rootless state must live under a directory the real user owns** (§8.1, `[O]`: root-in-userns cannot `mkdir` in `/run`). Capabilities are namespaced; file ownership is not.
+
+---
+
+## 14. Open questions
+
+### 14.1 Unresolved in this document
+
+1. **Provenance of the §9.2 production orphan.** The *state* is `[O]` HIGH; how it got there is not established. **Settle with:** `journalctl -u docker --since '<network creation date>' | grep 0d4cf39c58f7` on `my-droplet` (read-only, permitted, and not yet run), plus reproducing the three candidate paths on a local VM: `docker network rm` with a rule-delete forced to fail, `SIGKILL` of dockerd mid-`network rm`, and `docker network rm` while a container is still attached.
+2. **Whether Docker's `nat`/`raw` rules for a live network are re-derived at daemon start or only written at network-create time.** §9.2's evidence (filter cleaned, nat + raw leaked) implies the latter, but I inferred it from the end state rather than reading `setupPlatformFirewall()`/the bridge driver's init path. **Settle with:** `moby/daemon/libnetwork/drivers/bridge/bridge_linux.go` `createNetwork`/`Restore` paths, plus `iptables-save` diffs across a `systemctl restart docker` on a VM.
+3. **Whether our reconcile pass can safely run while containers are live.** §9.7 proposes "delete the nft table and re-add from intent in one transaction". That is atomic at the netfilter level, but conntrack entries created under the old ruleset survive it (§9.5), so a rebuild may need a conntrack flush for every live container — which would briefly break in-flight UDP. **Settle with:** an experiment on a local VM measuring whether established TCP and UDP flows survive `nft delete table` + immediate re-add in one transaction.
+4. **The cost of `nft -j -f -` per container start.** §12.5 accepts one `fork`+`exec` per operation. Unmeasured. **Settle with:** timing 100 sequential container starts with the `nftables` crate vs. a hand-rolled `nftnl` path on a VM. If the exec is <5 ms it is settled forever.
+5. **Whether `flock` on a `/run` tmpfs is sufficient under all our access patterns** (§10.5). It is advisory and per-open-file-description; a process that opens the file twice can deadlock itself. **Settle with:** a small concurrency test — 50 parallel `mydocker run` on one network, asserting 50 distinct addresses and no wedge.
+6. **IPv6 end to end.** §4.4 concluded dual-stack containers are the right fix for the userland proxy, and §10.3 notes that the on-link-route safety net for pool selection **does not exist for IPv6**. So IPv6 IPAM has no collision protection and we have not designed one. Unresolved and deliberately deferred.
+7. **Whether a stale `docker-proxy`-equivalent can be identified reliably after our death.** §9.7 proposes matching `argv[0]`, which is racy (a user can spawn anything). A pidfd or a cgroup would be better. **→ overlaps D5.**
+8. **Sticky IPs across a host reboot** (§10.5). If our state lives in `/run` (tmpfs), it is gone at boot and every container gets a fresh address, invalidating §6.5's `/etc/hosts` snapshots on restart. host-local documents both options (`/var/lib/cni` vs `/var/run/cni`) without choosing. We have not chosen either. **Settle with:** a decision, not research — and it belongs with D2's state model.
+
+### 14.2 Existing claims (§0–8) the verification pass should challenge
+
+9. **Cross-reference drift, mechanical.** §1.6 ("See §10"), §2.6 ("(§10)"), §3.3 ("→ §10"), §4.4 ("(§10)") and §5.4 ("§10, partial state after a crash", "reconciliation (§10)") all mean **§9**. §6.5's "sticky per container name (§11)" means **§10**. §5.4's "(§12)" and §2.6's "the alternative libraries all drag in tokio (§12)" are correct. Fix the pointers; do not renumber the sections.
+10. **§5.4's `[R] MED` recommending `nftnl` should be downgraded or reversed.** New evidence in §12.4: netavark — Podman's only supported backend as of Podman 6.0 — uses the `nftables` crate (typed JSON → `nft -j -f -`) in production, not `nftnl`; `nftnl-sys` carries 26 per-libnftnl-version bindgen outputs behind 24 cumulative Cargo features, which is a real distribution problem for a portable binary; and `nftnl`/`mnl` both took memory-corruption RUSTSEC advisories on 2025-10-18. §5.4's own fallback ("`nft -f -` is an honest stopgap") is in fact the production answer, not a stopgap.
+11. **§5.3's `[LOW]` on the iptables-removal timeline is now settled and should be upgraded to `[C] HIGH`.** Podman's `RELEASE_NOTES.md`, 6.0.0 Breaking Changes, verbatim: *"Support for running on iptables has been removed. Please use nftables instead."* The same list also removes CNI (*"Support for CNI networking has been removed. Please use Netavark instead."*) and slirp4netns (*"Support for the slirp4netns rootless network stack has been removed. Please use Pasta instead."*). Source: <https://github.com/containers/podman/blob/main/RELEASE_NOTES.md>. This also retroactively strengthens §5.4 and §8.3 from "direction of travel" to "the ecosystem has finished moving".
+12. **§1.1's `[LOW]` mechanism for `ip_forward = 1` in a fresh netns** is still open. Two hosts, one kernel each, and the mechanism (a mutated `ipv4_devconf` template) is a guess. **Settle with:** `devinet_init_net()` for the exact kernel, plus a repeat on a host whose `ip_forward` is 0 — which is easy on the coming local VM and is the cleanest test in the file.
+13. **§6.1's `[MED]` on *why* the embedded resolver binds a random high port** rather than `:53`. The conflict-avoidance explanation is the only one consistent with the design but is not sourced. **Settle with:** the libnetwork resolver's commit history. Note §6.5 stage 3 already recommends *not* copying the design, so this is curiosity, not a blocker.
+14. **§8.7's flagged 10× discrepancy on pasta at MTU 1500** (RootlessKit 0.24 Gbps vs. passt's own CI 2.5 Gbps) is still unresolved. Both benchmarks on one host would settle it. Note that §13.4 item 5 leans on pasta, so this is worth closing.
+15. **§3.1's `[O]` list of "the three bridges" should be re-read in light of §9.2.** It records `br-0d4cf39c58f7 172.19.0.1/16 NO-CARRIER` as ordinary state alongside `docker0`. One of those two is a normal idle bridge and the other is an orphan with no owning network; the section treats them identically. The observation is correct, the framing under-reads it.
+16. **§4.4's `[F] MED` on what `docker-proxy` does internally** (accept/connect/copy, per-source-tuple UDP map) is inferred from behaviour, not from source. Low stakes — §4.4 recommends writing our own — but if it is going to be our design template it should be read: `moby/cmd/docker-proxy/`.
+17. **§2.6's `[O] MED` that `ip link set v1 netns /proc/<pid>/ns/net` is rejected while the pid form is accepted** was observed on one iproute2 version on `uc-arcc` (4.18-era). Worth re-checking on the 6.11 host, since the claim is used to argue that even `ip`'s argument grammar is unstable.
+18. **Minor numbering nit:** §4.4 calls IPv6 dual-stack "a stage-6 item", but §11's ladder (which matches §3.2's "stage-4 model" for bridge+NAT) puts DNS at stage 6. Read §4.4's as "stage 6+".
+
+---
+
+## 15. Sources
+
+Consolidated. Items marked † are cited in §0–8 by name only (no URL in the original text) and the URL here is my reconstruction — verify before quoting. **Known gap:** a handful of §8's numbers (the RootlessKit CI tables, the passt CI figures, the `slirp4netns.1` and `passt.1` man-page quotations, Podman 5.0.0's release note, and moby issues #14041/#22054/#48815) are cited in the text without URLs and I could not recover the exact pages consulted; the canonical entry points are listed below instead.
+
+**Kernel documentation & man pages**
+- `network_namespaces(7)` — <https://man7.org/linux/man-pages/man7/network_namespaces.7.html>
+- `namespaces(7)` — <https://man7.org/linux/man-pages/man7/namespaces.7.html>
+- `veth(4)` — <https://man7.org/linux/man-pages/man4/veth.4.html>
+- `netlink(7)` — <https://man7.org/linux/man-pages/man7/netlink.7.html>
+- `rtnetlink(7)` — <https://man7.org/linux/man-pages/man7/rtnetlink.7.html>
+- `setns(2)` — <https://man7.org/linux/man-pages/man2/setns.2.html>
+- `unshare(2)` — <https://man7.org/linux/man-pages/man2/unshare.2.html>
+- `ip-netns(8)` — <https://man7.org/linux/man-pages/man8/ip-netns.8.html>
+- `ip-sysctl.txt` (`ip_forward`, `route_localnet`, `ping_group_range`, `ip_unprivileged_port_start`) — <https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt>
+- Linux bridge + netfilter — <https://www.kernel.org/doc/html/latest/networking/bridge.html>
+- † `ip-link(8)` (bridge and bridge_slave sections) — <https://man7.org/linux/man-pages/man8/ip-link.8.html>
+- † `slirp4netns(1)` — <https://github.com/rootless-containers/slirp4netns/blob/master/slirp4netns.1.md>
+- † `passt(1)` / `pasta(1)` — <https://passt.top/passt/about/>
+
+**Kernel source**
+- `net/core/net_namespace.c` (`netns_install`, the two-userns check) — <https://raw.githubusercontent.com/torvalds/linux/v6.11/net/core/net_namespace.c>
+- `net/core/rtnetlink.c` (`CAP_NET_ADMIN` gate, `rtnl_get_net_ns_capable`) — <https://raw.githubusercontent.com/torvalds/linux/v6.11/net/core/rtnetlink.c> and <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/net/core/rtnetlink.c>
+- `drivers/net/veth.c` (no capability check of its own) — <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/drivers/net/veth.c>
+- `net/ipv4/devinet.c` (`inetdev_init`, the loopback address) — <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/net/ipv4/devinet.c>
+- `include/uapi/linux/netlink.h` — <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/include/uapi/linux/netlink.h>
+- † `net/ipv4/af_inet.c` (`inet_port_requires_bind_service`, §8.5) — <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/net/ipv4/af_inet.c>
+
+**iproute2 source**
+- `lib/libnetlink.c` (`addattr_l`, the alignment rule) — <https://git.kernel.org/pub/scm/network/iproute2/iproute2.git/plain/lib/libnetlink.c>
+- `ip/link_veth.c` — <https://git.kernel.org/pub/scm/network/iproute2/iproute2.git/plain/ip/link_veth.c>
+- `ip/ipaddress.c` — <https://git.kernel.org/pub/scm/network/iproute2/iproute2.git/plain/ip/ipaddress.c>
+- `ip/iproute.c` — <https://git.kernel.org/pub/scm/network/iproute2/iproute2.git/plain/ip/iproute.c>
+- † `ip/ipnetns.c` (`netns_add`, §1.3) — <https://git.kernel.org/pub/scm/network/iproute2/iproute2.git/plain/ip/ipnetns.c>
+
+**Specifications**
+- OCI Runtime Spec, namespaces — <https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#namespaces>
+- OCI Runtime Spec, POSIX hooks — <https://github.com/opencontainers/runtime-spec/blob/main/config.md#posix-platform-hooks>
+- CNI Specification (DEL idempotency, GC, STATUS, runtime responsibilities) — <https://github.com/containernetworking/cni/blob/main/SPEC.md>
+- RFC 1918, private address space — <https://www.rfc-editor.org/rfc/rfc1918>
+- RFC 3021, /31 point-to-point links — <https://datatracker.ietf.org/doc/html/rfc3021>
+- RFC 4291 §2.6.1, IPv6 Subnet-Router anycast — <https://datatracker.ietf.org/doc/html/rfc4291#section-2.6.1>
+
+**Docker / Podman documentation**
+- Docker networking overview — <https://docs.docker.com/engine/network/>
+- Port publishing (gateway modes, IPv6→IPv4 proxying, `route_localnet` history) — <https://docs.docker.com/engine/network/port-publishing/>
+- Packet filtering & firewalls (`DOCKER-USER`, ufw) — <https://docs.docker.com/engine/network/packet-filtering-firewalls/>
+- Docker Engine 28 release notes — <https://docs.docker.com/engine/release-notes/28/>
+- Docker Engine 25.0 release notes (MAC address changes) — <https://docs.docker.com/engine/release-notes/25.0/>
+- Live restore — <https://docs.docker.com/engine/daemon/live-restore/>
+- Docker Engine 28 hardening blog — <https://www.docker.com/blog/docker-engine-28-hardening-container-networking-by-default/>
+- Podman `RELEASE_NOTES.md` (6.0.0 removals: iptables, CNI, slirp4netns) — <https://github.com/containers/podman/blob/main/RELEASE_NOTES.md>
+- Fedora change: netavark nftables by default — <https://fedoraproject.org/wiki/Changes/NetavarkNftablesDefault>
+- netavark firewalld integration — <https://github.com/containers/netavark/blob/main/docs/netavark-firewalld.7.md>
+- netavark iptables-deprecation discussion — <https://github.com/containers/netavark/discussions/1332>
+
+**Implementation source (mature reference implementations)**
+- moby, default IPAM pools — <https://github.com/moby/moby/blob/master/daemon/libnetwork/ipamutils/utils.go>
+- moby, IPAM allocator (reserved addresses, `RequestAddress`) — <https://github.com/moby/moby/blob/master/daemon/libnetwork/ipams/defaultipam/allocator.go>
+- moby, IPAM address space (in-memory, mutex) — <https://github.com/moby/moby/blob/master/daemon/libnetwork/ipams/defaultipam/address_space.go>
+- moby, IPAM contract (`RequiresRequestReplay`) — <https://github.com/moby/moby/blob/master/daemon/libnetwork/ipamapi/contract.go>
+- moby, controller init (`reservePools`, cleanup order) — <https://github.com/moby/moby/blob/master/daemon/libnetwork/controller.go>
+- moby, `sandboxRestore` / "Removing stale sandbox" — <https://github.com/moby/moby/blob/master/daemon/libnetwork/sandbox_store.go>
+- moby, `cleanupLocalEndpoints` (mark & sweep) — <https://github.com/moby/moby/blob/master/daemon/libnetwork/endpoint.go>
+- moby, `networkCleanup` (`inDelete` tombstones) — <https://github.com/moby/moby/blob/master/daemon/libnetwork/store.go>
+- moby, `InferReservedNetworks` / on-link routes — <https://github.com/moby/moby/blob/master/daemon/libnetwork/netutils/utils_linux.go>
+- moby, bridge driver + `clearConntrackEntries` — <https://github.com/moby/moby/blob/master/daemon/libnetwork/drivers/bridge/bridge_linux.go>
+- CNI host-local, disk backend (`O_EXCL`, `last_reserved_ip`) — <https://github.com/containernetworking/plugins/blob/main/plugins/ipam/host-local/backend/disk/backend.go>
+- CNI host-local, `flock` — <https://github.com/containernetworking/plugins/blob/main/plugins/ipam/host-local/backend/disk/lock.go>
+- CNI host-local docs (`dataDir`) — <https://cni.dev/plugins/current/ipam/host-local/>
+- CNI host-local IP-leak report — <https://github.com/containernetworking/plugins/issues/498>
+- netavark, `Cargo.toml` (the crate set) — <https://github.com/containers/netavark/blob/main/Cargo.toml>
+- netavark, synchronous netlink socket — <https://github.com/containers/netavark/blob/main/src/network/netlink.rs>
+- netavark, nftables firewall driver — <https://github.com/containers/netavark/blob/main/src/firewall/nft.rs>
+- netavark, firewall state persistence + `flock` — <https://github.com/containers/netavark/blob/main/src/firewall/state.rs>
+- netavark, `firewall-reload` (recovery by replaying setup) — <https://github.com/containers/netavark/blob/main/src/commands/firewall_reload.rs>
+- † RootlessKit port drivers (`builtin`, `SCM_RIGHTS`, `IP_TRANSPARENT`) — <https://github.com/rootless-containers/rootlesskit/tree/master/pkg/port/builtin>
+- † RootlessKit benchmarks (§8.7) — <https://github.com/rootless-containers/rootlesskit/blob/master/docs/network.md>
+- † slirp4netns `main.c` — <https://github.com/rootless-containers/slirp4netns/blob/master/main.c>
+- † libslirp `src/ip_icmp.c` — <https://gitlab.freedesktop.org/slirp/libslirp/-/blob/master/src/ip_icmp.c>
+
+**Rust crates**
+- `rtnetlink` (manifest: `default = ["tokio_socket"]`) — <https://github.com/rust-netlink/rtnetlink/blob/main/Cargo.toml>
+- `netlink-sys` (manifest: `default = []`) — <https://github.com/rust-netlink/netlink-sys/blob/main/Cargo.toml>
+- `netlink-packet-route` link attributes — <https://github.com/rust-netlink/netlink-packet-route/blob/main/src/link/attribute.rs>
+- `netlink-packet-route` `InfoVeth` (and the no-`fill_info` note) — <https://github.com/rust-netlink/netlink-packet-route/blob/main/src/link/link_info/veth.rs>
+- `netlink-packet-route` bridge-port flags (`Isolated`, `HairpinMode`) — <https://github.com/rust-netlink/netlink-packet-route/blob/main/src/link/link_info/bridge_port.rs>
+- `nftables-rs` helper (`nft -j -f -`) — <https://github.com/nftables-rs/nftables-rs/blob/main/src/helper.rs>
+- `nftnl-rs` (26 per-version bindgen outputs) — <https://github.com/mullvad/nftnl-rs>
+- `rustables` — <https://gitlab.com/rustwall/rustables>
+- `rust-iptables` (subprocess + version sniffing) — <https://github.com/yaa110/rust-iptables/blob/master/src/lib.rs>
+- RUSTSEC-2025-0126 (`nftnl`, heap overflow) — <https://github.com/rustsec/advisory-db/blob/main/crates/nftnl/RUSTSEC-2025-0126.md>
+- RUSTSEC-2025-0142 (`mnl`, unsound `cb_run`) — <https://github.com/rustsec/advisory-db/blob/main/crates/mnl/RUSTSEC-2025-0142.md>
+- RUSTSEC-2021-0119 (`nix`, `getgrouplist`) — <https://github.com/rustsec/advisory-db/blob/main/crates/nix/RUSTSEC-2021-0119.md>
+
+**Issue reports used only for undocumented behaviour (weakest tier, all `[LOW]`)**
+- live-restore & iptables recreation cost — <https://github.com/moby/moby/issues/34906>
+- live-restore & duplicated rules — <https://github.com/moby/moby/issues/31647>
+- live-restore & firewall rules — <https://forums.docker.com/t/live-restore-does-not-restore-iptables-rules/136677>
+- Docker 25 MAC address conflicts — <https://github.com/moby/moby/issues/47146>, <https://github.com/moby/moby/issues/47228>
