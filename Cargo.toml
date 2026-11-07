@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/cli"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/MansurPro/rustainer"
+
+# Pinned exactly, not by caret range. RND.md section 15.8: rustix's
+# `not_implemented.rs` boundary moves between releases, and libc's
+# `CLONE_INTO_CGROUP` is broken on the whole 0.2.x line (section 15.3).
+[workspace.dependencies]
+rustix = { version = "=1.1.5", default-features = false, features = [
+    "std",
+    "fs",
+    "process",
+    "pipe",
+    "system",
+] }
+libc = { version = "=0.2.191", default-features = false }
+thiserror = "2.0"
+clap = { version = "4.6", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
+anyhow = "1.0.103"
