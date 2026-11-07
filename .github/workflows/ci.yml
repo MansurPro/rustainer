@@ -60,6 +60,19 @@ jobs:
       # standing check that the privilege seam of RND.md 18.6 still holds.
       - name: Stages 1 and 2, unprivileged
         run: |
+          # Ubuntu 24.04 ships an AppArmor brake on unprivileged user
+          # namespaces, so `unshare -U` fails with "write failed
+          # /proc/self/uid_map: Operation not permitted". Lift it rather than
+          # skip the job: a silently skipped test is the kind of lie this
+          # project is built not to tell, and the rootless paths are exactly
+          # the ones nothing else here covers.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user true || {
+            echo "::error::unprivileged user namespaces are unavailable on this runner"
+            exit 1
+          }
           for s in 1 2; do
             unshare --user --map-root-user \
               env RUSTAINER_BIN="$PWD/target/release/rustainer" \
