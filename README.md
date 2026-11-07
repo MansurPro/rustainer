@@ -40,3 +40,52 @@ built and tested before images, storage or networking exist, because every one o
 is easier to reason about once the process model is not also in question.
 
 `run alpine echo hello` is not the first milestone. It is the sixth.
+
+| Stage | Goal | Status |
+|---|---|---|
+| 1 | A process in namespaces of its own | **Done** |
+| 2 | A real root filesystem (`pivot_root`) | Next |
+| 3 | Lifecycle, supervision and state | |
+| 4 | Resource limits (cgroup v2) | |
+| 5 | Security controls (capabilities, seccomp) | |
+| 6 | Pull and unpack a real image — `run alpine echo hello` | |
+| 7 | Layered filesystem (OverlayFS) | |
+| 8 | A network namespace of its own | |
+| 9 | Bridge, NAT and the outside world | |
+| 10 | Published ports | |
+| 11 | Single-ID rootless | |
+
+### Building and testing
+
+```sh
+cargo build --release
+```
+
+The success test for each stage asserts its guarantee by reading kernel state back from
+**inside** the container, never by observing that a command printed the right thing. It
+needs Linux and root:
+
+```sh
+sudo bash scripts/stage1-success-test.sh
+```
+
+On a macOS or Windows workstation, run it in a throwaway Linux VM:
+
+```sh
+docker run --rm --privileged -v "$PWD":/w -w /w rust:1.96-slim \
+    bash scripts/stage1-success-test.sh
+```
+
+Docker there is a VM substitute, not part of the implementation — everything under test
+is our own `clone3` call.
+
+### What stage 1 does and does not do
+
+`rustainer run --rootfs / --network host --hostname boxy /bin/sh` puts a process in its
+own PID, UTS and IPC namespaces and waits for it correctly. There is no image, no root
+filesystem change, no resource limit, no security control and no network isolation, and
+the flags refuse rather than pretend: `--rootfs <dir>` and `--network bridge` both fail
+with the stage that would support them.
+
+`ps` inside still lists host processes, because `/proc` has not been remounted. That is
+the teaching moment, not a bug — stage 2 fixes it.

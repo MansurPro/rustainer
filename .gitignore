@@ -1,5 +1,7 @@
 /target
-Cargo.lock
+# Cargo.lock IS committed: this workspace ships a binary, and RND.md 15.7
+# pins exact versions and minimum transitive versions against advisories.
 .env
 *.swp
 .DS_Store
+

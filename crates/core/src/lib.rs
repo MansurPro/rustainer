@@ -1,0 +1,325 @@
+//! Container runtime core.
+//!
+//! Stage 1 of the ladder in `RND.md` §17: a process in namespaces of its own,
+//! waited for correctly. No image, no root filesystem change, no limits, no
+//! networking.
+//!
+//! The stage exists to make the parent/child protocol and the post-`clone`
+//! constraints concrete *before* anything depends on them. Everything later —
+//! `pivot_root`, cgroup placement, uid mapping — happens inside the window
+//! this module defines, so getting the window right first means writing it
+//! once.
+//!
+//! # What this crate may never acquire
+//!
+//! No async runtime, no thread pool, no lazily-initialised global that might
+//! spawn one. Threads cannot be un-spawned, several namespace operations
+//! require a single-threaded caller, and retrofitting sync into an async
+//! codebase is a rewrite of every call path rather than a refactor
+//! (RND.md §18.3). This is checked at runtime by [`sys::thread_count`]
+//! immediately before every `clone3`, because a dependency can introduce a
+//! thread pool transitively and a rule nobody can enforce is not a rule.
+
+// A dependency constant that is silently zero is the worst available failure
+// shape. `#[deprecated]` is the one signal libc gives us that a constant has
+// gone wrong (RND.md §18.9), so a warning nobody reads becomes a build
+// failure.
+#![deny(deprecated)]
+
+pub mod child;
+mod sys;
+
+use std::ffi::OsString;
+
+use child::{ChildPlan, RECORD_LEN, Step};
+use sys::{Cloned, Error as Errno};
+
+/// Which namespaces the container gets.
+///
+/// Deliberately not a `bitflags` type: the cgroup namespace is **not** here
+/// and must not be added, and an opaque flags word is the wrong place for
+/// that rule to live.
+///
+/// `CLONE_NEWCGROUP` must never appear in the `clone3` flag word.
+/// `copy_cgroup_ns()` roots a new cgroup namespace at the **parent's**
+/// cgroup, so a child cloned with the flag is given a view anchored above
+/// where we are about to place it. It has to be unshared by the child
+/// *after* placement instead (RND.md §4.2). This is source-derived and not
+/// yet measured; the test is named in `RND.md` §21.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Namespaces {
+    pub pid: bool,
+    pub uts: bool,
+    pub ipc: bool,
+    pub mount: bool,
+    pub net: bool,
+}
+
+impl Namespaces {
+    /// What stage 1 creates: the process-identity namespaces only.
+    ///
+    /// Mount is stage 2 and network is stage 8, so neither is here. A
+    /// container at this stage shares the host's filesystem view and its
+    /// network stack, and the CLI says so rather than implying isolation it
+    /// does not have.
+    pub const STAGE1: Self = Self {
+        pid: true,
+        uts: true,
+        ipc: true,
+        mount: false,
+        net: false,
+    };
+
+    fn to_clone_flags(self) -> u64 {
+        let mut f = 0u64;
+        if self.pid {
+            f |= sys::CLONE_NEWPID;
+        }
+        if self.uts {
+            f |= sys::CLONE_NEWUTS;
+        }
+        if self.ipc {
+            f |= sys::CLONE_NEWIPC;
+        }
+        if self.mount {
+            f |= sys::CLONE_NEWNS;
+        }
+        if self.net {
+            f |= sys::CLONE_NEWNET;
+        }
+        f
+    }
+}
+
+/// What to run, and in what.
+#[derive(Clone, Debug)]
+pub struct Spec {
+    /// Absolute path to the executable. Not searched for on `PATH`: the
+    /// search would have to happen in the child, where it cannot allocate.
+    pub exe: OsString,
+    /// `argv` in full, including `argv[0]`.
+    pub argv: Vec<OsString>,
+    /// `KEY=VALUE` entries. Not inherited implicitly — the caller decides.
+    pub envp: Vec<OsString>,
+    /// Hostname to set inside the UTS namespace. Ignored without `uts`.
+    pub hostname: Option<OsString>,
+    pub namespaces: Namespaces,
+}
+
+/// How the container's init process ended.
+///
+/// There is no `Unknown` variant yet because at this stage the supervisor
+/// *is* the waiting process and cannot miss the exit. Stage 3 introduces a
+/// supervisor that can be killed, and with it the obligation to report an
+/// unobserved exit as unknown rather than as `0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exit {
+    Code(i32),
+    Signal(i32),
+}
+
+impl Exit {
+    /// The conventional shell encoding, for a process that must turn this
+    /// into its own exit status.
+    pub fn to_shell_status(self) -> i32 {
+        match self {
+            Exit::Code(c) => c,
+            Exit::Signal(s) => 128 + s,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(
+        "refusing to clone3: this process has {count} threads and must have exactly 1. \
+         A raw clone inherits every lock in whatever state it was in, and glibc - unlike \
+         after fork() - has had no chance to reset them. Something in the dependency \
+         graph spawned a thread."
+    )]
+    MultiThreaded { count: u64 },
+
+    #[error("preparing the child: {0}")]
+    Plan(#[from] child::PlanError),
+
+    #[error("creating the pipes the child reports through: {0}")]
+    Pipe(#[source] Errno),
+
+    #[error("clone3 failed: {0}")]
+    Clone(#[source] Errno),
+
+    #[error("the container never started: {step} failed with {errno}", step = .step.describe())]
+    ChildFailed { step: Step, errno: Errno },
+
+    #[error("waiting for the container: {0}")]
+    Wait(#[source] Errno),
+
+    #[error("the container process vanished without a wait status")]
+    NoWaitStatus,
+}
+
+/// Create the container, run it to completion, and report how it ended.
+///
+/// Blocks until the container's init process exits. The caller is the
+/// container's parent, which is correct for stage 1 and *wrong* from stage 3
+/// onward: the CLI must never be in the container's process ancestry, or
+/// detach, `ps` after the CLI exits, exit-code collection and restart
+/// policies all become changes to the process topology rather than features
+/// (RND.md §18.2). Stage 3 forks a supervisor and calls this from there; the
+/// signature does not change.
+pub fn run(spec: &Spec) -> Result<Exit, Error> {
+    // The invariant, checked at the only moment it matters.
+    let count = sys::thread_count().map_err(Error::Pipe)?;
+    if count != 1 {
+        return Err(Error::MultiThreaded { count });
+    }
+
+    let (proceed_rx, proceed_tx) = sys::pipe_with(sys::PipeFlags::CLOEXEC).map_err(Error::Pipe)?;
+    let (err_rx, err_tx) = sys::pipe_with(sys::PipeFlags::CLOEXEC).map_err(Error::Pipe)?;
+
+    let hostname = if spec.namespaces.uts {
+        spec.hostname.as_deref()
+    } else {
+        None
+    };
+    let plan = ChildPlan::build(
+        &spec.exe, &spec.argv, &spec.envp, hostname, proceed_rx, err_tx,
+    )?;
+
+    let mut args = sys::clone_args_zeroed();
+    args.flags = spec.namespaces.to_clone_flags();
+    // Not ORed into `flags` - that is clone(2)'s convention and clone3
+    // rejects it there. Without this the parent gets no SIGCHLD and the
+    // child is not waitable as a child.
+    args.exit_signal = libc::SIGCHLD as u64;
+
+    // Both of these must happen immediately before the clone, and both are
+    // the kind of thing a reviewer deletes as redundant.
+    //
+    // The flush is not about Rust's own buffering - `Stdout` is a
+    // `LineWriter` unconditionally, so a Rust parent emitting whole lines has
+    // nothing buffered. It is about anything else in the process: a
+    // `BufWriter` we construct, a `print!` without a newline, any C library,
+    // or a log subscriber buffering into a `Vec<u8>`. Flushing here makes the
+    // whole duplicated-output class impossible regardless of what a
+    // dependency did (RND.md §15.4.2).
+    flush_stdio();
+
+    match unsafe { sys::clone3(&args) } {
+        Err(e) => Err(Error::Clone(e)),
+
+        // SAFETY: this is the child branch, and nothing has allocated since
+        // the clone returned.
+        Ok(Cloned::Child) => unsafe { child::child_main(&plan) },
+
+        Ok(Cloned::Parent(pid)) => {
+            // The parent holds its own copies of the child's pipe ends.
+            // Until they are closed, the read below can never see EOF - and
+            // EOF is precisely how a successful execve is reported. Dropping
+            // the plan here is load-bearing, not tidiness.
+            drop(plan);
+
+            // The go-ahead. EPIPE means the child is already gone, which the
+            // wait status will explain better than this write could. Rust
+            // sets SIGPIPE to SIG_IGN at startup, so this returns an error
+            // rather than killing us.
+            let _ = sys::write(&proceed_tx, &[1u8]);
+            drop(proceed_tx);
+
+            let failure = read_failure_record(&err_rx);
+
+            // Reap first, always: a child that failed is still a child, and
+            // leaving it unreaped to report an error faster is how zombies
+            // accumulate.
+            let status = reap(pid);
+
+            if let Some((step, errno)) = failure {
+                return Err(Error::ChildFailed { step, errno });
+            }
+            status
+        }
+    }
+}
+
+fn flush_stdio() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+}
+
+/// Read the child's failure report, if there is one.
+///
+/// A successful `execve` closes the write end (it is `O_CLOEXEC`) and we see
+/// EOF with nothing read. Anything else is a short, fixed-size record.
+fn read_failure_record(err_rx: &sys::OwnedFd) -> Option<(Step, Errno)> {
+    let mut buf = [0u8; RECORD_LEN];
+    let mut n = 0;
+    while n < RECORD_LEN {
+        match sys::read(err_rx, &mut buf[n..]) {
+            Ok(0) => break,
+            Ok(got) => n += got,
+            Err(Errno::INTR) => continue,
+            Err(_) => break,
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    child::decode(&buf[..n])
+}
+
+fn reap(pid: libc::pid_t) -> Result<Exit, Error> {
+    let pid = sys::Pid::from_raw(pid).ok_or(Error::NoWaitStatus)?;
+    loop {
+        match sys::waitpid(Some(pid), sys::WaitOptions::empty()) {
+            // rustix hands back the pid alongside the status; we asked for
+            // a specific pid, so only the status is news.
+            Ok(Some((_, status))) => {
+                return if let Some(code) = status.exit_status() {
+                    Ok(Exit::Code(code))
+                } else if let Some(sig) = status.terminating_signal() {
+                    Ok(Exit::Signal(sig))
+                } else {
+                    Err(Error::NoWaitStatus)
+                };
+            }
+            Ok(None) => return Err(Error::NoWaitStatus),
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(Error::Wait(e)),
+        }
+    }
+}
+
+impl Spec {
+    /// A spec that runs `exe` with the current environment, in stage 1's
+    /// namespace set.
+    pub fn new(exe: impl Into<OsString>, argv: Vec<OsString>) -> Self {
+        let exe = exe.into();
+        let argv = if argv.is_empty() {
+            vec![exe.clone()]
+        } else {
+            argv
+        };
+        Self {
+            exe,
+            argv,
+            envp: inherited_env(),
+            hostname: None,
+            namespaces: Namespaces::STAGE1,
+        }
+    }
+}
+
+/// The parent's environment as `KEY=VALUE` entries.
+fn inherited_env() -> Vec<OsString> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    std::env::vars_os()
+        .map(|(k, v)| {
+            let mut e = Vec::with_capacity(k.len() + v.len() + 1);
+            e.extend_from_slice(k.as_bytes());
+            e.push(b'=');
+            e.extend_from_slice(v.as_bytes());
+            OsString::from_vec(e)
+        })
+        .collect()
+}

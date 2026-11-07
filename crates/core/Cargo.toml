@@ -1,0 +1,19 @@
+[package]
+name = "rustainer-core"
+version = "0.0.1"
+description = "Container runtime core: the process that calls clone3 and everything reachable from it."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This list is the enforcement mechanism, not an organisational preference.
+# RND.md section 18.3: no async runtime, no thread pool, and no lazily
+# initialised global that might spawn one may ever appear in this graph -
+# several namespace operations require a single-threaded caller. `anyhow`
+# is absent on purpose: errors here are typed so a rollback decision can be
+# made from them (section 15.8).
+[dependencies]
+rustix.workspace = true
+libc.workspace = true
+thiserror.workspace = true

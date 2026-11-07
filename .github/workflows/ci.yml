@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      # RND.md section 18.3 and 15.8: "no async runtime near clone3" must be a
+      # build failure, not a review rule. Threads cannot be un-spawned,
+      # several namespace operations require a single-threaded caller, and a
+      # crate can introduce an executor transitively - the obvious cgroups
+      # crate does exactly this, pulling in a D-Bus client whose default
+      # features include a blocking thread pool. A current-thread runtime does
+      # not save you either.
+      #
+      # `cargo tree -i <pkg>` exits non-zero when the package is absent from
+      # the graph, so success here is the failure condition.
+      - name: rustainer-core must never link an async runtime
+        run: |
+          for rt in tokio async-std smol; do
+            if cargo tree -p rustainer-core -i "$rt" 2>/dev/null; then
+              echo "::error::rustainer-core depends on $rt. The process that calls clone3 must be single-threaded (RND.md 18.3)."
+              exit 1
+            fi
+          done
+          echo "no executor in the core dependency graph"
+
+  stage1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # CLONE_NEWPID needs CAP_SYS_ADMIN. Every assertion in this script reads
+      # kernel state back from inside the container rather than checking that
+      # a command printed the right thing.
+      - name: Stage 1 success test
+        run: sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME bash scripts/stage1-success-test.sh

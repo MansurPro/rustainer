@@ -1,0 +1,19 @@
+[package]
+name = "rustainer"
+version = "0.0.1"
+description = "A container engine written in Rust from first principles."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rustainer"
+path = "src/main.rs"
+
+# The transient front end. `anyhow` lives here and only here, because at this
+# boundary the only job left is printing (RND.md section 15.8).
+[dependencies]
+rustainer-core = { path = "../core" }
+clap.workspace = true
+anyhow.workspace = true
