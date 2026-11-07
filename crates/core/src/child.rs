@@ -30,6 +30,7 @@ use core::ffi::{CStr, c_char};
 use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 
+use crate::mount::{self, PlannedOp};
 use crate::sys::{self, Error as Errno, OwnedFd};
 
 /// Which step failed, so the parent can say so without guessing.
@@ -39,6 +40,8 @@ pub enum Step {
     AwaitParent = 1,
     SetHostname = 2,
     Execve = 3,
+    Mount = 4,
+    PivotRoot = 5,
 }
 
 impl Step {
@@ -47,6 +50,8 @@ impl Step {
             1 => Step::AwaitParent,
             2 => Step::SetHostname,
             3 => Step::Execve,
+            4 => Step::Mount,
+            5 => Step::PivotRoot,
             _ => return None,
         })
     }
@@ -56,26 +61,32 @@ impl Step {
             Step::AwaitParent => "waiting for the parent's go-ahead",
             Step::SetHostname => "setting the hostname in the new UTS namespace",
             Step::Execve => "executing the container command",
+            Step::Mount => "building the container's mount set",
+            Step::PivotRoot => "pivoting onto the container's root filesystem",
         }
     }
 }
 
 /// The child's failure report: a fixed-size record, written with one
 /// `write(2)` of a stack array. Nothing here allocates or formats.
+///
+/// `detail` is an index into the mount plan for [`Step::Mount`], and unused
+/// otherwise — the child cannot build a message, so it sends a number the
+/// parent looks up in the plan it still holds.
 pub const RECORD_LEN: usize = 8;
 
-fn encode(step: Step, errno: Errno) -> [u8; RECORD_LEN] {
+fn encode(step: Step, detail: u8, errno: Errno) -> [u8; RECORD_LEN] {
     let e = errno.raw_os_error().to_ne_bytes();
-    [step as u8, 0, 0, 0, e[0], e[1], e[2], e[3]]
+    [step as u8, detail, 0, 0, e[0], e[1], e[2], e[3]]
 }
 
-pub fn decode(record: &[u8]) -> Option<(Step, Errno)> {
+pub fn decode(record: &[u8]) -> Option<(Step, u8, Errno)> {
     if record.len() != RECORD_LEN {
         return None;
     }
     let step = Step::from_u8(record[0])?;
     let errno = i32::from_ne_bytes([record[4], record[5], record[6], record[7]]);
-    Some((step, Errno::from_raw_os_error(errno)))
+    Some((step, record[1], Errno::from_raw_os_error(errno)))
 }
 
 /// Everything the child touches, pre-encoded parent-side.
@@ -96,6 +107,9 @@ pub struct ChildPlan {
     argv: Vec<*const c_char>,
     envp: Vec<*const c_char>,
     hostname: Option<CString>,
+    /// Empty when the container keeps the host's filesystem view.
+    mount_ops: Vec<PlannedOp>,
+    rootfs: Option<CString>,
     proceed_rx: OwnedFd,
     err_tx: OwnedFd,
 }
@@ -107,11 +121,13 @@ pub enum PlanError {
 }
 
 impl ChildPlan {
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         exe: &OsStr,
         argv: &[OsString],
         envp: &[OsString],
         hostname: Option<&OsStr>,
+        mounts: Option<mount::MountPlan>,
         proceed_rx: OwnedFd,
         err_tx: OwnedFd,
     ) -> Result<Self, PlanError> {
@@ -146,12 +162,19 @@ impl ChildPlan {
             None => None,
         };
 
+        let (mount_ops, rootfs) = match mounts {
+            Some(p) => (p.ops, Some(p.rootfs)),
+            None => (Vec::new(), None),
+        };
+
         Ok(Self {
             _storage: storage,
             exe: exe_ptr,
             argv: argv_ptrs,
             envp: envp_ptrs,
             hostname,
+            mount_ops,
+            rootfs,
             proceed_rx,
             err_tx,
         })
@@ -173,40 +196,53 @@ impl ChildPlan {
 pub unsafe fn child_main(plan: &ChildPlan) -> ! {
     // 1. Wait for the parent to finish the setup only it can do.
     //
-    // At this stage there is nothing for the parent to do here, and the
-    // rendezvous looks like ceremony. It is not: this is where uid_map
-    // writing and cgroup placement go, and both must happen before the child
-    // runs anything. Establishing the protocol now is what keeps those from
-    // being a change to the process topology later.
+    // This is where uid_map writing and cgroup placement go, and both must
+    // happen before the child runs anything. Establishing the protocol now
+    // is what keeps those from being a change to the process topology later.
     let mut byte = [0u8; 1];
     loop {
         match sys::read(&plan.proceed_rx, &mut byte) {
             Ok(1) => break,
             // EOF: the parent died between the clone and the go-ahead.
-            Ok(_) => fail(plan, Step::AwaitParent, Errno::PIPE),
+            Ok(_) => fail(plan, Step::AwaitParent, 0, Errno::PIPE),
             Err(Errno::INTR) => continue,
-            Err(e) => fail(plan, Step::AwaitParent, e),
+            Err(e) => fail(plan, Step::AwaitParent, 0, e),
         }
     }
 
-    // 2. Name ourselves. This is the child's job, not the parent's: the new
+    // 2. Build the mount set, then pivot onto it.
+    //
+    // Both belong here rather than in the parent. The mount namespace is
+    // ours, and /proc in particular binds its pid namespace at mount time
+    // from the mounting process — mounted by the supervisor, the container
+    // would see host PIDs.
+    if let Some(rootfs) = &plan.rootfs {
+        if let Err((index, e)) = mount::apply(&plan.mount_ops) {
+            fail(plan, Step::Mount, index, e);
+        }
+        if let Err(e) = mount::pivot(rootfs) {
+            fail(plan, Step::PivotRoot, 0, e);
+        }
+    }
+
+    // 3. Name ourselves. This is the child's job, not the parent's: the new
     //    UTS namespace is ours and the parent is not in it.
     if let Some(h) = &plan.hostname
         && let Err(e) = sys::sethostname(h.to_bytes())
     {
-        fail(plan, Step::SetHostname, e);
+        fail(plan, Step::SetHostname, 0, e);
     }
 
-    // 3. Become the container command. `err_tx` is O_CLOEXEC, so a successful
+    // 4. Become the container command. `err_tx` is O_CLOEXEC, so a successful
     //    execve closes it and the parent sees EOF — that, and not a success
     //    message, is how the parent learns this worked.
     let e = unsafe { sys::execve(plan.exe, plan.argv.as_ptr(), plan.envp.as_ptr()) };
-    fail(plan, Step::Execve, e)
+    fail(plan, Step::Execve, 0, e)
 }
 
 /// Report and leave. One `write(2)` of a stack array, then `_exit`.
-fn fail(plan: &ChildPlan, step: Step, errno: Errno) -> ! {
-    let record = encode(step, errno);
+fn fail(plan: &ChildPlan, step: Step, detail: u8, errno: Errno) -> ! {
+    let record = encode(step, detail, errno);
     // A partial write cannot be retried meaningfully here and a failed write
     // leaves us nothing to say, so the result is deliberately discarded: the
     // parent falls back to reporting the exit status.
@@ -227,6 +263,7 @@ mod tests {
             &args.iter().map(OsString::from).collect::<Vec<_>>(),
             &[OsString::from("PATH=/usr/bin:/bin")],
             Some(OsStr::new("box")),
+            None,
             rx,
             tx,
         )
@@ -258,19 +295,42 @@ mod tests {
     #[test]
     fn interior_nul_is_rejected_not_truncated() {
         let (rx, tx) = sys::pipe_with(sys::PipeFlags::CLOEXEC).unwrap();
-        let result = ChildPlan::build(OsStr::new("/bin/sh\0extra"), &[], &[], None, rx, tx);
+        let result = ChildPlan::build(OsStr::new("/bin/sh\0extra"), &[], &[], None, None, rx, tx);
         assert!(matches!(result, Err(PlanError::InteriorNul { .. })));
     }
 
     #[test]
     fn failure_record_round_trips() {
-        for step in [Step::AwaitParent, Step::SetHostname, Step::Execve] {
-            let encoded = encode(step, Errno::NOENT);
-            let (got_step, got_errno) = decode(&encoded).expect("decode");
+        for step in [
+            Step::AwaitParent,
+            Step::SetHostname,
+            Step::Execve,
+            Step::Mount,
+            Step::PivotRoot,
+        ] {
+            let encoded = encode(step, 7, Errno::NOENT);
+            let (got_step, detail, got_errno) = decode(&encoded).expect("decode");
             assert_eq!(got_step, step);
+            assert_eq!(
+                detail, 7,
+                "the mount-plan index must survive the round trip"
+            );
             assert_eq!(got_errno, Errno::NOENT);
         }
         assert!(decode(&[9, 0, 0, 0, 0, 0, 0, 0]).is_none(), "unknown step");
         assert!(decode(&[1, 2, 3]).is_none(), "short record");
+    }
+
+    #[test]
+    fn every_step_describes_itself() {
+        for step in [
+            Step::AwaitParent,
+            Step::SetHostname,
+            Step::Execve,
+            Step::Mount,
+            Step::PivotRoot,
+        ] {
+            assert!(!step.describe().is_empty());
+        }
     }
 }

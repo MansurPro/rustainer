@@ -9,11 +9,12 @@
 //! (RND.md §18.1).
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use rustainer_core::{Exit, Namespaces, Spec};
+use rustainer_core::{Exit, Namespaces, Privileges, Spec, mount};
 
 #[derive(Parser)]
 #[command(
@@ -22,9 +23,9 @@ use rustainer_core::{Exit, Namespaces, Spec};
     about = "A container engine written in Rust from first principles.",
     long_about = "A container engine written in Rust from first principles - owning the \
                   runtime core rather than shelling out to runc, crun or containerd.\n\n\
-                  This is stage 1 of 11: a process in namespaces of its own. There is no \
-                  image, no root filesystem change, no resource limit and no network \
-                  isolation yet, and the flags below refuse rather than pretend."
+                  This is stage 2 of 11: a process in namespaces of its own, with its own \
+                  root filesystem. There is no image, no layering, no resource limit and \
+                  no network isolation yet, and the flags below refuse rather than pretend."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -39,11 +40,13 @@ enum Command {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Root filesystem for the container. Stage 1 supports only `/`.
+    /// Root filesystem for the container: a directory tree, for example one
+    /// extracted from an image tarball with `tar`. `/` keeps the host's
+    /// filesystem view, which is stage 1 behaviour.
     #[arg(long, default_value = "/")]
-    rootfs: OsString,
+    rootfs: PathBuf,
 
-    /// Network mode. Stage 1 supports only `host`, and requires it
+    /// Network mode. Only `host` is supported, and it is required
     /// explicitly so that sharing the host's network stack is a decision
     /// rather than a default.
     #[arg(long)]
@@ -53,20 +56,26 @@ struct RunArgs {
     #[arg(long, default_value = "container")]
     hostname: OsString,
 
-    /// The command to run, and its arguments.
+    /// The command to run, and its arguments. Resolved inside the
+    /// container's root filesystem.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     command: Vec<OsString>,
 }
 
 fn main() -> ExitCode {
-    // ponytail: `/proc/self/exe` is not sealed into a memfd yet. RND.md
-    // §18.10 wants `pentacle::ensure_sealed()` as the first statement here,
-    // against the CVE-2019-5736 class in which a container overwrites the
-    // runtime binary through `/proc/self/exe`. It is deferred exactly one
-    // stage, on the research's own reasoning that the cost of adding it
-    // later is low: the attack needs a container-controlled binary, and
-    // until stage 2 brings `--rootfs <dir>` there is none. Add it with the
-    // first commit of stage 2, before pivot_root works.
+    // RND.md §18.10, and the first thing this binary does. A container that
+    // can write to `/proc/self/exe` overwrites the runtime binary itself -
+    // CVE-2019-5736. Re-executing from a sealed memfd makes the path refer
+    // to a copy nothing can modify.
+    //
+    // "We will design so that we never re-execute into the container, which
+    // eliminates the whole class" is false and tempting: crun does
+    // re-execute, and all three mature runtimes carry this mitigation
+    // regardless of design.
+    if let Err(e) = pentacle::ensure_sealed() {
+        eprintln!("rustainer: could not seal /proc/self/exe: {e}");
+        return ExitCode::FAILURE;
+    }
 
     match real_main() {
         Ok(code) => code,
@@ -85,17 +94,9 @@ fn real_main() -> Result<ExitCode> {
 }
 
 fn run(args: RunArgs) -> Result<ExitCode> {
-    if args.rootfs != *"/" {
-        bail!(
-            "--rootfs {:?} is not supported yet. Stage 1 runs in the host's filesystem \
-             view; giving the container its own root is stage 2, which needs a mount \
-             namespace, a propagation change and pivot_root. Pass --rootfs / .",
-            args.rootfs
-        );
-    }
     if args.network != "host" {
         bail!(
-            "--network {} is not supported yet. Stage 1 shares the host's network \
+            "--network {} is not supported yet. This stage shares the host's network \
              namespace, and the flag is mandatory so that is visible. A private network \
              stack is stage 8 and bridge networking is stage 9. Pass --network host .",
             args.network
@@ -103,7 +104,7 @@ fn run(args: RunArgs) -> Result<ExitCode> {
     }
 
     let exe = args.command[0].clone();
-    if !std::path::Path::new(&exe).is_absolute() {
+    if !Path::new(&exe).is_absolute() {
         bail!(
             "{exe:?} must be an absolute path. PATH is not searched: the search would \
              have to run in the child, between clone3 and execve, where it cannot \
@@ -113,9 +114,43 @@ fn run(args: RunArgs) -> Result<ExitCode> {
 
     let mut spec = Spec::new(exe, args.command);
     spec.hostname = Some(args.hostname);
-    spec.namespaces = Namespaces::STAGE1;
 
-    let exit = rustainer_core::run(&spec).context("running the container")?;
+    // `/` means "keep the host's filesystem view" - stage 1. Anything else
+    // builds a mount set and pivots onto it.
+    let mounts = if args.rootfs == Path::new("/") {
+        spec.namespaces = Namespaces::STAGE1;
+        None
+    } else {
+        if !args.rootfs.is_dir() {
+            bail!(
+                "--rootfs {:?} is not a directory. It should be an extracted root \
+                 filesystem - for example `mkdir rootfs && tar -xf alpine.tar -C rootfs`. \
+                 Pulling an image is stage 6.",
+                args.rootfs
+            );
+        }
+        let privs = Privileges::probe();
+        if !privs.sys_admin {
+            bail!(
+                "a private root filesystem needs CAP_SYS_ADMIN in the user namespace that \
+                 owns this mount namespace, and this process does not have it. Either run \
+                 as root, or re-run inside `unshare --user --map-root-user`."
+            );
+        }
+        let plan = mount::plan(&args.rootfs, privs).context("planning the container's mounts")?;
+
+        // Say what is missing, and why, rather than producing a container
+        // that is quietly less than it looks. "Detect and degrade silently"
+        // is a lie told to the operator (RND.md §18.5).
+        for d in &plan.degradations {
+            eprintln!("rustainer: degraded: {} - {}", d.what, d.because);
+        }
+
+        spec.namespaces = Namespaces::STAGE2;
+        Some(plan)
+    };
+
+    let exit = rustainer_core::run(&spec, mounts).context("running the container")?;
 
     // Report a signal death as a signal death. Collapsing it into an exit
     // code here would be the same class of lie as reporting an unobserved

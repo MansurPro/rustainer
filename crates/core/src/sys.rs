@@ -12,6 +12,7 @@
 //! | `clone3` | `not_implemented::libc_internals` |
 //! | `execve` | `not_implemented::quite_yet` |
 //! | `_exit` | `not_implemented::quite_yet` |
+//! | `mount_setattr` | `not_implemented::yet` |
 //!
 //! Everything else in the create path — `sethostname`, `pipe2`, `read`,
 //! `write`, `waitpid` — `rustix` provides, and `rustix`'s versions issue the
@@ -20,7 +21,7 @@
 //! `__nptl_setxid`, which takes a lock and futex-waits for threads that do
 //! not exist in a `clone3` child, hanging it forever (RND.md §15.1.1).
 
-use core::ffi::c_char;
+use core::ffi::{CStr, c_char};
 
 use rustix::io::Errno;
 
@@ -216,6 +217,167 @@ pub use rustix::pipe::{PipeFlags, pipe_with};
 pub use rustix::process::{Pid, WaitOptions, waitpid};
 pub use rustix::system::sethostname;
 pub use std::os::fd::OwnedFd;
+
+// ---------------------------------------------------------------------------
+// Filesystem and mount surface
+//
+// Thin wrappers so no module but this one imports `rustix`. Each takes a
+// pre-built `&CStr`, which makes rustix's `path::Arg` the identity function -
+// no copy, no allocation, safe to call from the child (RND.md 15.4.3).
+// ---------------------------------------------------------------------------
+
+pub use rustix::mount::{MountFlags, MountPropagationFlags};
+
+/// `MS_SLAVE`.
+///
+/// rustix calls this `DOWNSTREAM`, which is the kernel's own term for the
+/// relationship but not the name anyone searching for `MS_SLAVE` will try.
+/// Aliased here so call sites read like `mount(8)` and `mount_namespaces(7)`.
+pub const MS_SLAVE: MountPropagationFlags = MountPropagationFlags::DOWNSTREAM;
+use rustix::mount::{UnmountFlags, mount_bind_recursive, mount_change as rmount_change};
+
+pub fn mount(
+    source: &CStr,
+    target: &CStr,
+    fstype: &CStr,
+    flags: MountFlags,
+    data: Option<&CStr>,
+) -> Result<(), Errno> {
+    rustix::mount::mount(source, target, fstype, flags, data)
+}
+
+pub fn mount_bind(source: &CStr, target: &CStr) -> Result<(), Errno> {
+    rustix::mount::mount_bind(source, target)
+}
+
+pub fn mount_recursive_bind(source: &CStr, target: &CStr) -> Result<(), Errno> {
+    mount_bind_recursive(source, target)
+}
+
+pub fn mount_change(target: &CStr, flags: MountPropagationFlags) -> Result<(), Errno> {
+    rmount_change(target, flags)
+}
+
+// linux/mount.h. Defined here for the same reason as the clone flags: these
+// are load-bearing and a binding crate is free to get their width wrong.
+const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
+const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
+const MOUNT_ATTR_NOEXEC: u64 = 0x0000_0008;
+const AT_RECURSIVE: i32 = 0x8000;
+
+/// `struct mount_attr` — exactly 32 bytes, four `__u64` fields.
+#[repr(C)]
+#[derive(Default)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+/// Apply read-only, nosuid, nodev and noexec to a mount **and everything
+/// beneath it**, atomically.
+///
+/// This is why `mount_setattr` is in the hand-written surface. A recursive
+/// bind followed by a read-only *remount* changes only the top mount, so
+/// every submount arrives writable; and the obvious alternative - a
+/// non-recursive bind, so there are no submounts to miss - is refused with
+/// `EINVAL` inside a user namespace, because it would reveal directory
+/// contents that a locked submount is hiding. `AT_RECURSIVE` is the only
+/// option that is both complete and permitted (RND.md 4 step 29, 15.2).
+///
+/// Kernel 5.12 and later; the project floor is higher.
+pub fn mount_setattr_recursive_readonly(path: &CStr) -> Result<(), Errno> {
+    let attr = MountAttr {
+        attr_set: MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+        ..Default::default()
+    };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            AT_RECURSIVE,
+            &attr as *const MountAttr,
+            core::mem::size_of::<MountAttr>(),
+        )
+    };
+    if rc < 0 { Err(last_errno()) } else { Ok(()) }
+}
+
+const _: () = assert!(core::mem::size_of::<MountAttr>() == 32);
+
+pub fn unmount_detach(target: &CStr) -> Result<(), Errno> {
+    rustix::mount::unmount(target, UnmountFlags::DETACH)
+}
+
+pub fn mknod_char(target: &CStr, mode: u32, major: u32, minor: u32) -> Result<(), Errno> {
+    use rustix::fs::{CWD, FileType, Mode, makedev, mknodat};
+    mknodat(
+        CWD,
+        target,
+        FileType::CharacterDevice,
+        Mode::from_bits_truncate(mode),
+        makedev(major, minor),
+    )
+}
+
+/// `mkdir`, tolerating a directory that already exists.
+pub fn mkdir(path: &CStr, mode: u32) -> Result<(), Errno> {
+    use rustix::fs::{CWD, Mode, mkdirat};
+    match mkdirat(CWD, path, Mode::from_bits_truncate(mode)) {
+        Err(Errno::EXIST) => Ok(()),
+        other => other,
+    }
+}
+
+/// Create an empty file if it is not there, for use as a bind-mount target.
+pub fn touch(path: &CStr) -> Result<(), Errno> {
+    use rustix::fs::{Mode, OFlags, open};
+    match open(
+        path,
+        OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC,
+        Mode::from_bits_truncate(0o644),
+    ) {
+        Ok(fd) => {
+            drop(fd);
+            Ok(())
+        }
+        Err(Errno::EXIST) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn symlink(contents: &CStr, link: &CStr) -> Result<(), Errno> {
+    rustix::fs::symlink(contents, link)
+}
+
+/// `open(path, O_PATH|O_DIRECTORY|O_CLOEXEC)`.
+///
+/// `O_PATH` is deliberate: we want a reference to the directory, not the
+/// ability to read it. The fd on the old root is opened *before* the pivot
+/// so the process can `fchdir` back to a root that no longer has a pathname.
+pub fn open_path(path: &CStr) -> Result<OwnedFd, Errno> {
+    use rustix::fs::{Mode, OFlags, open};
+    open(
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+pub fn fchdir(fd: &OwnedFd) -> Result<(), Errno> {
+    rustix::process::fchdir(fd)
+}
+
+pub fn chdir(path: &CStr) -> Result<(), Errno> {
+    rustix::process::chdir(path)
+}
+
+pub fn pivot_root(new_root: &CStr, put_old: &CStr) -> Result<(), Errno> {
+    rustix::process::pivot_root(new_root, put_old)
+}
 
 #[cfg(test)]
 mod tests {

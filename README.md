@@ -44,8 +44,8 @@ is easier to reason about once the process model is not also in question.
 | Stage | Goal | Status |
 |---|---|---|
 | 1 | A process in namespaces of its own | **Done** |
-| 2 | A real root filesystem (`pivot_root`) | Next |
-| 3 | Lifecycle, supervision and state | |
+| 2 | A real root filesystem (`pivot_root`) | **Done** |
+| 3 | Lifecycle, supervision and state | Next |
 | 4 | Resource limits (cgroup v2) | |
 | 5 | Security controls (capabilities, seccomp) | |
 | 6 | Pull and unpack a real image — `run alpine echo hello` | |
@@ -61,31 +61,55 @@ is easier to reason about once the process model is not also in question.
 cargo build --release
 ```
 
-The success test for each stage asserts its guarantee by reading kernel state back from
-**inside** the container, never by observing that a command printed the right thing. It
-needs Linux and root:
+Each stage's success test asserts its guarantee by reading kernel state back
+from **inside** the container, never by observing that a command printed the
+right thing. They need Linux and `CAP_SYS_ADMIN` — which does **not** mean
+root:
 
 ```sh
 sudo bash scripts/stage1-success-test.sh
+sudo bash scripts/stage2-success-test.sh
+
+# or with no root at all, if /proc/sys/user/max_user_namespaces > 0
+unshare --user --map-root-user bash scripts/stage2-success-test.sh
 ```
 
-On a macOS or Windows workstation, run it in a throwaway Linux VM:
+On a macOS or Windows workstation, use a throwaway Linux VM:
 
 ```sh
 docker run --rm --privileged -v "$PWD":/w -w /w rust:1.96-slim \
-    bash scripts/stage1-success-test.sh
+    bash scripts/stage2-success-test.sh
 ```
 
-Docker there is a VM substitute, not part of the implementation — everything under test
-is our own `clone3` call.
+Docker there is a VM substitute, not part of the implementation — everything
+under test is our own `clone3` and `pivot_root`.
 
-### What stage 1 does and does not do
+To run against a remote Linux box without installing a toolchain on it,
+`scripts/remote-test.sh <ssh-host>` cross-compiles to static musl, copies two
+files to `/tmp`, and runs the tests in an unprivileged user namespace.
 
-`rustainer run --rootfs / --network host --hostname boxy /bin/sh` puts a process in its
-own PID, UTS and IPC namespaces and waits for it correctly. There is no image, no root
-filesystem change, no resource limit, no security control and no network isolation, and
-the flags refuse rather than pretend: `--rootfs <dir>` and `--network bridge` both fail
-with the stage that would support them.
+### What works now, and what refuses
 
-`ps` inside still lists host processes, because `/proc` has not been remounted. That is
-the teaching moment, not a bug — stage 2 fixes it.
+```sh
+rustainer run --rootfs ./alpine-rootfs --network host --hostname boxy /bin/sh
+```
+
+The container gets its own PID, UTS, IPC and mount namespaces, a root
+filesystem pivoted onto a directory you extracted yourself, a private `/proc`
+reflecting only its own processes, a fresh `tmpfs` on `/dev` with the core
+device nodes, `/dev/pts`, `/dev/shm`, and a read-only `/sys`.
+
+There is still no image, no layering, no resource limit, no capability or
+seccomp work, and no network isolation. The flags refuse rather than pretend:
+`--network bridge` names stage 9, and a `--rootfs` that is not a directory
+says so.
+
+Where a facility is genuinely unavailable the engine says what is degraded and
+why, rather than quietly producing less than it looks. Running rootless, for
+example:
+
+```
+rustainer: degraded: device nodes - mknod of a device requires CAP_MKNOD in the
+  INITIAL user namespace, and we are in a nested one; the host's nodes are
+  bind-mounted instead
+```

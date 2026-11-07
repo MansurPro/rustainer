@@ -41,7 +41,7 @@ jobs:
           done
           echo "no executor in the core dependency graph"
 
-  stage1:
+  stages:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -52,3 +52,16 @@ jobs:
       - run: cargo build --release
       - name: Stage 1 success test
         run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage1-success-test.sh
+      - name: Stage 2 success test
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage2-success-test.sh
+      # The same stages with no root at all, in a user namespace. This is not
+      # redundant: it takes the rootless code paths - device nodes bound
+      # instead of mknod'd, /sys bound instead of mounted - and it is the
+      # standing check that the privilege seam of RND.md 18.6 still holds.
+      - name: Stages 1 and 2, unprivileged
+        run: |
+          for s in 1 2; do
+            unshare --user --map-root-user \
+              env RUSTAINER_BIN="$PWD/target/release/rustainer" \
+              bash "scripts/stage${s}-success-test.sh"
+          done

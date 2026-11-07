@@ -17,3 +17,4 @@ path = "src/main.rs"
 rustainer-core = { path = "../core" }
 clap.workspace = true
 anyhow.workspace = true
+pentacle.workspace = true

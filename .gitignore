@@ -5,3 +5,6 @@
 *.swp
 .DS_Store
 
+# cross-built artefacts from scripts/remote-test.sh
+/rustainer-musl-*
+/rustainer-core-tests-*

@@ -1,14 +1,12 @@
 //! Container runtime core.
 //!
-//! Stage 1 of the ladder in `RND.md` §17: a process in namespaces of its own,
-//! waited for correctly. No image, no root filesystem change, no limits, no
-//! networking.
+//! Stages 1 and 2 of the ladder in `RND.md` §17: a process in namespaces of
+//! its own, with its own root filesystem. No images, no layers, no limits, no
+//! security controls, no networking.
 //!
-//! The stage exists to make the parent/child protocol and the post-`clone`
-//! constraints concrete *before* anything depends on them. Everything later —
-//! `pivot_root`, cgroup placement, uid mapping — happens inside the window
-//! this module defines, so getting the window right first means writing it
-//! once.
+//! The ordering is deliberate. Everything later — cgroup placement, uid
+//! mapping, seccomp — happens inside the window these two stages define, so
+//! getting the window right first means writing it once.
 //!
 //! # What this crate may never acquire
 //!
@@ -27,12 +25,15 @@
 #![deny(deprecated)]
 
 pub mod child;
+pub mod mount;
 mod sys;
 
 use std::ffi::OsString;
 
 use child::{ChildPlan, RECORD_LEN, Step};
 use sys::{Cloned, Error as Errno};
+
+pub use mount::{Degradation, MountPlan, Privileges};
 
 /// Which namespaces the container gets.
 ///
@@ -56,18 +57,22 @@ pub struct Namespaces {
 }
 
 impl Namespaces {
-    /// What stage 1 creates: the process-identity namespaces only.
-    ///
-    /// Mount is stage 2 and network is stage 8, so neither is here. A
-    /// container at this stage shares the host's filesystem view and its
-    /// network stack, and the CLI says so rather than implying isolation it
-    /// does not have.
+    /// Stage 1: the process-identity namespaces only. The container shares
+    /// the host's filesystem view and network stack, and the CLI says so
+    /// rather than implying isolation it does not have.
     pub const STAGE1: Self = Self {
         pid: true,
         uts: true,
         ipc: true,
         mount: false,
         net: false,
+    };
+
+    /// Stage 2: adds the mount namespace, which is what makes a private root
+    /// filesystem possible. Network is stage 8.
+    pub const STAGE2: Self = Self {
+        mount: true,
+        ..Self::STAGE1
     };
 
     fn to_clone_flags(self) -> u64 {
@@ -94,8 +99,9 @@ impl Namespaces {
 /// What to run, and in what.
 #[derive(Clone, Debug)]
 pub struct Spec {
-    /// Absolute path to the executable. Not searched for on `PATH`: the
-    /// search would have to happen in the child, where it cannot allocate.
+    /// Absolute path to the executable, **as resolved inside the container**.
+    /// Not searched for on `PATH`: the search would have to happen in the
+    /// child, where it cannot allocate.
     pub exe: OsString,
     /// `argv` in full, including `argv[0]`.
     pub argv: Vec<OsString>,
@@ -139,6 +145,13 @@ pub enum Error {
     )]
     MultiThreaded { count: u64 },
 
+    #[error(
+        "refusing to run: a mount plan was given without a mount namespace. Applying it \
+         would mount over the HOST's filesystem, pivot the host's root, and leave the \
+         damage behind after exit."
+    )]
+    MountsWithoutMountNamespace,
+
     #[error("preparing the child: {0}")]
     Plan(#[from] child::PlanError),
 
@@ -148,8 +161,12 @@ pub enum Error {
     #[error("clone3 failed: {0}")]
     Clone(#[source] Errno),
 
-    #[error("the container never started: {step} failed with {errno}", step = .step.describe())]
-    ChildFailed { step: Step, errno: Errno },
+    #[error("the container never started: {} failed with {errno}", describe(*step, *detail))]
+    ChildFailed {
+        step: Step,
+        detail: Option<&'static str>,
+        errno: Errno,
+    },
 
     #[error("waiting for the container: {0}")]
     Wait(#[source] Errno),
@@ -158,16 +175,30 @@ pub enum Error {
     NoWaitStatus,
 }
 
+fn describe(step: Step, detail: Option<&'static str>) -> String {
+    match detail {
+        Some(d) => format!("{} ({d})", step.describe()),
+        None => step.describe().to_owned(),
+    }
+}
+
 /// Create the container, run it to completion, and report how it ended.
 ///
 /// Blocks until the container's init process exits. The caller is the
-/// container's parent, which is correct for stage 1 and *wrong* from stage 3
-/// onward: the CLI must never be in the container's process ancestry, or
-/// detach, `ps` after the CLI exits, exit-code collection and restart
-/// policies all become changes to the process topology rather than features
-/// (RND.md §18.2). Stage 3 forks a supervisor and calls this from there; the
-/// signature does not change.
-pub fn run(spec: &Spec) -> Result<Exit, Error> {
+/// container's parent, which is correct for stages 1–2 and *wrong* from
+/// stage 3 onward: the CLI must never be in the container's process
+/// ancestry, or detach, `ps` after the CLI exits, exit-code collection and
+/// restart policies all become changes to the process topology rather than
+/// features (RND.md §18.2). Stage 3 forks a supervisor and calls this from
+/// there; the signature does not change.
+pub fn run(spec: &Spec, mounts: Option<MountPlan>) -> Result<Exit, Error> {
+    // A mount plan without a mount namespace would be applied to the host:
+    // every mount leaks, and `pivot_root` repoints the *host's* root. Refuse
+    // rather than trust the caller to have set both.
+    if mounts.is_some() && !spec.namespaces.mount {
+        return Err(Error::MountsWithoutMountNamespace);
+    }
+
     // The invariant, checked at the only moment it matters.
     let count = sys::thread_count().map_err(Error::Pipe)?;
     if count != 1 {
@@ -177,13 +208,17 @@ pub fn run(spec: &Spec) -> Result<Exit, Error> {
     let (proceed_rx, proceed_tx) = sys::pipe_with(sys::PipeFlags::CLOEXEC).map_err(Error::Pipe)?;
     let (err_rx, err_tx) = sys::pipe_with(sys::PipeFlags::CLOEXEC).map_err(Error::Pipe)?;
 
+    // Keep the labels parent-side: the child can only send an index, and the
+    // plan itself is about to move into the child's view.
+    let labels = mounts.as_ref().map(|m| m.labels()).unwrap_or_default();
+
     let hostname = if spec.namespaces.uts {
         spec.hostname.as_deref()
     } else {
         None
     };
     let plan = ChildPlan::build(
-        &spec.exe, &spec.argv, &spec.envp, hostname, proceed_rx, err_tx,
+        &spec.exe, &spec.argv, &spec.envp, hostname, mounts, proceed_rx, err_tx,
     )?;
 
     let mut args = sys::clone_args_zeroed();
@@ -233,8 +268,17 @@ pub fn run(spec: &Spec) -> Result<Exit, Error> {
             // accumulate.
             let status = reap(pid);
 
-            if let Some((step, errno)) = failure {
-                return Err(Error::ChildFailed { step, errno });
+            if let Some((step, index, errno)) = failure {
+                let detail = if step == Step::Mount {
+                    labels.get(index as usize).copied()
+                } else {
+                    None
+                };
+                return Err(Error::ChildFailed {
+                    step,
+                    detail,
+                    errno,
+                });
             }
             status
         }
@@ -251,7 +295,7 @@ fn flush_stdio() {
 ///
 /// A successful `execve` closes the write end (it is `O_CLOEXEC`) and we see
 /// EOF with nothing read. Anything else is a short, fixed-size record.
-fn read_failure_record(err_rx: &sys::OwnedFd) -> Option<(Step, Errno)> {
+fn read_failure_record(err_rx: &sys::OwnedFd) -> Option<(Step, u8, Errno)> {
     let mut buf = [0u8; RECORD_LEN];
     let mut n = 0;
     while n < RECORD_LEN {
@@ -322,4 +366,45 @@ fn inherited_env() -> Vec<OsString> {
             OsString::from_vec(e)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The footgun this guard exists for: a mount plan applied without a
+    /// mount namespace mounts over the host and pivots the host's root.
+    #[test]
+    fn a_mount_plan_without_a_mount_namespace_is_refused() {
+        let dir = std::env::temp_dir().join("rustainer-guard-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = mount::plan(&dir, Privileges::probe()).unwrap();
+
+        let mut spec = Spec::new("/bin/true", vec![]);
+        spec.namespaces = Namespaces::STAGE1; // mount: false
+        assert!(matches!(
+            run(&spec, Some(plan)),
+            Err(Error::MountsWithoutMountNamespace)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stage2_adds_only_the_mount_namespace() {
+        const { assert!(!Namespaces::STAGE1.mount) };
+        const { assert!(Namespaces::STAGE2.mount) };
+        const { assert!(!Namespaces::STAGE2.net, "network is stage 8") };
+        let only_mount_differs = Namespaces {
+            mount: false,
+            ..Namespaces::STAGE2
+        };
+        assert_eq!(only_mount_differs, Namespaces::STAGE1);
+    }
+
+    #[test]
+    fn exit_encodes_signals_the_way_a_shell_does() {
+        assert_eq!(Exit::Code(42).to_shell_status(), 42);
+        assert_eq!(Exit::Signal(9).to_shell_status(), 137);
+        assert_eq!(Exit::Signal(15).to_shell_status(), 143);
+    }
 }

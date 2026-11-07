@@ -18,6 +18,7 @@ rustix = { version = "=1.1.5", default-features = false, features = [
     "process",
     "pipe",
     "system",
+    "mount",
 ] }
 libc = { version = "=0.2.191", default-features = false }
 thiserror = "2.0"
@@ -30,3 +31,4 @@ clap = { version = "4.6", default-features = false, features = [
     "suggestions",
 ] }
 anyhow = "1.0.103"
+pentacle = "1.1"
