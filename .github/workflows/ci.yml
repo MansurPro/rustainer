@@ -49,5 +49,6 @@ jobs:
       # CLONE_NEWPID needs CAP_SYS_ADMIN. Every assertion in this script reads
       # kernel state back from inside the container rather than checking that
       # a command printed the right thing.
+      - run: cargo build --release
       - name: Stage 1 success test
-        run: sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME bash scripts/stage1-success-test.sh
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage1-success-test.sh

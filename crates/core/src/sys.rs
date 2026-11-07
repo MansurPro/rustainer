@@ -181,15 +181,21 @@ fn last_errno() -> Errno {
 pub fn thread_count() -> Result<u64, Errno> {
     let stat = read_small(c"/proc/self/stat")?;
     let stat = core::str::from_utf8(&stat).map_err(|_| Errno::INVAL)?;
-    let tail = stat.rsplit_once(')').ok_or(Errno::INVAL)?.1;
-    // After `)` the fields are: state, ppid, pgrp, session, tty_nr, tpgid,
-    // flags, minflt, cminflt, majflt, cmajflt, utime, stime, cutime, cstime,
-    // priority, nice, num_threads. That is index 17 zero-based.
-    tail.split_ascii_whitespace()
-        .nth(17)
-        .ok_or(Errno::INVAL)?
-        .parse()
-        .map_err(|_| Errno::INVAL)
+    parse_num_threads(stat).ok_or(Errno::INVAL)
+}
+
+/// Field 20 of a `/proc/<pid>/stat` line, counting from the field after
+/// `comm`.
+///
+/// Split after the **last** `)`, never the first: `comm` is the executable
+/// name, it is attacker-influenced, and a process named `foo) 0 R 1` shifts
+/// every field after it if you split on the first one.
+fn parse_num_threads(stat: &str) -> Option<u64> {
+    let tail = stat.rsplit_once(')')?.1;
+    // After `)`: state, ppid, pgrp, session, tty_nr, tpgid, flags, minflt,
+    // cminflt, majflt, cmajflt, utime, stime, cutime, cstime, priority,
+    // nice, num_threads. That is index 17 zero-based.
+    tail.split_ascii_whitespace().nth(17)?.parse().ok()
 }
 
 fn read_small(path: &core::ffi::CStr) -> Result<Vec<u8>, Errno> {
@@ -215,29 +221,48 @@ pub use std::os::fd::OwnedFd;
 mod tests {
     use super::*;
 
-    /// The invariant's detector has to be right, or the assertion that
-    /// guards `clone3` is decoration.
+    /// The hazard this parser exists for, tested deterministically: a
+    /// process can be named so that splitting on the *first* `)` shifts
+    /// every later field.
     #[test]
-    fn thread_count_tracks_reality() {
-        let before = thread_count().expect("read /proc/self/stat");
-        assert!(before >= 1);
+    fn num_threads_survives_a_hostile_comm() {
+        // A normal line: num_threads is 4.
+        let normal = "42 (bash) S 1 42 42 0 -1 4194304 500 0 0 0 1 2 3 4 20 0 4 0 900 0 0";
+        assert_eq!(parse_num_threads(normal), Some(4));
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let handle = std::thread::spawn(move || {
-            tx.send(()).unwrap();
-            let _ = done_rx.recv();
-        });
-        rx.recv().unwrap();
-
+        // Same line, but the executable is named `evil) 0 R 1`. Splitting on
+        // the first `)` would read a field from the comm itself.
+        let hostile = "42 (evil) 0 R 1) S 1 42 42 0 -1 4194304 500 0 0 0 1 2 3 4 20 0 7 0 900 0 0";
         assert_eq!(
-            thread_count().expect("read /proc/self/stat"),
-            before + 1,
-            "thread_count did not see the thread we just spawned"
+            parse_num_threads(hostile),
+            Some(7),
+            "split on the first ')' instead of the last"
         );
 
-        drop(done_tx);
-        handle.join().unwrap();
+        assert_eq!(parse_num_threads("nonsense"), None);
+        assert_eq!(parse_num_threads("42 (bash) S 1"), None);
+    }
+
+    /// And the live reading has to agree with the kernel's own answer.
+    ///
+    /// Deliberately not written as "spawn a thread, assert the count rose by
+    /// one": `cargo test` runs tests on a thread pool, so the ambient count
+    /// moves under you and that assertion fails on a loaded machine. Compare
+    /// against `/proc/self/task` instead, retrying until two reads agree -
+    /// a parser reading the wrong field never agrees.
+    #[test]
+    fn thread_count_agrees_with_proc_self_task() {
+        for _ in 0..50 {
+            let n = thread_count().expect("read /proc/self/stat");
+            let tasks = std::fs::read_dir("/proc/self/task")
+                .expect("read /proc/self/task")
+                .count() as u64;
+            if n == tasks {
+                assert!(n >= 1);
+                return;
+            }
+        }
+        panic!("thread_count never agreed with /proc/self/task");
     }
 
     /// The constants are load-bearing and silently wrong is the failure mode

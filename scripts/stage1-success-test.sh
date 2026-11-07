@@ -35,8 +35,18 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 echo "kernel $(uname -r) $(uname -m), uid $(id -u)"
-cargo build --release --quiet || exit 1
-B="$CARGO_TARGET_DIR/release/rustainer"
+# CI builds as the unprivileged runner and passes the binary in, because
+# rustup has no default toolchain for root and installing one just to build
+# is slower than not needing to.
+B="${RUSTAINER_BIN:-}"
+if [ -z "$B" ]; then
+    cargo build --release --quiet || exit 1
+    B="$CARGO_TARGET_DIR/release/rustainer"
+fi
+if [ ! -x "$B" ]; then
+    echo "no rustainer binary at '$B'" >&2
+    exit 2
+fi
 
 HOST_NS=$(readlink /proc/self/ns/pid)
 HOST_IPC=$(readlink /proc/self/ns/ipc)
