@@ -98,20 +98,16 @@ fi
 
 echo
 echo "1. A bridged container has an address and a route"
-# `ip addr` and grep, not `-o` or a per-device filter: busybox's ip has
-# neither. Stderr is shown when it comes back empty, because an empty
-# answer here almost always means the container never started.
-IP=$(R /bin/sh -c 'ip addr 2>/dev/null | grep -o "inet 172\.30\.[0-9.]*"' 2>/dev/null | tail -1)
-if [ -z "$IP" ]; then
-    echo "  (no address; container output was:)"
-    R /bin/sh -c 'ip addr' 2>&1 | tail -4 | sed 's/^/    /'
+# From procfs, not `ip addr`: busybox's ip is not present or not useful on
+# every image or every host, and /proc/net/fib_trie lists the addresses the
+# kernel considers local to this namespace whatever userspace is available.
+LOCAL=$(R /bin/sh -c 'grep -c "172\.30\." /proc/net/fib_trie' 2>/dev/null | tail -1)
+if [ "${LOCAL:-0}" -ge 1 ]; then
+    ok "the kernel holds a local address from the bridge subnet"
+else
+    bad "no address from the bridge subnet (got '$LOCAL')"
+    R /bin/sh -c 'ip addr; cat /proc/net/fib_trie' 2>&1 | tail -6 | sed 's/^/    /'
 fi
-case "$IP" in
-    "inet 172.30."*) ok "it holds an address from the bridge subnet ($IP)" ;;
-    *) bad "no address on eth0 (got '$IP')" ;;
-esac
-# Filter with awk, not `ip route show default`: busybox's ip ignores the
-# filter and prints the whole table, so `tail -1` reads the wrong line.
 check "it has a default route via the bridge" \
     "$(R /bin/sh -c 'ip route 2>/dev/null | awk "/^default/ {print \$3}"' 2>/dev/null | tail -1)" \
     "172.30.0.1"
@@ -134,8 +130,11 @@ timeout 60 "$B" stop -t 2 "$A" >/dev/null 2>&1
 
 echo
 echo "3. The container can reach the outside world"
-check "a public address answers" \
-    "$(R /bin/sh -c 'ping -c2 -W3 1.1.1.1 >/dev/null 2>&1 && echo reachable || echo unreachable' 2>/dev/null | tail -1)" \
+# Over TCP, not ICMP. Plenty of networks drop ICMP while forwarding TCP
+# perfectly well - GitHub's runners among them - and a ping test there
+# fails for a reason that has nothing to do with the container.
+check "a TCP connection to a public address completes" \
+    "$(R /bin/sh -c 'nc -z -w5 1.1.1.1 443 >/dev/null 2>&1 && echo reachable || echo unreachable' 2>/dev/null | tail -1)" \
     "reachable"
 
 echo
