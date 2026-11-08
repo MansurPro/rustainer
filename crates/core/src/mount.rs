@@ -93,6 +93,20 @@ pub enum Op {
     Touch {
         target: CString,
     },
+    /// Hide a path: `/dev/null` bound over a file, a read-only `tmpfs` over
+    /// a directory. Which one applies is decided in the child, because these
+    /// live inside `/proc`, which does not exist until the child mounts it.
+    Mask {
+        target: CString,
+    },
+    /// Bind a path onto itself and make it read-only.
+    ///
+    /// Two calls, not one: `MS_RDONLY` is **ignored** in the initial
+    /// `MS_BIND`, so a single bind with the flag produces a writable mount
+    /// and a false sense of having done something.
+    ReadOnly {
+        target: CString,
+    },
 }
 
 /// An operation plus how to treat its failure.
@@ -201,6 +215,43 @@ const DEVICES: &[(&str, u32, u32)] = &[
     ("dev/random", 1, 8),
     ("dev/urandom", 1, 9),
     ("dev/tty", 5, 0),
+];
+
+/// Paths hidden from the container.
+///
+/// Docker's list, not `runc spec`'s default. The difference is exactly three
+/// entries — `/proc/interrupts`, the powercap tree and `thermal_throttle` —
+/// and all three are side channels with CVEs behind them. Emitting the
+/// "spec default" leaves the container side-channel exposed.
+///
+/// `/proc/kcore` is all of physical memory as an ELF core file.
+const MASKED_PATHS: &[&str] = &[
+    "proc/asound",
+    "proc/acpi",
+    "proc/interrupts",
+    "proc/kcore",
+    "proc/keys",
+    "proc/latency_stats",
+    "proc/timer_list",
+    "proc/timer_stats",
+    "proc/sched_debug",
+    "proc/scsi",
+    "sys/firmware",
+    "sys/devices/virtual/powercap",
+];
+
+/// Paths the container may read but not write.
+///
+/// `/proc/sysrq-trigger` crashes the host with one echo, and
+/// `/proc/sys/kernel/core_pattern` set to `|/bin/sh -c …` gets host-root
+/// code execution on the next core dump, because the kernel runs the pipe
+/// program in the **initial** namespaces as root.
+const READONLY_PATHS: &[&str] = &[
+    "proc/bus",
+    "proc/fs",
+    "proc/irq",
+    "proc/sys",
+    "proc/sysrq-trigger",
 ];
 
 /// `/dev` symlinks every image expects. `symlink(2)` does not resolve its
@@ -524,6 +575,37 @@ pub fn plan(
         );
     }
 
+    // --- 30. Masked and read-only paths. --------------------------------
+    //
+    // Worth being precise about what this buys. These are
+    // **per-superblock**: procfs uses `get_tree_nodev()`, so mounting a
+    // second procfs inside the same mount namespace produces a different
+    // superblock with `/proc/kcore` present and nothing masked. Masking is
+    // therefore not a boundary on its own. It becomes one only together
+    // with `CAP_SYS_ADMIN` being absent from the bounding set and a seccomp
+    // filter denying the mount family - both of which are defaults here.
+    // The three are one property, not three hardening items: *the container
+    // cannot obtain a writable /proc/sys* (RND.md §13.4).
+    for rel in MASKED_PATHS {
+        push(
+            Op::Mask {
+                target: cstr(&join(&rootfs, rel))?,
+            },
+            // Absent paths are normal: the list spans kernels and hardware.
+            true,
+            "masking a path",
+        );
+    }
+    for rel in READONLY_PATHS {
+        push(
+            Op::ReadOnly {
+                target: cstr(&join(&rootfs, rel))?,
+            },
+            true,
+            "making a path read-only",
+        );
+    }
+
     Ok(MountPlan {
         ops,
         rootfs: cstr(&rootfs)?,
@@ -590,6 +672,23 @@ fn run_one(op: &Op) -> Result<(), Errno> {
         Op::Symlink { contents, link } => sys::symlink(contents.as_c_str(), link.as_c_str()),
         Op::Mkdir { target, mode } => sys::mkdir(target.as_c_str(), *mode),
         Op::Touch { target } => sys::touch(target.as_c_str()),
+        Op::Mask { target } => match sys::mount_bind(c"/dev/null", target.as_c_str()) {
+            // A directory cannot have /dev/null bound over it; cover it
+            // with an empty read-only tmpfs instead. Masking rather than
+            // deleting, so programs that stat() the path still work.
+            Err(Errno::NOTDIR) | Err(Errno::ISDIR) | Err(Errno::PERM) => sys::mount(
+                c"tmpfs",
+                target.as_c_str(),
+                c"tmpfs",
+                sys::MountFlags::RDONLY | sys::MountFlags::NOSUID | sys::MountFlags::NODEV,
+                Some(c"size=0k"),
+            ),
+            other => other,
+        },
+        Op::ReadOnly { target } => {
+            sys::mount_bind(target.as_c_str(), target.as_c_str())?;
+            sys::mount_setattr_recursive_readonly(target.as_c_str())
+        }
         Op::SetAttrRecursiveReadonly { target } => {
             sys::mount_setattr_recursive_readonly(target.as_c_str())
         }

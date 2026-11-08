@@ -15,6 +15,7 @@
 //! | `mount_setattr` | `not_implemented::yet` |
 //! | `sigprocmask` | `not_implemented::libc_internals` |
 //! | `signalfd` | not wrapped |
+//! | `seccomp` | not wrapped |
 //!
 //! Everything else in the create path — `sethostname`, `pipe2`, `read`,
 //! `write`, `waitpid` — `rustix` provides, and `rustix`'s versions issue the
@@ -518,6 +519,35 @@ pub fn read_signal(fd: &OwnedFd) -> Result<Option<i32>, Errno> {
         Err(Errno::AGAIN) | Err(Errno::INTR) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// `seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog)`.
+///
+/// Installed by us rather than by the crate that compiled the program, so
+/// the child's third-party code surface stays at zero. The compile step
+/// allocates a `Vec<sock_filter>`, which is legal in the parent and
+/// forbidden here; this call only reads it.
+///
+/// # Safety
+///
+/// `prog` must remain valid for the duration of the call, and the caller
+/// must already have `no_new_privs` set or `CAP_SYS_ADMIN` - otherwise the
+/// kernel returns `EACCES`.
+pub unsafe fn install_seccomp(prog: &[libc::sock_filter]) -> Result<(), Errno> {
+    const SECCOMP_SET_MODE_FILTER: u32 = 1;
+    let fprog = libc::sock_fprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr() as *mut libc::sock_filter,
+    };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            SECCOMP_SET_MODE_FILTER,
+            0,
+            &fprog as *const libc::sock_fprog,
+        )
+    };
+    if rc < 0 { Err(last_errno()) } else { Ok(()) }
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use rustainer_core::security::{self, UserSpec};
 use rustainer_core::state::{Paths, State, Status};
 use rustainer_core::supervise::{self, Config, HANDSHAKE_FD, HANDSHAKE_LEN};
 use rustainer_core::{Privileges, mount, sys};
@@ -49,7 +50,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run a command in a new container.
-    Run(RunArgs),
+    //
+    // Boxed: `run` carries far more options than the other subcommands, and
+    // an enum is as large as its largest variant. One allocation in a
+    // process that exits in milliseconds.
+    Run(Box<RunArgs>),
     /// List containers.
     Ps(PsArgs),
     /// Stop a running container: SIGTERM, a grace period, then SIGKILL.
@@ -93,6 +98,24 @@ struct RunArgs {
     /// Maximum number of tasks. Counts threads, not processes.
     #[arg(long)]
     pids_limit: Option<u64>,
+
+    /// Run the container's process as this user. Numeric `uid` or
+    /// `uid:gid`.
+    #[arg(short = 'u', long)]
+    user: Option<String>,
+
+    /// Add a capability to the default set, e.g. --cap-add NET_ADMIN.
+    #[arg(long, value_name = "CAP")]
+    cap_add: Vec<String>,
+
+    /// Drop a capability from the default set, or ALL.
+    #[arg(long, value_name = "CAP")]
+    cap_drop: Vec<String>,
+
+    /// `seccomp=<file.json>` for an OCI seccomp profile, or
+    /// `seccomp=unconfined` to install no filter at all.
+    #[arg(long, value_name = "OPT")]
+    security_opt: Vec<String>,
 
     /// Start the container and return immediately, printing its id.
     #[arg(short, long)]
@@ -162,7 +185,7 @@ fn real_main() -> Result<ExitCode> {
         .context("preparing the state directory")?;
 
     match cli.command {
-        Command::Run(a) => cmd_run(&paths, a),
+        Command::Run(a) => cmd_run(&paths, *a),
         Command::Ps(a) => cmd_ps(&paths, a),
         Command::Stop(a) => cmd_stop(&paths, a),
         Command::Rm(a) => cmd_rm(&paths, a),
@@ -253,6 +276,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .create(paths.dir(&id))
         .with_context(|| format!("container {id} already exists"))?;
 
+    let (seccomp_profile, seccomp_unconfined) = resolve_seccomp(&args.security_opt)?;
     let config = Config {
         id: id.clone(),
         exe: exe.to_string_lossy().into_owned(),
@@ -267,6 +291,19 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         memory: args.memory.as_deref().map(parse_size).transpose()?,
         cpus: args.cpus,
         pids: args.pids_limit,
+        capabilities: resolve_capabilities(&args.cap_add, &args.cap_drop)?,
+        user: match &args.user {
+            None => None,
+            Some(u) => {
+                let spec = UserSpec::parse(u).map_err(|e| anyhow::anyhow!("--user: {e}"))?;
+                if let Some(why) = spec.unmapped_reason() {
+                    bail!("--user {u}: {why}");
+                }
+                Some(spec)
+            }
+        },
+        seccomp: seccomp_profile,
+        seccomp_unconfined,
     };
     if let Some(c) = config.cpus
         && c <= 0.0
@@ -553,6 +590,73 @@ fn dump(path: &Path, out: &mut impl std::io::Write) -> Result<()> {
 fn cmd_supervise(paths: &Paths, id: &str) -> Result<ExitCode> {
     let exit = supervise::supervise(paths, id).with_context(|| format!("supervising {id}"))?;
     Ok(ExitCode::from(exit.to_shell_status().min(255) as u8))
+}
+
+/// The bounding set to keep, as names, or `None` for the default.
+fn resolve_capabilities(add: &[String], drop: &[String]) -> Result<Option<Vec<String>>> {
+    if add.is_empty() && drop.is_empty() {
+        return Ok(None);
+    }
+    let mut set = security::default_capabilities();
+    for name in drop {
+        if name.eq_ignore_ascii_case("all") {
+            set = security::CapabilitySet::empty();
+            continue;
+        }
+        let c = security::capability_by_name(name)
+            .with_context(|| format!("--cap-drop: unknown capability {name:?}"))?;
+        set &= !c;
+    }
+    for name in add {
+        if name.eq_ignore_ascii_case("all") {
+            bail!(
+                "--cap-add ALL is not supported. It would hand the container the whole \
+                 bounding set including CAP_SYS_ADMIN, which is the capability masked \
+                 paths and the seccomp mount rules exist to assume absent - the result \
+                 looks confined and is not."
+            );
+        }
+        let c = security::capability_by_name(name)
+            .with_context(|| format!("--cap-add: unknown capability {name:?}"))?;
+        set |= c;
+    }
+    Ok(Some(
+        set.iter()
+            .map(|c| {
+                format!("{c:?}")
+                    .trim_start_matches("CapabilitySet(")
+                    .trim_end_matches(')')
+                    .to_owned()
+            })
+            .collect(),
+    ))
+}
+
+/// `(profile, unconfined)`: `(None, false)` is the default profile,
+/// `(_, true)` installs no filter, `(Some(json), false)` uses that profile.
+fn resolve_seccomp(opts: &[String]) -> Result<(Option<serde_json::Value>, bool)> {
+    let mut out = None;
+    let mut unconfined = false;
+    for opt in opts {
+        let Some(v) = opt.strip_prefix("seccomp=") else {
+            bail!(
+                "--security-opt {opt:?} is not supported. This stage understands \
+                 seccomp=<file.json> and seccomp=unconfined. AppArmor, SELinux and \
+                 no-new-privileges are not implemented."
+            );
+        };
+        if v == "unconfined" {
+            unconfined = true;
+            continue;
+        }
+        let text = std::fs::read_to_string(v)
+            .with_context(|| format!("reading the seccomp profile {v:?}"))?;
+        out = Some(
+            serde_json::from_str(&text)
+                .with_context(|| format!("parsing the seccomp profile {v:?}"))?,
+        );
+    }
+    Ok((out, unconfined))
 }
 
 /// `512m`, `2g`, `1048576`. Binary multiples, as every container runtime

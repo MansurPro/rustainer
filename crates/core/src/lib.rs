@@ -27,6 +27,7 @@
 pub mod cgroup;
 pub mod child;
 pub mod mount;
+pub mod security;
 pub mod state;
 pub mod supervise;
 pub mod sys;
@@ -208,10 +209,14 @@ impl Spawned {
     /// pidfd says the child is gone.
     pub fn start_failure(&self) -> Option<Error> {
         let (step, index, errno) = read_failure_record(&self.err_rx)?;
-        let detail = if step == Step::Mount {
-            self.labels.get(index as usize).copied()
-        } else {
-            None
+        let detail = match step {
+            Step::Mount => self.labels.get(index as usize).copied(),
+            // The security step sends which of its own thirteen sub-steps
+            // failed; naming it is the difference between "permission
+            // denied" and "the bounding-set drop was attempted after the
+            // uid change".
+            Step::Security => security::Step::from_u8(index).map(|s| s.describe()),
+            _ => None,
         };
         Some(Error::ChildFailed {
             step,
@@ -228,6 +233,7 @@ impl Spawned {
 pub fn spawn(
     spec: &Spec,
     mounts: Option<MountPlan>,
+    security: Option<security::Security>,
     stdio: Option<child::Stdio>,
     exec_fifo: Option<sys::OwnedFd>,
     cgroup_fd: Option<&sys::OwnedFd>,
@@ -264,6 +270,7 @@ pub fn spawn(
         hostname,
         mounts,
         cgroup_fd.is_some(),
+        security,
         stdio,
         exec_fifo,
         proceed_rx,
@@ -347,7 +354,7 @@ pub fn spawn(
 /// [`supervise`] instead, because the CLI must never be in the container's
 /// process ancestry (RND.md §18.2).
 pub fn run(spec: &Spec, mounts: Option<MountPlan>) -> Result<Exit, Error> {
-    let spawned = spawn(spec, mounts, None, None, None)?;
+    let spawned = spawn(spec, mounts, None, None, None, None)?;
     // Safe to read to EOF here: no start rendezvous was given, so the child
     // runs straight through to execve.
     let failure = spawned.start_failure();
