@@ -436,6 +436,27 @@ pub fn open_path_file(path: &CStr) -> Result<OwnedFd, Errno> {
     open(path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
 }
 
+/// `O_PATH|O_DIRECTORY` on a directory, for `CLONE_INTO_CGROUP`.
+///
+/// The kernel insists on a directory fd here. A `cgroup.procs` fd is never
+/// accepted, by design, so that spawning into a cgroup is conceptualised as
+/// an atomic open-and-write using the caller's credentials.
+pub fn open_path_dir(path: &CStr) -> Result<OwnedFd, Errno> {
+    open_path(path)
+}
+
+/// `unshare(CLONE_NEWCGROUP)`.
+///
+/// Done by the child **after** it has been placed, never as a `clone3` flag.
+/// `copy_cgroup_ns()` roots a new cgroup namespace at the **parent's**
+/// cgroup, so a child cloned with the flag gets a view anchored above where
+/// it actually lives, and `/proc/self/cgroup` inside reads as the
+/// supervisor's path rather than `/` (RND.md §4.2).
+pub fn unshare_cgroup_namespace() -> Result<(), Errno> {
+    let rc = unsafe { libc::unshare(CLONE_NEWCGROUP as i32) };
+    if rc < 0 { Err(last_errno()) } else { Ok(()) }
+}
+
 pub fn open_devnull() -> Result<OwnedFd, Errno> {
     use rustix::fs::{Mode, OFlags, open};
     open(c"/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())

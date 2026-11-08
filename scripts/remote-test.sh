@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 HOST=${1:-}
 [ -n "$HOST" ] || { sed -n '2,16p' "$0" >&2; exit 2; }
 shift
-STAGES=${*:-1 2 3}
+STAGES=${*:-1 2 3 4}
 
 ARCH=$(ssh -o BatchMode=yes "$HOST" 'uname -m')
 case "$ARCH" in
@@ -51,9 +51,20 @@ ssh -o BatchMode=yes "$HOST" "rm -rf $DIR && mkdir -p $DIR/scripts"
 scp -q "$OUT/rustainer" "$OUT/unit-tests" "$HOST:$DIR/"
 scp -q scripts/stage*-success-test.sh "$HOST:$DIR/scripts/"
 
+# A delegated cgroup scope when the host has a user systemd, so the resource
+# stages exercise real limits instead of only the refusal path. Without it
+# the engine correctly refuses every limit, which is worth testing too but
+# covers much less.
 # shellcheck disable=SC2029  # $DIR and $STAGES are meant to expand locally
 ssh -o BatchMode=yes "$HOST" "
     set -u; cd $DIR; chmod +x rustainer unit-tests
+    SCOPE=''
+    if systemd-run --user --scope -p Delegate=yes -q true >/dev/null 2>&1; then
+        SCOPE='systemd-run --user --scope -p Delegate=yes -q'
+        echo 'using a delegated cgroup scope'
+    else
+        echo 'no delegated cgroup scope available; limits will be refused, not applied'
+    fi
     echo \"host: \$(uname -r) \$(uname -m), uid \$(id -u)\"
     echo; echo '=== unit tests ==='
     ./unit-tests 2>&1 | tail -3
@@ -63,8 +74,8 @@ ssh -o BatchMode=yes "$HOST" "
         # namespace that owns our mount and pid namespaces, which is all these
         # stages need. Expressing it this way is also what proves the rootless
         # seam of RND.md 18.6 is holding.
-        unshare --user --map-root-user \
+        \$SCOPE unshare --user --map-root-user \
             env RUSTAINER_BIN=$DIR/rustainer bash scripts/stage\${s}-success-test.sh \
-            2>&1 | tail -n 6
+            2>&1 | tail -n 8
     done
 "

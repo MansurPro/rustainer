@@ -45,6 +45,7 @@ pub enum Step {
     PivotRoot = 5,
     Stdio = 6,
     AwaitStart = 7,
+    CgroupNamespace = 8,
 }
 
 impl Step {
@@ -57,6 +58,7 @@ impl Step {
             5 => Step::PivotRoot,
             6 => Step::Stdio,
             7 => Step::AwaitStart,
+            8 => Step::CgroupNamespace,
             _ => return None,
         })
     }
@@ -70,6 +72,7 @@ impl Step {
             Step::PivotRoot => "pivoting onto the container's root filesystem",
             Step::Stdio => "attaching the container's standard streams",
             Step::AwaitStart => "waiting at the start rendezvous",
+            Step::CgroupNamespace => "unsharing the cgroup namespace",
         }
     }
 }
@@ -114,6 +117,8 @@ pub struct ChildPlan {
     argv: Vec<*const c_char>,
     envp: Vec<*const c_char>,
     hostname: Option<CString>,
+    /// Unshare the cgroup namespace once placement has happened.
+    cgroup_ns: bool,
     /// Empty when the container keeps the host's filesystem view.
     mount_ops: Vec<PlannedOp>,
     rootfs: Option<CString>,
@@ -151,6 +156,7 @@ impl ChildPlan {
         envp: &[OsString],
         hostname: Option<&OsStr>,
         mounts: Option<mount::MountPlan>,
+        cgroup_ns: bool,
         stdio: Option<Stdio>,
         exec_fifo: Option<OwnedFd>,
         proceed_rx: OwnedFd,
@@ -211,6 +217,7 @@ impl ChildPlan {
             argv: argv_ptrs,
             envp: envp_ptrs,
             hostname,
+            cgroup_ns,
             mount_ops,
             rootfs,
             stdio,
@@ -250,7 +257,19 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 2. Build the mount set, then pivot onto it.
+    // 2. Take our own cgroup namespace, now that we are already placed.
+    //
+    // This cannot be a clone3 flag: `copy_cgroup_ns()` roots the new
+    // namespace at the PARENT's cgroup, so the container would see the
+    // supervisor's path instead of `/`. CLONE_INTO_CGROUP has already put
+    // us where we belong, so unsharing here anchors the view correctly.
+    if plan.cgroup_ns
+        && let Err(e) = sys::unshare_cgroup_namespace()
+    {
+        fail(plan, Step::CgroupNamespace, 0, e);
+    }
+
+    // 3. Build the mount set, then pivot onto it.
     //
     // Both belong here rather than in the parent. The mount namespace is
     // ours, and /proc in particular binds its pid namespace at mount time
@@ -265,7 +284,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 3. Name ourselves. This is the child's job, not the parent's: the new
+    // 4. Name ourselves. This is the child's job, not the parent's: the new
     //    UTS namespace is ours and the parent is not in it.
     if let Some(h) = &plan.hostname
         && let Err(e) = sys::sethostname(h.to_bytes())
@@ -273,7 +292,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::SetHostname, 0, e);
     }
 
-    // 4. Attach the standard streams. After this point the child has no
+    // 5. Attach the standard streams. After this point the child has no
     //    way to report anything except through `err_tx`, which is why the
     //    failure record exists at all.
     if let Some(io) = &plan.stdio {
@@ -284,7 +303,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 5. Block at the start rendezvous.
+    // 6. Block at the start rendezvous.
     //
     // `open(O_WRONLY)` on a FIFO blocks until a reader opens it, so this is
     // where a created-but-not-started container waits. Re-opening through
@@ -299,7 +318,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 6. Become the container command. `err_tx` is O_CLOEXEC, so a successful
+    // 7. Become the container command. `err_tx` is O_CLOEXEC, so a successful
     //    execve closes it and the parent sees EOF — that, and not a success
     //    message, is how the parent learns this worked.
     let e = unsafe { sys::execve(plan.exe, plan.argv.as_ptr(), plan.envp.as_ptr()) };
@@ -330,6 +349,7 @@ mod tests {
             &[OsString::from("PATH=/usr/bin:/bin")],
             Some(OsStr::new("box")),
             None,
+            false,
             None,
             None,
             rx,
@@ -369,6 +389,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
             None,
             None,
             rx,
@@ -387,6 +408,7 @@ mod tests {
             Step::PivotRoot,
             Step::Stdio,
             Step::AwaitStart,
+            Step::CgroupNamespace,
         ] {
             let encoded = encode(step, 7, Errno::NOENT);
             let (got_step, detail, got_errno) = decode(&encoded).expect("decode");
@@ -411,6 +433,7 @@ mod tests {
             Step::PivotRoot,
             Step::Stdio,
             Step::AwaitStart,
+            Step::CgroupNamespace,
         ] {
             assert!(!step.describe().is_empty());
         }

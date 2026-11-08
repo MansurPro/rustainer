@@ -217,7 +217,11 @@ const DEV_SYMLINKS: &[(&str, &str)] = &[
 ///
 /// Creates the mount points on disk here, in the parent, because `mkdir` in
 /// the child would mean building a path in the child.
-pub fn plan(rootfs: &Path, privs: Privileges) -> Result<MountPlan, PlanError> {
+pub fn plan(
+    rootfs: &Path,
+    privs: Privileges,
+    cgroup_dir: Option<&Path>,
+) -> Result<MountPlan, PlanError> {
     let rootfs = rootfs
         .canonicalize()
         .map_err(|e| PlanError::Canonicalize(rootfs.as_os_str().to_owned(), e))?;
@@ -475,6 +479,39 @@ pub fn plan(rootfs: &Path, privs: Privileges) -> Result<MountPlan, PlanError> {
         });
     }
 
+    // --- 27. The container's own cgroup, read-only. ---------------------
+    //
+    // A bind of the cgroup directory, not a fresh `cgroup2` mount. The
+    // obvious version - mount cgroup2 at <rootfs>/sys/fs/cgroup - cannot
+    // work outside the initial namespaces: cgroup2 has a single superblock,
+    // a mount whose options differ from the existing one is refused EBUSY,
+    // and `nsdelegate` is *ignored* on a non-initial-namespace mount, so the
+    // options can never be made to match. Copying the host's option string
+    // does not help for that reason. The bind needs no superblock and gives
+    // exactly the subtree this container owns, which combined with the
+    // cgroup namespace is what makes reading a limit back from inside mean
+    // something.
+    if let Some(cg) = cgroup_dir {
+        let target = join(&rootfs, "sys/fs/cgroup");
+        std::fs::create_dir_all(&target)
+            .map_err(|e| PlanError::Mkdir(target.clone().into_os_string(), e))?;
+        push(
+            Op::Bind {
+                source: cstr(cg)?,
+                target: cstr(&target)?,
+            },
+            false,
+            "binding the container's cgroup",
+        );
+        push(
+            Op::SetAttrRecursiveReadonly {
+                target: cstr(&target)?,
+            },
+            true,
+            "making the container's cgroup read-only",
+        );
+    }
+
     // --- 28. The /dev symlinks. -----------------------------------------
     for (contents, rel) in DEV_SYMLINKS {
         push(
@@ -619,7 +656,7 @@ mod tests {
             mknod_devices: false,
             initial_user_ns: false,
         };
-        let plan = plan(&dir, privs).unwrap();
+        let plan = plan(&dir, privs, None).unwrap();
         let walk = plan
             .ops
             .iter()
@@ -646,7 +683,7 @@ mod tests {
             mknod_devices: false,
             initial_user_ns: false,
         };
-        let plan = plan(&dir, privs).unwrap();
+        let plan = plan(&dir, privs, None).unwrap();
         let what: Vec<_> = plan.degradations.iter().map(|d| d.what).collect();
         assert!(what.contains(&"device nodes"), "{what:?}");
         assert!(what.contains(&"/sys"), "{what:?}");
@@ -662,7 +699,7 @@ mod tests {
             mknod_devices: true,
             initial_user_ns: true,
         };
-        let plan = plan(&dir, privs).unwrap();
+        let plan = plan(&dir, privs, None).unwrap();
         assert!(plan.degradations.is_empty(), "{:?}", plan.degradations);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -676,7 +713,7 @@ mod tests {
             mknod_devices: true,
             initial_user_ns: true,
         };
-        let plan = plan(&dir, privs).unwrap();
+        let plan = plan(&dir, privs, None).unwrap();
         let labels = plan.labels();
         let pos = |needle: &str| labels.iter().position(|l| l.contains(needle)).unwrap();
         assert!(pos("rootfs onto itself") < pos("/proc"));
@@ -712,7 +749,10 @@ mod tests {
             mknod_devices: true,
             initial_user_ns: true,
         };
-        assert!(matches!(plan(&f, privs), Err(PlanError::NotADirectory(_))));
+        assert!(matches!(
+            plan(&f, privs, None),
+            Err(PlanError::NotADirectory(_))
+        ));
         std::fs::remove_file(&f).ok();
     }
 

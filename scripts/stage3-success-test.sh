@@ -63,11 +63,20 @@ echo "2. The CLI is not in the container's ancestry"
 PPID_OF_INIT=$(sed 's/.*) //' "/proc/$INIT/stat" | cut -d' ' -f2)
 check "init's parent is the supervisor" "$PPID_OF_INIT" "$SUP"
 PPID_OF_SUP=$(sed 's/.*) //' "/proc/$SUP/stat" | cut -d' ' -f2)
-if [ ! -r "/proc/$PPID_OF_SUP/cmdline" ] || ! tr '\0' ' ' < "/proc/$PPID_OF_SUP/cmdline" | grep -q rustainer; then
-    ok "the supervisor was reparented; no CLI remains above it"
-else
-    bad "a rustainer CLI is still the supervisor's parent"
-fi
+# Compare the parent's EXECUTABLE, not its command line. A command line
+# merely mentioning rustainer - `RUSTAINER_BIN=... bash test.sh`, say - is
+# not a rustainer process, and matching on it fails here for the wrong
+# reason. Our CLI re-execs itself from a sealed memfd, so a live one has an
+# exe link of "/memfd:... (deleted)".
+PARENT_EXE=$(readlink "/proc/$PPID_OF_SUP/exe" 2>/dev/null)
+case "$PARENT_EXE" in
+    *memfd*|*/rustainer)
+        bad "a rustainer CLI ($PARENT_EXE) is still the supervisor's parent" ;;
+    *)
+        ok "the supervisor was reparented to ${PARENT_EXE:-pid $PPID_OF_SUP}; no CLI above it" ;;
+esac
+check "the supervisor's parent is not the shell that ran the CLI" \
+    "$([ "$PPID_OF_SUP" = "$$" ] && echo same || echo different)" "different"
 
 echo
 echo "3. The inherited lock does not wedge later commands"

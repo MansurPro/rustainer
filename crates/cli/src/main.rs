@@ -80,6 +80,20 @@ struct RunArgs {
     #[arg(long, default_value = "container")]
     hostname: String,
 
+    /// Memory limit, e.g. 512m, 2g. Enforced by cgroup v2 memory.max.
+    #[arg(short = 'm', long)]
+    memory: Option<String>,
+
+    /// CPU limit as a fraction of one CPU, e.g. 1.5. Absolute, not a share:
+    /// a container at --cpus=0.5 is throttled to half a CPU even on an idle
+    /// 64-core machine.
+    #[arg(long)]
+    cpus: Option<f64>,
+
+    /// Maximum number of tasks. Counts threads, not processes.
+    #[arg(long)]
+    pids_limit: Option<u64>,
+
     /// Start the container and return immediately, printing its id.
     #[arg(short, long)]
     detach: bool,
@@ -201,12 +215,27 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         }
         // Planned here only to report degradations while someone is still
         // watching; the supervisor plans it again for real.
-        let plan = mount::plan(&args.rootfs, privs).context("planning the container's mounts")?;
+        let plan =
+            mount::plan(&args.rootfs, privs, None).context("planning the container's mounts")?;
         for d in &plan.degradations {
             eprintln!("rustainer: degraded: {} - {}", d.what, d.because);
         }
         Some(args.rootfs.canonicalize()?.to_string_lossy().into_owned())
     };
+
+    // Move ourselves out of the cgroup that is about to delegate to the
+    // container. A CLI left sitting in it would keep it non-empty, and
+    // `cgroup.subtree_control` cannot be written for a cgroup that holds
+    // processes - so every limit would be refused with a message about a
+    // busy cgroup that is in fact about us.
+    let limits_requested =
+        args.memory.is_some() || args.cpus.is_some() || args.pids_limit.is_some();
+    if limits_requested && let Err(e) = rustainer_core::cgroup::enter_own_leaf() {
+        bail!(
+            "could not move into our own cgroup leaf, so the limits you asked for cannot \
+             be enforced: {e}"
+        );
+    }
 
     let id = match args.name {
         Some(n) => {
@@ -235,7 +264,15 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         envp: std::env::vars().map(|(k, v)| format!("{k}={v}")).collect(),
         hostname: args.hostname,
         rootfs,
+        memory: args.memory.as_deref().map(parse_size).transpose()?,
+        cpus: args.cpus,
+        pids: args.pids_limit,
     };
+    if let Some(c) = config.cpus
+        && c <= 0.0
+    {
+        bail!("--cpus must be greater than 0; {c} would mean no CPU at all");
+    }
     config.store(paths)?;
     State::new(id.clone(), config.argv.clone()).store(paths)?;
 
@@ -455,14 +492,18 @@ fn cmd_ps(paths: &Paths, args: PsArgs) -> Result<ExitCode> {
             _ => "-".into(),
         };
         // An exit code we never saw is printed as "?", never as 0.
-        let exit = match (observed, st.exit_code, st.signal) {
-            (Status::Exited, Some(c), _) => c.to_string(),
-            (Status::Exited, None, Some(s)) => format!("sig{s}"),
-            (Status::Unknown, _, _) => "?".into(),
+        // An OOM kill is reported as an OOM kill. Collapsing it into
+        // "killed by signal 9" sends the user to look for whoever sent the
+        // signal, and there was no sender.
+        let exit = match (observed, st.exit_code, st.signal, st.oom_killed) {
+            (Status::Exited, _, _, true) => "oom".into(),
+            (Status::Exited, Some(c), _, _) => c.to_string(),
+            (Status::Exited, None, Some(s), _) => format!("sig{s}"),
+            (Status::Unknown, _, _, _) => "?".into(),
             _ => "-".into(),
         };
         println!(
-            "{:<14} {:<9} {:<8} {:<8} {}",
+            "{:<14} {:<9} {:<8} {:<10} {}",
             id,
             observed.to_string(),
             pid,
@@ -512,6 +553,25 @@ fn dump(path: &Path, out: &mut impl std::io::Write) -> Result<()> {
 fn cmd_supervise(paths: &Paths, id: &str) -> Result<ExitCode> {
     let exit = supervise::supervise(paths, id).with_context(|| format!("supervising {id}"))?;
     Ok(ExitCode::from(exit.to_shell_status().min(255) as u8))
+}
+
+/// `512m`, `2g`, `1048576`. Binary multiples, as every container runtime
+/// means them.
+fn parse_size(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (digits, mult) = match s.chars().last() {
+        Some('k') | Some('K') => (&s[..s.len() - 1], 1024u64),
+        Some('m') | Some('M') => (&s[..s.len() - 1], 1024 * 1024),
+        Some('g') | Some('G') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        Some('b') | Some('B') => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .with_context(|| format!("{s:?} is not a size; try 512m, 2g, or a number of bytes"))?;
+    n.checked_mul(mult)
+        .with_context(|| format!("{s:?} overflows"))
 }
 
 // ---------------------------------------------------------------------------

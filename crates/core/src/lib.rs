@@ -24,6 +24,7 @@
 // failure.
 #![deny(deprecated)]
 
+pub mod cgroup;
 pub mod child;
 pub mod mount;
 pub mod state;
@@ -33,6 +34,8 @@ pub mod sys;
 use std::ffi::OsString;
 
 use child::{ChildPlan, RECORD_LEN, Step};
+use std::os::fd::AsRawFd;
+
 use sys::{Cloned, Error as Errno};
 
 pub use mount::{Degradation, MountPlan, Privileges};
@@ -227,6 +230,7 @@ pub fn spawn(
     mounts: Option<MountPlan>,
     stdio: Option<child::Stdio>,
     exec_fifo: Option<sys::OwnedFd>,
+    cgroup_fd: Option<&sys::OwnedFd>,
 ) -> Result<Spawned, Error> {
     // A mount plan without a mount namespace would be applied to the host:
     // every mount leaks, and `pivot_root` repoints the *host's* root. Refuse
@@ -254,13 +258,37 @@ pub fn spawn(
         None
     };
     let plan = ChildPlan::build(
-        &spec.exe, &spec.argv, &spec.envp, hostname, mounts, stdio, exec_fifo, proceed_rx, err_tx,
+        &spec.exe,
+        &spec.argv,
+        &spec.envp,
+        hostname,
+        mounts,
+        cgroup_fd.is_some(),
+        stdio,
+        exec_fifo,
+        proceed_rx,
+        err_tx,
     )?;
 
     let mut pidfd_slot: i32 = -1;
     let mut args = sys::clone_args_zeroed();
     args.flags = spec.namespaces.to_clone_flags() | sys::CLONE_PIDFD;
     args.pidfd = &mut pidfd_slot as *mut i32 as u64;
+
+    // Place the child in its cgroup at clone time, so there is no window in
+    // which it exists outside its limits.
+    //
+    // `sys::CLONE_INTO_CGROUP` is our own constant, not `libc`'s: that one
+    // is typed `c_int` with the value 2^33, truncates to **zero**, and
+    // compiles under an `#[allow]`. ORing in zero makes clone3 succeed,
+    // return a pid, and put the child in the PARENT's cgroup - unaccounted
+    // and unlimited, with no error anywhere. The unit tests assert the
+    // constant's value and the stage 4 success test reads the placement
+    // back from inside the container (RND.md §15.3, §12.9).
+    if let Some(fd) = cgroup_fd {
+        args.flags |= sys::CLONE_INTO_CGROUP;
+        args.cgroup = fd.as_raw_fd() as u64;
+    }
     // Not ORed into `flags` - that is clone(2)'s convention and clone3
     // rejects it there. Without this the parent gets no SIGCHLD and the
     // child is not waitable as a child.
@@ -319,7 +347,7 @@ pub fn spawn(
 /// [`supervise`] instead, because the CLI must never be in the container's
 /// process ancestry (RND.md §18.2).
 pub fn run(spec: &Spec, mounts: Option<MountPlan>) -> Result<Exit, Error> {
-    let spawned = spawn(spec, mounts, None, None)?;
+    let spawned = spawn(spec, mounts, None, None, None)?;
     // Safe to read to EOF here: no start rendezvous was given, so the child
     // runs straight through to execve.
     let failure = spawned.start_failure();
@@ -425,7 +453,7 @@ mod tests {
     fn a_mount_plan_without_a_mount_namespace_is_refused() {
         let dir = std::env::temp_dir().join("rustainer-guard-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let plan = mount::plan(&dir, Privileges::probe()).unwrap();
+        let plan = mount::plan(&dir, Privileges::probe(), None).unwrap();
 
         let mut spec = Spec::new("/bin/true", vec![]);
         spec.namespaces = Namespaces::STAGE1; // mount: false
