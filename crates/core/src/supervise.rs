@@ -38,6 +38,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cgroup::{self, Cgroup, Limits};
 use crate::state::{self, Lock, Paths, State, Status};
 use crate::{Exit, MountPlan, Namespaces, Privileges, Spec, mount, sys};
 
@@ -55,6 +56,12 @@ pub struct Config {
     pub envp: Vec<String>,
     pub hostname: String,
     pub rootfs: Option<String>,
+    #[serde(default)]
+    pub memory: Option<u64>,
+    #[serde(default)]
+    pub cpus: Option<f64>,
+    #[serde(default)]
+    pub pids: Option<u64>,
 }
 
 impl Config {
@@ -84,10 +91,22 @@ impl Config {
         }
     }
 
-    pub fn mount_plan(&self) -> Result<Option<MountPlan>, Error> {
+    pub fn limits(&self) -> Limits {
+        Limits {
+            memory: self.memory,
+            cpus: self.cpus,
+            pids: self.pids,
+        }
+    }
+
+    pub fn mount_plan(&self, cgroup_dir: Option<&Path>) -> Result<Option<MountPlan>, Error> {
         match &self.rootfs {
             None => Ok(None),
-            Some(r) => Ok(Some(mount::plan(Path::new(r), Privileges::probe())?)),
+            Some(r) => Ok(Some(mount::plan(
+                Path::new(r),
+                Privileges::probe(),
+                cgroup_dir,
+            )?)),
         }
     }
 }
@@ -98,6 +117,8 @@ pub enum Error {
     Core(#[from] crate::Error),
     #[error(transparent)]
     Plan(#[from] mount::PlanError),
+    #[error(transparent)]
+    Cgroup(#[from] cgroup::Error),
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("syscall: {0}")]
@@ -164,7 +185,6 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
 
     let config = Config::load(paths, id)?;
     let spec = config.to_spec();
-    let mounts = config.mount_plan()?;
 
     let mut st = State::load(paths, id).unwrap_or_else(|_| {
         State::new(
@@ -200,7 +220,23 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
         stderr: err_w.try_clone()?,
     };
 
-    let spawned = crate::spawn(&spec, mounts, Some(stdio), Some(fifo_opath))?;
+    // Resource limits, before the child exists. A requested limit that
+    // cannot be applied fails here, loudly, rather than producing a
+    // container that silently has none.
+    let limits = config.limits();
+    let cg = Cgroup::prepare(id, &limits)?;
+    if let Some(c) = &cg {
+        c.apply(&limits)?;
+    }
+    let mounts = config.mount_plan(cg.as_ref().map(|c| c.dir()))?;
+
+    let spawned = crate::spawn(
+        &spec,
+        mounts,
+        Some(stdio),
+        Some(fifo_opath),
+        cg.as_ref().map(|c| c.fd()),
+    )?;
 
     // Our copies of the child's write ends must go, or the reads below can
     // never see EOF.
@@ -259,6 +295,12 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     // "exited 127 because /bin/nonexistent does not exist".
     let failure = spawned.start_failure();
     let exit = reap_into(&mut st, spawned.pid);
+
+    // `memory.events`'s `oom_kill` is the only key that means a kill
+    // happened; `max` and `oom` do not. Read before the cgroup is removed.
+    if let Some(c) = &cg {
+        st.oom_killed = c.oom_killed();
+    }
     if let Some(e) = &failure {
         eprintln!("rustainer: {e}");
         st.error = Some(e.to_string());
@@ -266,6 +308,9 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     st.status = Status::Exited;
     st.exited_at = Some(state::now());
     st.store(paths)?;
+    if let Some(c) = &cg {
+        c.remove();
+    }
     Ok(exit)
 }
 
@@ -519,6 +564,9 @@ mod tests {
             envp: vec!["PATH=/bin".into()],
             hostname: "box".into(),
             rootfs: None,
+            memory: None,
+            cpus: None,
+            pids: None,
         };
         c.store(&paths).unwrap();
         let back = Config::load(&paths, "c1").unwrap();
