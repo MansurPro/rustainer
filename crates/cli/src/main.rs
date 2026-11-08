@@ -96,10 +96,11 @@ struct RunArgs {
     #[arg(long)]
     read_only: bool,
 
-    /// Network mode. Only `host` is supported, and it is required
-    /// explicitly so that sharing the host's network stack is a decision
-    /// rather than a default.
-    #[arg(long)]
+    /// `none` (the default) gives the container its own network stack with
+    /// nothing in it but loopback. `host` shares the host's, which reaches
+    /// every host-local service including anything trusting 127.0.0.1 and
+    /// the cloud metadata address - so it must be asked for.
+    #[arg(long, default_value = "none")]
     network: String,
 
     /// Hostname inside the container's UTS namespace.
@@ -239,14 +240,22 @@ fn real_main() -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 
 fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
-    if args.network != "host" {
-        bail!(
-            "--network {} is not supported yet. This stage shares the host's network \
-             namespace, and the flag is mandatory so that is visible. A private network \
-             stack is stage 8 and bridge networking is stage 9. Pass --network host .",
-            args.network
-        );
-    }
+    let private_net = match args.network.as_str() {
+        "none" => true,
+        "host" => {
+            eprintln!(
+                "rustainer: --network host shares the host's network stack. The container \
+                 can reach every host-local service, including anything that trusts \
+                 127.0.0.1 and the cloud metadata address."
+            );
+            false
+        }
+        other => bail!(
+            "--network {other} is not supported yet. `none` gives the container its own \
+             stack with only loopback; `host` shares the host's. Bridge networking, which \
+             is what lets containers reach the internet and each other, is stage 9."
+        ),
+    };
 
     // Three shapes, chosen by --rootfs:
     //   --rootfs /       the host's filesystem view (stage 1)
@@ -439,6 +448,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         // Beside the layers, on whatever filesystem the image store is on.
         // The runtime state directory is usually a tmpfs and sometimes an
         // overlayfs, and overlayfs cannot host an upperdir at all.
+        private_net,
         overlay_dir: if layers.is_empty() {
             None
         } else {

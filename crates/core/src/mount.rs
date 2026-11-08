@@ -625,7 +625,10 @@ pub fn plan(
                       does not have; the host's /sys is bind-mounted read-only instead, \
                       and made read-only throughout with mount_setattr(AT_RECURSIVE), so its \
                       submounts - /sys/fs/cgroup, /sys/kernel/debug, /sys/fs/bpf - are visible \
-                      but not writable"
+                      but not writable. One consequence worth knowing: /sys/class/net then \
+                      lists the HOST's interfaces whatever network namespace the container \
+                      is in. The network is still isolated - /proc/net/dev and `ip link` \
+                      show the truth - but /sys does not."
                 .into(),
         });
     }
