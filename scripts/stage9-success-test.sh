@@ -98,15 +98,17 @@ fi
 
 echo
 echo "1. A bridged container has an address and a route"
-# From procfs, not `ip addr`: busybox's ip is not present or not useful on
-# every image or every host, and /proc/net/fib_trie lists the addresses the
-# kernel considers local to this namespace whatever userspace is available.
-LOCAL=$(R /bin/sh -c 'grep -c "172\.30\." /proc/net/fib_trie' 2>/dev/null | tail -1)
-if [ "${LOCAL:-0}" -ge 1 ]; then
+# From procfs, and grepped HERE rather than inside the container: busybox's
+# ip produced nothing on one host, and a regex passed through two shells
+# into a third is one quoting layer too many. /proc/net/fib_trie lists the
+# addresses the kernel considers local to this namespace.
+FIB=$(R /bin/cat /proc/net/fib_trie 2>/dev/null)
+if echo "$FIB" | grep -q '172\.30\..*'; then
     ok "the kernel holds a local address from the bridge subnet"
+    echo "  $(echo "$FIB" | grep -A1 '172\.30\.' | grep -B1 LOCAL | head -1 | tr -d ' |-')"
 else
-    bad "no address from the bridge subnet (got '$LOCAL')"
-    R /bin/sh -c 'ip addr; cat /proc/net/fib_trie' 2>&1 | tail -6 | sed 's/^/    /'
+    bad "no address from the bridge subnet"
+    echo "$FIB" | tail -5 | sed 's/^/    /'
 fi
 check "it has a default route via the bridge" \
     "$(R /bin/sh -c 'ip route 2>/dev/null | awk "/^default/ {print \$3}"' 2>/dev/null | tail -1)" \
