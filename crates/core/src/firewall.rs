@@ -38,6 +38,26 @@ pub trait Firewall {
     /// Everything needed for a container subnet to reach the outside
     /// world, applied as one unit.
     fn ensure_masquerade(&self, subnet: Ipv4Addr, prefix: u8, bridge: &str) -> Result<(), Error>;
+
+    /// Let packets through the forward path for our bridge.
+    ///
+    /// Not optional on a host someone else has configured. A `FORWARD`
+    /// policy of `DROP` - which Kubernetes, libvirt, firewalld and most
+    /// cloud images set - silently blackholes every container's egress,
+    /// and the symptom is "DNS times out, everything times out" with a
+    /// perfectly correct address, route and NAT rule in place. Docker adds
+    /// the same rules for the same reason.
+    fn ensure_forward(&self, bridge: &str) -> Result<(), Error>;
+
+    /// Is a policy somebody else set going to drop our traffic anyway?
+    ///
+    /// Worth saying out loud rather than leaving the user to discover it:
+    /// an `accept` in our own table cannot rescue a packet another
+    /// ruleset drops first, at any priority.
+    fn foreign_drop_policy(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str;
 }
 
@@ -126,6 +146,29 @@ impl Firewall for Nft {
         }
         Ok(())
     }
+
+    fn ensure_forward(&self, bridge: &str) -> Result<(), Error> {
+        run_ok(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "ip",
+                TABLE,
+                "forward",
+                "{ type filter hook forward priority filter; }",
+            ],
+        );
+        for rule in [
+            format!("iifname \"{bridge}\" counter accept"),
+            format!("oifname \"{bridge}\" counter accept"),
+        ] {
+            if !rule_present("nft", &["list", "table", "ip", TABLE], &rule) {
+                run("nft", &["add", "rule", "ip", TABLE, "forward", &rule])?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct Iptables;
@@ -176,6 +219,35 @@ impl Firewall for Iptables {
             )?;
         }
         Ok(())
+    }
+
+    fn ensure_forward(&self, bridge: &str) -> Result<(), Error> {
+        for args in [
+            vec!["-C", "FORWARD", "-i", bridge, "-j", "ACCEPT"],
+            vec!["-C", "FORWARD", "-o", bridge, "-j", "ACCEPT"],
+        ] {
+            let present = Command::new("iptables")
+                .args(&args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !present {
+                let mut add = args.clone();
+                add[0] = "-I";
+                run("iptables", &add)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn foreign_drop_policy(&self) -> bool {
+        Command::new("iptables")
+            .args(["-S", "FORWARD"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("-P FORWARD DROP"))
+            .unwrap_or(false)
     }
 }
 

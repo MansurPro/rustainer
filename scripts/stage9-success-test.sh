@@ -98,7 +98,8 @@ fi
 
 echo
 echo "1. A bridged container has an address and a route"
-IP=$(R /bin/sh -c 'ip -4 -o addr show eth0 2>/dev/null | awk "{print \$4}"' 2>/dev/null | tail -1)
+# `ip -4 addr show` and grep, not `-o`: busybox's ip has no -o.
+IP=$(R /bin/sh -c 'ip addr show eth0 2>/dev/null | awk "/inet /{print \$2}"' 2>/dev/null | tail -1)
 echo "  container address: $IP"
 case "$IP" in
     172.30.*/16) ok "it holds an address from the bridge subnet" ;;

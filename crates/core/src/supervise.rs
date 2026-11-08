@@ -741,6 +741,19 @@ fn plumb_network(pid: i32) -> Result<(), Error> {
     // and the failure looks like "everything times out".
     let fw = firewall::detect().ok_or(firewall::Error::NoBackend)?;
     fw.ensure_masquerade(net::GATEWAY, net::SUBNET_PREFIX, net::BRIDGE)?;
+    // And the forward path. A FORWARD policy of DROP - set by Kubernetes,
+    // libvirt, firewalld and most cloud images - silently blackholes every
+    // container's egress, with a correct address, route and NAT rule in
+    // place. The symptom is "everything times out".
+    if fw.foreign_drop_policy() {
+        eprintln!(
+            "rustainer: this host has a FORWARD policy of DROP that something else set. \
+             Accept rules for {} have been added to our own chain; if another ruleset \
+             drops the packet first, containers will have no egress.",
+            net::BRIDGE
+        );
+    }
+    fw.ensure_forward(net::BRIDGE)?;
     Ok(())
 }
 
