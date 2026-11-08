@@ -29,6 +29,7 @@ pub mod child;
 pub mod firewall;
 pub mod mount;
 pub mod net;
+pub mod proxy;
 pub mod security;
 pub mod state;
 pub mod supervise;

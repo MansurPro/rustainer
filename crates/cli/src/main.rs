@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use rustainer_core::firewall::Publish;
 use rustainer_core::security::{self, UserSpec};
 use rustainer_core::state::{Paths, State, Status};
 use rustainer_core::supervise::{self, Config, HANDSHAKE_FD, HANDSHAKE_LEN};
@@ -139,6 +140,11 @@ struct RunArgs {
     /// `seccomp=unconfined` to install no filter at all.
     #[arg(long, value_name = "OPT")]
     security_opt: Vec<String>,
+
+    /// Publish a container port to the host: `[host-ip:]host-port:container-port`.
+    /// Repeatable. TCP only.
+    #[arg(short = 'p', long = "publish", value_name = "SPEC")]
+    publish: Vec<String>,
 
     /// Start the container and return immediately, printing its id.
     #[arg(short, long)]
@@ -464,6 +470,23 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         private_net,
         bridge,
         ip: lease.map(|l| l.ip.to_string()),
+        ports: {
+            if !args.publish.is_empty() && !bridge {
+                bail!(
+                    "-p needs a container with an address, so it only works with \
+                     --network bridge. With `host` the container already shares every \
+                     port; with `none` there is nothing to reach."
+                );
+            }
+            match lease {
+                None => Vec::new(),
+                Some(l) => args
+                    .publish
+                    .iter()
+                    .map(|s| parse_publish(s, l.ip))
+                    .collect::<Result<Vec<_>>>()?,
+            }
+        },
         overlay_dir: if layers.is_empty() {
             None
         } else {
@@ -923,6 +946,49 @@ fn resolve_seccomp(opts: &[String]) -> Result<(Option<serde_json::Value>, bool)>
         );
     }
     Ok((out, unconfined))
+}
+
+/// `8080:80`, `127.0.0.1:8080:80`.
+///
+/// The host address defaults to `0.0.0.0`, which is what `-p 8080:80`
+/// means everywhere and is worth being explicit about: it publishes to
+/// every interface the machine has, not just loopback.
+fn parse_publish(spec: &str, container_ip: std::net::Ipv4Addr) -> Result<Publish> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (host_ip, host_s, cont_s) = match parts.as_slice() {
+        [h, c] => (std::net::Ipv4Addr::UNSPECIFIED, *h, *c),
+        [ip, h, c] => (
+            ip.parse()
+                .with_context(|| format!("-p {spec:?}: {ip:?} is not an IPv4 address"))?,
+            *h,
+            *c,
+        ),
+        _ => bail!(
+            "-p {spec:?} should be host-port:container-port, optionally prefixed with a \
+             host address. UDP and port ranges are not implemented."
+        ),
+    };
+    let host_port: u16 = host_s
+        .parse()
+        .with_context(|| format!("-p {spec:?}: {host_s:?} is not a port"))?;
+    let container_port: u16 = cont_s
+        .split('/')
+        .next()
+        .unwrap_or(cont_s)
+        .parse()
+        .with_context(|| format!("-p {spec:?}: {cont_s:?} is not a port"))?;
+    if cont_s.contains('/') && !cont_s.ends_with("/tcp") {
+        bail!("-p {spec:?}: only tcp is implemented");
+    }
+    if host_port == 0 || container_port == 0 {
+        bail!("-p {spec:?}: port 0 means \"any port\", which is not what you meant here");
+    }
+    Ok(Publish {
+        host_ip,
+        host_port,
+        container_ip,
+        container_port,
+    })
 }
 
 /// `512m`, `2g`, `1048576`. Binary multiples, as every container runtime
