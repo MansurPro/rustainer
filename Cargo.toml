@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/image", "crates/cli"]
 
 [workspace.package]
 edition = "2024"
@@ -30,6 +30,13 @@ thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 seccompiler = { version = "0.5", features = ["json"] }
+# The image subsystem. Synchronous on purpose: `ureq` rather than
+# `reqwest` + `tokio`, so nothing here can put an executor in the process
+# tree that later calls clone3 (RND.md section 15.6).
+ureq = "3.5"
+sha2 = "0.10"
+flate2 = "1.1"
+tar = "0.4.45"
 clap = { version = "4.6", default-features = false, features = [
     "std",
     "derive",

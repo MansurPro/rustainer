@@ -48,8 +48,8 @@ is easier to reason about once the process model is not also in question.
 | 3 | Lifecycle, supervision and state | **Done** |
 | 4 | Resource limits (cgroup v2) | **Done** |
 | 5 | Security controls (capabilities, seccomp) | **Done** |
-| 6 | Pull and unpack a real image — `run alpine echo hello` | Next |
-| 7 | Layered filesystem (OverlayFS) | |
+| 6 | Pull and unpack a real image — `run alpine echo hello` | **Done** |
+| 7 | Layered filesystem (OverlayFS) | Next |
 | 8 | A network namespace of its own | |
 | 9 | Bridge, NAT and the outside world | |
 | 10 | Published ports | |
@@ -72,6 +72,7 @@ sudo bash scripts/stage2-success-test.sh
 sudo bash scripts/stage3-success-test.sh
 sudo bash scripts/stage4-success-test.sh
 sudo bash scripts/stage5-success-test.sh
+sudo bash scripts/stage6-success-test.sh
 
 # or with no root at all, if /proc/sys/user/max_user_namespaces > 0
 unshare --user --map-root-user bash scripts/stage2-success-test.sh
@@ -128,7 +129,24 @@ second procfs and gets an unmasked one. They count only together with
 seccomp — the property being enforced is *the container cannot obtain a
 writable `/proc/sys`*.
 
-There is still no image, no layering, and no network isolation. The flags refuse rather than pretend:
+Images are pulled by our own registry client. Every digest is **recomputed**
+rather than taken from a response header, the manifest is classified by what
+arrived rather than by what was asked for, and schema 1 is detected and
+refused — its signature covers a rearranged document, so the bytes on the
+wire never hash to the digest the registry reports.
+
+Extraction is the most dangerous code here: attacker-controlled input, parsed
+by a root process, becoming a container's root filesystem. Every filesystem
+operation goes through a pinned directory handle with
+`openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`, because
+lexical path checks cannot close the symlink-swap hole — between "I verified
+this path is inside the root" and "I opened it", another entry of the same
+tarball can change the answer. Device nodes from layer content are refused
+outright; absolute hardlink targets are refused; `security.*` xattrs are
+dropped.
+
+There is still no layering — each image extracts to a flat directory — and no
+network isolation. The flags refuse rather than pretend:
 `--network bridge` names stage 9, and a `--rootfs` that is not a directory
 says so.
 

@@ -1,0 +1,25 @@
+[package]
+name = "rustainer-image"
+version = "0.0.1"
+description = "Image pulling, verification and extraction. Separate from the runtime on purpose."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Image handling is a separate subsystem from container execution, with one
+# narrow interface: pull and unpack produce a content-addressed store and a
+# materialised rootfs; the runtime consumes a directory. Coupling them is the
+# default outcome of writing `run` first, and very hard to undo - you end up
+# unable to pull without running, unable to run without pulling, and unable
+# to test either in isolation (RND.md section 18.4).
+[dependencies]
+ureq.workspace = true
+sha2.workspace = true
+flate2.workspace = true
+tar.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rustix.workspace = true
+libc.workspace = true

@@ -159,15 +159,17 @@ pub enum Error {
     },
 
     #[error(
-        "cannot enable the {controller} controller in {path}: it still holds {others} \
-         process(es) that are not ours, and a cgroup may not have both member processes \
-         and enabled controllers. {what} therefore cannot be enforced here. Get a cgroup \
-         of our own - `systemd-run --user --scope -p Delegate=yes -- <command>` - or move \
-         those processes into a leaf first."
+        "cannot enable the {controller} controller in {path}: it still holds {others}, \
+         and a cgroup may not have both member processes and enabled controllers. \
+         {what} therefore cannot be enforced here. Get a cgroup of our own - \
+         `systemd-run --user --scope -p Delegate=yes -- <command>` - or move those \
+         processes into a leaf first."
     )]
     SharedCgroup {
         path: String,
-        others: usize,
+        /// Named, not counted: "it is busy" sends people to look at
+        /// devices, and which process is in the way is the whole answer.
+        others: String,
         controller: &'static str,
         what: String,
     },
@@ -242,7 +244,7 @@ impl Cgroup {
                 // rest of a container. Say so, with the count, because
                 // "device or resource busy" sends people to look at devices.
                 let others = other_procs(&base);
-                if others > 0 {
+                if !others.is_empty() {
                     return Err(Error::SharedCgroup {
                         path: base.display().to_string(),
                         others,
@@ -440,16 +442,24 @@ fn subtree_has(base: &Path, controller: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Processes in this cgroup that are not us.
-fn other_procs(base: &Path) -> usize {
+/// Processes in this cgroup that are not us, named.
+fn other_procs(base: &Path) -> String {
     let me = std::process::id().to_string();
-    std::fs::read_to_string(base.join("cgroup.procs"))
-        .map(|s| {
-            s.split_ascii_whitespace()
-                .filter(|p| !p.is_empty() && *p != me)
-                .count()
+    let Ok(s) = std::fs::read_to_string(base.join("cgroup.procs")) else {
+        return String::new();
+    };
+    let named: Vec<String> = s
+        .split_ascii_whitespace()
+        .filter(|p| !p.is_empty() && *p != me)
+        .take(5)
+        .map(|p| {
+            let comm = std::fs::read_to_string(format!("/proc/{p}/comm"))
+                .map(|c| c.trim().to_owned())
+                .unwrap_or_else(|_| "?".into());
+            format!("{p} ({comm})")
         })
-        .unwrap_or(0)
+        .collect();
+    named.join(", ")
 }
 
 fn read_event(dir: &Path, key: &str) -> Option<u64> {

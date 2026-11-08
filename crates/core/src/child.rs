@@ -48,6 +48,7 @@ pub enum Step {
     AwaitStart = 7,
     CgroupNamespace = 8,
     Security = 9,
+    WorkingDirectory = 10,
 }
 
 impl Step {
@@ -62,6 +63,7 @@ impl Step {
             7 => Step::AwaitStart,
             8 => Step::CgroupNamespace,
             9 => Step::Security,
+            10 => Step::WorkingDirectory,
             _ => return None,
         })
     }
@@ -77,6 +79,7 @@ impl Step {
             Step::AwaitStart => "waiting at the start rendezvous",
             Step::CgroupNamespace => "unsharing the cgroup namespace",
             Step::Security => "applying the security posture",
+            Step::WorkingDirectory => "entering the image's working directory",
         }
     }
 }
@@ -129,6 +132,8 @@ pub struct ChildPlan {
     argv: Vec<*const c_char>,
     envp: Vec<*const c_char>,
     hostname: Option<CString>,
+    /// The image's `WorkingDir`, entered after the pivot.
+    workdir: Option<CString>,
     /// Unshare the cgroup namespace once placement has happened.
     cgroup_ns: bool,
     /// Empty when the container keeps the host's filesystem view.
@@ -170,6 +175,7 @@ impl ChildPlan {
         argv: &[OsString],
         envp: &[OsString],
         hostname: Option<&OsStr>,
+        workdir: Option<&OsStr>,
         mounts: Option<mount::MountPlan>,
         cgroup_ns: bool,
         security: Option<Security>,
@@ -208,6 +214,10 @@ impl ChildPlan {
             Some(h) => Some(cstr(h, "the hostname")?),
             None => None,
         };
+        let workdir = match workdir {
+            Some(w) => Some(cstr(w, "the working directory")?),
+            None => None,
+        };
 
         let (mount_ops, rootfs) = match mounts {
             Some(p) => (p.ops, Some(p.rootfs)),
@@ -233,6 +243,7 @@ impl ChildPlan {
             argv: argv_ptrs,
             envp: envp_ptrs,
             hostname,
+            workdir,
             cgroup_ns,
             security,
             mount_ops,
@@ -309,7 +320,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::SetHostname, 0, e);
     }
 
-    // 8. Attach the standard streams. After this point the child has no
+    // 9. Attach the standard streams. After this point the child has no
     //    way to report anything except through `err_tx`, which is why the
     //    failure record exists at all.
     if let Some(io) = &plan.stdio {
@@ -320,7 +331,17 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 5. Open the start rendezvous - but do not wait on it yet.
+    // 5. Enter the image's working directory, while we can still see it.
+    //
+    // After the pivot and before the privilege drop: a WorkingDir that only
+    // root can enter is common in real images.
+    if let Some(w) = &plan.workdir
+        && let Err(e) = sys::chdir(w)
+    {
+        fail(plan, Step::WorkingDirectory, 0, e);
+    }
+
+    // 6. Open the start rendezvous - but do not wait on it yet.
     //
     // The open must happen while we are still root. After the uid change
     // the process is non-dumpable, which makes `/proc/<pid>/fd` root-owned
@@ -339,7 +360,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 6. Give away privilege: bounding set, user, no_new_privs, seccomp.
+    // 7. Give away privilege: bounding set, user, no_new_privs, seccomp.
     //
     // As close to execve as possible, so as few of our own syscalls as
     // possible run under the filter. Everything above this line needed
@@ -350,12 +371,12 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::Security, step as u8, e);
     }
 
-    // 7. Announce that we are started, now that the posture is in place.
+    // 8. Announce that we are started, now that the posture is in place.
     if let Some(w) = &started {
         let _ = sys::write(w, &[0u8]);
     }
 
-    // 9. Become the container command. `err_tx` is O_CLOEXEC, so a successful
+    // 10. Become the container command. `err_tx` is O_CLOEXEC, so a successful
     //    execve closes it and the parent sees EOF — that, and not a success
     //    message, is how the parent learns this worked.
     let e = unsafe { sys::execve(plan.exe, plan.argv.as_ptr(), plan.envp.as_ptr()) };
@@ -385,6 +406,7 @@ mod tests {
             &args.iter().map(OsString::from).collect::<Vec<_>>(),
             &[OsString::from("PATH=/usr/bin:/bin")],
             Some(OsStr::new("box")),
+            None,
             None,
             false,
             None,
@@ -427,6 +449,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             false,
             None,
             None,
@@ -449,6 +472,7 @@ mod tests {
             Step::AwaitStart,
             Step::CgroupNamespace,
             Step::Security,
+            Step::WorkingDirectory,
         ] {
             let encoded = encode(step, 7, Errno::NOENT);
             let (got_step, detail, got_errno) = decode(&encoded).expect("decode");
@@ -484,6 +508,7 @@ mod tests {
             Step::AwaitStart,
             Step::CgroupNamespace,
             Step::Security,
+            Step::WorkingDirectory,
         ] {
             assert!(!step.describe().is_empty());
         }

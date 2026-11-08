@@ -15,6 +15,7 @@ path = "src/main.rs"
 # boundary the only job left is printing (RND.md section 15.8).
 [dependencies]
 rustainer-core = { path = "../core" }
+rustainer-image = { path = "../image" }
 clap.workspace = true
 anyhow.workspace = true
 pentacle.workspace = true

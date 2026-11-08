@@ -80,6 +80,8 @@ pub struct Config {
     /// "unspecified" the moment it passed through the config file.
     #[serde(default)]
     pub seccomp_unconfined: bool,
+    #[serde(default)]
+    pub workdir: Option<String>,
 }
 
 impl Config {
@@ -101,6 +103,7 @@ impl Config {
             argv: self.argv.iter().map(Into::into).collect(),
             envp: self.envp.iter().map(Into::into).collect(),
             hostname: Some(self.hostname.clone().into()),
+            workdir: self.workdir.clone().map(Into::into),
             namespaces: if self.rootfs.is_some() {
                 Namespaces::STAGE2
             } else {
@@ -634,6 +637,7 @@ mod tests {
             user: None,
             seccomp: None,
             seccomp_unconfined: false,
+            workdir: None,
         };
         c.store(&paths).unwrap();
         let back = Config::load(&paths, "c1").unwrap();

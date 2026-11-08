@@ -115,6 +115,8 @@ pub struct Spec {
     pub envp: Vec<OsString>,
     /// Hostname to set inside the UTS namespace. Ignored without `uts`.
     pub hostname: Option<OsString>,
+    /// The image's `WorkingDir`, if it has one.
+    pub workdir: Option<OsString>,
     pub namespaces: Namespaces,
 }
 
@@ -268,6 +270,7 @@ pub fn spawn(
         &spec.argv,
         &spec.envp,
         hostname,
+        spec.workdir.as_deref(),
         mounts,
         cgroup_fd.is_some(),
         security,
@@ -431,6 +434,7 @@ impl Spec {
             argv,
             envp: inherited_env(),
             hostname: None,
+            workdir: None,
             namespaces: Namespaces::STAGE1,
         }
     }

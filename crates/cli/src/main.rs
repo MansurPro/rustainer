@@ -25,6 +25,7 @@ use rustainer_core::security::{self, UserSpec};
 use rustainer_core::state::{Paths, State, Status};
 use rustainer_core::supervise::{self, Config, HANDSHAKE_FD, HANDSHAKE_LEN};
 use rustainer_core::{Privileges, mount, sys};
+use rustainer_image::Store;
 
 #[derive(Parser)]
 #[command(
@@ -63,6 +64,12 @@ enum Command {
     Rm(RmArgs),
     /// Print a container's captured output.
     Logs(LogsArgs),
+    /// Download an image and extract it into the local store.
+    Pull(PullArgs),
+    /// List images in the local store.
+    Images,
+    /// Remove an image from the local store.
+    Rmi(RmiArgs),
     /// Internal: become the supervisor for an already-prepared container.
     #[command(hide = true)]
     Supervise { id: String },
@@ -70,10 +77,15 @@ enum Command {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Root filesystem: a directory tree, for example one extracted from an
-    /// image tarball with `tar`. `/` keeps the host's filesystem view.
-    #[arg(long, default_value = "/")]
-    rootfs: PathBuf,
+    /// Root filesystem: a directory tree you extracted yourself. `/` keeps
+    /// the host's filesystem view. Omit it and the first positional
+    /// argument is an image reference instead.
+    #[arg(long)]
+    rootfs: Option<PathBuf>,
+
+    /// Pull the image again even if it is already in the store.
+    #[arg(long)]
+    pull: bool,
 
     /// Network mode. Only `host` is supported, and it is required
     /// explicitly so that sharing the host's network stack is a decision
@@ -125,9 +137,25 @@ struct RunArgs {
     #[arg(long)]
     name: Option<String>,
 
-    /// The command to run, resolved inside the container's root filesystem.
+    /// With `--rootfs`: the command, which must be an absolute path.
+    /// Without it: an image reference, then an optional command overriding
+    /// the image's own.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     command: Vec<OsString>,
+}
+
+#[derive(Args)]
+struct PullArgs {
+    /// Image reference, e.g. `alpine`, `alpine:3.21`, `ghcr.io/o/r@sha256:…`.
+    image: String,
+    /// Fetch and re-extract even if it is already in the store.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args)]
+struct RmiArgs {
+    image: String,
 }
 
 #[derive(Args)]
@@ -190,6 +218,9 @@ fn real_main() -> Result<ExitCode> {
         Command::Stop(a) => cmd_stop(&paths, a),
         Command::Rm(a) => cmd_rm(&paths, a),
         Command::Logs(a) => cmd_logs(&paths, a),
+        Command::Pull(a) => cmd_pull(a),
+        Command::Images => cmd_images(),
+        Command::Rmi(a) => cmd_rmi(a),
         Command::Supervise { id } => cmd_supervise(&paths, &id),
     }
 }
@@ -208,26 +239,76 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         );
     }
 
-    let exe = args.command[0].clone();
-    if !Path::new(&exe).is_absolute() {
-        bail!(
-            "{exe:?} must be an absolute path. PATH is not searched: the search would \
-             have to run in the child, between clone3 and execve, where it cannot \
-             allocate."
-        );
-    }
+    // Three shapes, chosen by --rootfs:
+    //   --rootfs /       the host's filesystem view (stage 1)
+    //   --rootfs <dir>   a tree you extracted yourself (stage 2)
+    //   no --rootfs      an image reference (stage 6)
+    let mut image_env: Vec<String> = Vec::new();
+    let mut workdir: Option<String> = None;
+    let mut image_user: Option<String> = None;
 
-    let rootfs = if args.rootfs == Path::new("/") {
-        None
-    } else {
-        if !args.rootfs.is_dir() {
-            bail!(
-                "--rootfs {:?} is not a directory. It should be an extracted root \
-                 filesystem - for example `mkdir rootfs && tar -xf alpine.tar -C rootfs`. \
-                 Pulling an image is stage 6.",
-                args.rootfs
-            );
+    let (rootfs, command) = match &args.rootfs {
+        Some(p) if p == Path::new("/") => {
+            require_absolute(&args.command[0])?;
+            (None, args.command.clone())
         }
+        Some(p) => {
+            if !p.is_dir() {
+                bail!(
+                    "--rootfs {p:?} is not a directory. It should be an extracted root \
+                     filesystem - or omit --rootfs and name an image instead."
+                );
+            }
+            require_absolute(&args.command[0])?;
+            (
+                Some(p.canonicalize()?.to_string_lossy().into_owned()),
+                args.command.clone(),
+            )
+        }
+        None => {
+            let reference = args.command[0].to_string_lossy().into_owned();
+            let store = Store::new(Store::default_root());
+            let image = store
+                .pull(&reference, args.pull)
+                .with_context(|| format!("pulling {reference}"))?;
+
+            // Say what the extractor refused. A device node in a layer is
+            // not a corrupt image - it is a layer asking for a direct path
+            // to host memory - and silently dropping it would hide that.
+            for d in &image.report.devices_skipped {
+                eprintln!("rustainer: refused a device node in the image: {d}");
+            }
+            if image.report.xattrs_dropped > 0 {
+                eprintln!(
+                    "rustainer: dropped {} security.*/system.* extended attribute(s) from the image",
+                    image.report.xattrs_dropped
+                );
+            }
+
+            image_env = image.env.clone();
+            workdir = image.working_dir.clone();
+            image_user = image.user.clone();
+
+            let override_cmd: Vec<OsString> = args.command[1..].to_vec();
+            let cmd = if override_cmd.is_empty() {
+                let c = image.command();
+                if c.is_empty() {
+                    bail!(
+                        "{reference} declares neither an Entrypoint nor a Cmd, so there is \
+                         nothing to run. Give a command after the image name."
+                    );
+                }
+                c.into_iter().map(OsString::from).collect()
+            } else {
+                override_cmd
+            };
+            (Some(image.rootfs.to_string_lossy().into_owned()), cmd)
+        }
+    };
+
+    let exe = resolve_exe(&command[0], rootfs.as_deref())?;
+
+    if let Some(dir) = &rootfs {
         let privs = Privileges::probe();
         if !privs.sys_admin {
             bail!(
@@ -239,18 +320,17 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         // Planned here only to report degradations while someone is still
         // watching; the supervisor plans it again for real.
         let plan =
-            mount::plan(&args.rootfs, privs, None).context("planning the container's mounts")?;
+            mount::plan(Path::new(dir), privs, None).context("planning the container's mounts")?;
         for d in &plan.degradations {
             eprintln!("rustainer: degraded: {} - {}", d.what, d.because);
         }
-        Some(args.rootfs.canonicalize()?.to_string_lossy().into_owned())
-    };
+    }
 
     // Move ourselves out of the cgroup that is about to delegate to the
-    // container. A CLI left sitting in it would keep it non-empty, and
+    // container. A CLI left sitting in it keeps it non-empty, and
     // `cgroup.subtree_control` cannot be written for a cgroup that holds
-    // processes - so every limit would be refused with a message about a
-    // busy cgroup that is in fact about us.
+    // processes - so every limit is refused with a message about a busy
+    // cgroup that is in fact about us.
     let limits_requested =
         args.memory.is_some() || args.cpus.is_some() || args.pids_limit.is_some();
     if limits_requested && let Err(e) = rustainer_core::cgroup::enter_own_leaf() {
@@ -280,19 +360,32 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
     let config = Config {
         id: id.clone(),
         exe: exe.to_string_lossy().into_owned(),
-        argv: args
-            .command
+        argv: command
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect(),
-        envp: std::env::vars().map(|(k, v)| format!("{k}={v}")).collect(),
+        // The container's environment is the image's, never the host's.
+        //
+        // Inheriting the caller's environment is the obvious thing and the
+        // wrong thing: it leaks whatever the operator happened to have
+        // exported into every container, and it overrides the PATH the
+        // image set for its own binaries. Docker does not do it either.
+        envp: if image_env.is_empty() {
+            vec![
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
+                "HOME=/root".to_owned(),
+            ]
+        } else {
+            image_env
+        },
         hostname: args.hostname,
         rootfs,
+        workdir,
         memory: args.memory.as_deref().map(parse_size).transpose()?,
         cpus: args.cpus,
         pids: args.pids_limit,
         capabilities: resolve_capabilities(&args.cap_add, &args.cap_drop)?,
-        user: match &args.user {
+        user: match args.user.as_ref().or(image_user.as_ref()) {
             None => None,
             Some(u) => {
                 let spec = UserSpec::parse(u).map_err(|e| anyhow::anyhow!("--user: {e}"))?;
@@ -587,9 +680,88 @@ fn dump(path: &Path, out: &mut impl std::io::Write) -> Result<()> {
     }
 }
 
+fn cmd_pull(args: PullArgs) -> Result<ExitCode> {
+    let store = Store::new(Store::default_root());
+    let image = store
+        .pull(&args.image, args.force)
+        .with_context(|| format!("pulling {}", args.image))?;
+    for d in &image.report.devices_skipped {
+        eprintln!("rustainer: refused a device node in the image: {d}");
+    }
+    println!("{}", image.digest);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_images() -> Result<ExitCode> {
+    let store = Store::new(Store::default_root());
+    println!("{:<48} DIGEST", "REFERENCE");
+    for (key, digest) in store.list()? {
+        println!("{key:<48} {digest}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_rmi(args: RmiArgs) -> Result<ExitCode> {
+    let store = Store::new(Store::default_root());
+    store
+        .remove(&args.image)
+        .with_context(|| format!("removing {}", args.image))?;
+    println!("{}", args.image);
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_supervise(paths: &Paths, id: &str) -> Result<ExitCode> {
     let exit = supervise::supervise(paths, id).with_context(|| format!("supervising {id}"))?;
     Ok(ExitCode::from(exit.to_shell_status().min(255) as u8))
+}
+
+fn require_absolute(exe: &OsString) -> Result<()> {
+    if !Path::new(exe).is_absolute() {
+        bail!(
+            "{exe:?} must be an absolute path with --rootfs. PATH is not searched: the \
+             search would have to run in the child, between clone3 and execve, where it \
+             cannot allocate."
+        );
+    }
+    Ok(())
+}
+
+/// Find the command inside the container's filesystem.
+///
+/// Resolved HERE, in the parent, against the rootfs on disk - never in the
+/// child, where a PATH search would mean reading directories and allocating
+/// in the one window that forbids both.
+fn resolve_exe(cmd: &OsString, rootfs: Option<&str>) -> Result<OsString> {
+    let p = Path::new(cmd);
+    if p.is_absolute() {
+        return Ok(cmd.clone());
+    }
+    let Some(root) = rootfs else {
+        return Err(anyhow::anyhow!(
+            "{cmd:?} must be an absolute path when there is no image to search"
+        ));
+    };
+    for dir in [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ] {
+        let candidate = Path::new(root).join(dir.trim_start_matches('/')).join(p);
+        // `symlink_metadata`, not `is_file`: in a real image `/bin/echo` is
+        // a symlink to `/bin/busybox`, and that absolute target only
+        // resolves *inside* the container. Following it from out here looks
+        // for the host's busybox and concludes the command does not exist.
+        if candidate.symlink_metadata().is_ok() {
+            return Ok(OsString::from(format!("{dir}/{}", p.display())));
+        }
+    }
+    bail!(
+        "{cmd:?} was not found in the image's PATH directories. Give an absolute path, \
+         or check the image actually contains it."
+    )
 }
 
 /// The bounding set to keep, as names, or `None` for the default.
