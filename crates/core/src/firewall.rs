@@ -88,7 +88,7 @@ pub fn detect() -> Option<Box<dyn Firewall>> {
 
 fn iptables_has_forward_chain() -> bool {
     Command::new("iptables")
-        .args(["-S", "FORWARD"])
+        .args(["-w", "5", "-S", "FORWARD"])
         .output()
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false)
@@ -121,6 +121,11 @@ fn run(tool: &'static str, args: &[&str]) -> Result<(), Error> {
         });
     }
     Ok(())
+}
+
+fn run_owned(tool: &'static str, args: &[String]) -> Result<(), Error> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(tool, &refs)
 }
 
 /// Idempotent: creating a table or chain that exists is not an error.
@@ -195,6 +200,21 @@ impl Firewall for Nft {
 
 pub struct Iptables;
 
+/// `-w` on every invocation.
+///
+/// `iptables` takes an exclusive lock, and without `-w` it does not wait
+/// for it - it fails. Any host also running Docker, libvirt or firewalld
+/// holds that lock periodically, so a container start fails for reasons
+/// that have nothing to do with the container and succeeds on the retry.
+const WAIT: [&str; 2] = ["-w", "5"];
+
+fn with_wait(args: &[&str]) -> Vec<String> {
+    WAIT.iter()
+        .chain(args.iter())
+        .map(|s| (*s).to_owned())
+        .collect()
+}
+
 impl Firewall for Iptables {
     fn name(&self) -> &'static str {
         "iptables"
@@ -249,7 +269,7 @@ impl Firewall for Iptables {
             vec!["-C", "FORWARD", "-o", bridge, "-j", "ACCEPT"],
         ] {
             let present = Command::new("iptables")
-                .args(&args)
+                .args(with_wait(&args))
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
@@ -258,7 +278,7 @@ impl Firewall for Iptables {
             if !present {
                 let mut add = args.clone();
                 add[0] = "-I";
-                run("iptables", &add)?;
+                run_owned("iptables", &with_wait(&add))?;
             }
         }
         Ok(())
@@ -266,7 +286,7 @@ impl Firewall for Iptables {
 
     fn foreign_drop_policy(&self) -> bool {
         Command::new("iptables")
-            .args(["-S", "FORWARD"])
+            .args(with_wait(&["-S", "FORWARD"]))
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("-P FORWARD DROP"))
             .unwrap_or(false)

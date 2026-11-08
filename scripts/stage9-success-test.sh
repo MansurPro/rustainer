@@ -108,7 +108,10 @@ if echo "$FIB" | grep -q '172\.30\..*'; then
     echo "  $(echo "$FIB" | grep -A1 '172\.30\.' | grep -B1 LOCAL | head -1 | tr -d ' |-')"
 else
     bad "no address from the bridge subnet"
-    echo "$FIB" | tail -5 | sed 's/^/    /'
+    # Why, in the container's own words. An empty answer here almost
+    # always means the container never started at all.
+    echo "  the same run, with stderr:"
+    R /bin/cat /proc/net/fib_trie 2>&1 | tail -4 | sed 's/^/    /'
 fi
 check "it has a default route via the bridge" \
     "$(R /bin/sh -c 'ip route 2>/dev/null | awk "/^default/ {print \$3}"' 2>/dev/null | tail -1)" \
