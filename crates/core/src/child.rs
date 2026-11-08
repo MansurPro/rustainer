@@ -92,6 +92,9 @@ impl Step {
 /// parent looks up in the plan it still holds.
 pub const RECORD_LEN: usize = 8;
 
+/// Room for the kernel's own explanation, appended after the record.
+pub const DETAIL_LEN: usize = crate::mount::DETAIL_LEN;
+
 fn encode(step: Step, detail: u8, errno: Errno) -> [u8; RECORD_LEN] {
     let e = errno.raw_os_error().to_ne_bytes();
     [step as u8, detail, 0, 0, e[0], e[1], e[2], e[3]]
@@ -304,8 +307,9 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
     // from the mounting process — mounted by the supervisor, the container
     // would see host PIDs.
     if let Some(rootfs) = &plan.rootfs {
-        if let Err((index, e)) = mount::apply(&plan.mount_ops) {
-            fail(plan, Step::Mount, index, e);
+        let mut detail = [0u8; mount::DETAIL_LEN];
+        if let Err((index, e, n)) = mount::apply(&plan.mount_ops, &mut detail) {
+            fail_with(plan, Step::Mount, index, e, &detail[..n]);
         }
         if let Err(e) = mount::pivot(rootfs) {
             fail(plan, Step::PivotRoot, 0, e);
@@ -385,11 +389,24 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
 
 /// Report and leave. One `write(2)` of a stack array, then `_exit`.
 fn fail(plan: &ChildPlan, step: Step, detail: u8, errno: Errno) -> ! {
+    fail_with(plan, step, detail, errno, &[])
+}
+
+/// As [`fail`], with the kernel's own words appended.
+///
+/// `extra` is written straight after the fixed record, so the parent reads
+/// eight bytes of structure and then whatever explanation exists. Nothing
+/// here formats or allocates: the bytes came from a `read(2)` into a stack
+/// buffer.
+fn fail_with(plan: &ChildPlan, step: Step, detail: u8, errno: Errno, extra: &[u8]) -> ! {
     let record = encode(step, detail, errno);
     // A partial write cannot be retried meaningfully here and a failed write
     // leaves us nothing to say, so the result is deliberately discarded: the
     // parent falls back to reporting the exit status.
     let _ = sys::write(&plan.err_tx, &record);
+    if !extra.is_empty() {
+        let _ = sys::write(&plan.err_tx, extra);
+    }
     // 127 is the shell's convention for "command not found", and the closest
     // thing to a conventional meaning for "the child never started".
     sys::exit_immediately(127)

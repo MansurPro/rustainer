@@ -71,7 +71,13 @@ pub struct Store {
 /// What the runtime needs to run an image.
 #[derive(Clone, Debug)]
 pub struct Materialised {
-    pub rootfs: PathBuf,
+    /// Extracted layer directories, lowest first.
+    ///
+    /// Kept separate rather than flattened into one tree: that is what
+    /// lets two containers from one image share the read-only layers and
+    /// each get a private writable upper, and what makes a second image
+    /// sharing a base layer cost nothing.
+    pub layers: Vec<PathBuf>,
     pub digest: String,
     pub env: Vec<String>,
     pub entrypoint: Vec<String>,
@@ -118,12 +124,30 @@ impl Store {
             .join("images")
             .join(digest.trim_start_matches("sha256:"))
     }
+    /// Extracted layers, keyed by their uncompressed digest.
+    ///
+    /// Partitioned by extended-attribute mode, because a layer written
+    /// with `trusted.overlay.*` whiteouts is silently unreadable by a
+    /// `userxattr` mount and vice versa: deleted files quietly reappear.
+    /// Sharing one directory between the two modes corrupts both.
+    fn layer_dir(&self, diff_id: &str, userxattr: bool) -> PathBuf {
+        self.root
+            .join(if userxattr { "layers-user" } else { "layers" })
+            .join(diff_id.trim_start_matches("sha256:"))
+    }
+
+    /// Are we outside the initial user namespace?
+    fn userxattr() -> bool {
+        std::fs::read_to_string("/proc/self/uid_map")
+            .map(|m| m.split_whitespace().collect::<Vec<_>>() != ["0", "0", "4294967295"])
+            .unwrap_or(false)
+    }
     fn tag_path(&self, key: &str) -> PathBuf {
         self.root.join("tags").join(key)
     }
 
     pub fn prepare(&self) -> Result<(), Error> {
-        for d in ["blobs/sha256", "images", "tags"] {
+        for d in ["blobs/sha256", "images", "tags", "layers", "layers-user"] {
             let p = self.root.join(d);
             std::fs::create_dir_all(&p).map_err(io("creating", &p))?;
         }
@@ -156,8 +180,9 @@ impl Store {
         std::fs::remove_file(&tag).map_err(io("removing the tag", &tag))?;
         if let Some(d) = digest {
             let dir = self.image_dir(d.trim());
-            // Only the extracted tree goes; blobs stay, because another
-            // image may share them and they are cheap to keep.
+            // Only this image's record goes. Blobs and extracted layers
+            // stay: they are content-addressed, another image may share
+            // them, and re-fetching is far more expensive than the disk.
             let _ = std::fs::remove_dir_all(&dir);
         }
         Ok(())
@@ -184,7 +209,6 @@ impl Store {
         };
 
         let image_dir = self.image_dir(&manifest_digest);
-        let rootfs = image_dir.join("rootfs");
         let config_path = image_dir.join("config.json");
 
         // Step 7: the config blob. Its digest is the image ID.
@@ -195,52 +219,67 @@ impl Store {
                 source,
             })?;
 
-        let already = rootfs.exists() && config_path.exists();
-        if already && !force {
-            return self.materialise(&manifest_digest, &config, extract::Report::default());
-        }
-        if already {
-            std::fs::remove_dir_all(&rootfs).map_err(io("removing the old rootfs", &rootfs))?;
-        }
-
-        // A fresh, empty, per-attempt staging directory. Most escapes need
-        // something pre-existing to aim at, and cleanup is one remove.
-        let staging = image_dir.join("staging");
-        let _ = std::fs::remove_dir_all(&staging);
-        std::fs::create_dir_all(&staging)
-            .map_err(io("creating the staging directory", &staging))?;
-
+        let userxattr = Self::userxattr();
+        let mut layer_dirs = Vec::new();
         let mut report = extract::Report::default();
-        {
-            let root = extract::SafeRoot::open(&staging)?;
-            for (i, layer) in manifest.layers.iter().enumerate() {
-                // Step 8: the compressed digest is checked by `blob`; the
-                // uncompressed one against the config's diff_ids. Both
-                // matter: the first says the bytes are the blob we asked
-                // for, the second says the blob belongs to this image.
-                let bytes = self.blob(&mut client, &r, &layer.digest)?;
-                let gz = flate2::read::GzDecoder::new(&bytes[..]);
-                let mut hashing = registry::HashingReader::new(gz);
-                extract::apply_layer(&root, &mut hashing, extract::Limits::default(), &mut report)?;
-                // The tar reader stops at the end-of-archive marker and
-                // leaves the trailing padding unread, so the digest would
-                // cover only part of the layer. Drain first.
-                std::io::copy(&mut hashing, &mut std::io::sink())
-                    .map_err(io("draining the layer stream", "layer"))?;
-                let actual = hashing.digest();
-                if let Some(expected) = config.rootfs.diff_ids.get(i)
-                    && *expected != actual
-                {
-                    return Err(Error::DiffIdMismatch {
-                        index: i,
-                        expected: expected.clone(),
-                        actual,
-                    });
-                }
+
+        for (i, layer) in manifest.layers.iter().enumerate() {
+            let diff_id = config
+                .rootfs
+                .diff_ids
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| layer.digest.clone());
+            let dir = self.layer_dir(&diff_id, userxattr);
+            if dir.exists() && !force {
+                layer_dirs.push(dir);
+                continue;
             }
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).map_err(io("removing a stale layer", &dir))?;
+            }
+
+            // A fresh, empty, per-attempt staging directory, committed by
+            // rename only once the whole layer verified. A half-extracted
+            // layer must never be visible under its content address.
+            let staging = dir.with_extension("staging");
+            let _ = std::fs::remove_dir_all(&staging);
+            std::fs::create_dir_all(&staging)
+                .map_err(io("creating a staging directory", &staging))?;
+
+            // Both digests: the compressed one says these are the bytes we
+            // asked for, the uncompressed one says they belong to this image.
+            let bytes = self.blob(&mut client, &r, &layer.digest)?;
+            let gz = flate2::read::GzDecoder::new(&bytes[..]);
+            let mut hashing = registry::HashingReader::new(gz);
+            {
+                let root = extract::SafeRoot::open(&staging)?;
+                extract::apply_layer(&root, &mut hashing, extract::Limits::default(), &mut report)?;
+            }
+            // The tar reader stops at the end-of-archive marker and leaves
+            // the trailing padding unread, so drain before hashing.
+            std::io::copy(&mut hashing, &mut std::io::sink())
+                .map_err(io("draining the layer stream", "layer"))?;
+            let actual = hashing.digest();
+            if let Some(expected) = config.rootfs.diff_ids.get(i)
+                && *expected != actual
+            {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(Error::DiffIdMismatch {
+                    index: i,
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+            if let Some(p) = dir.parent() {
+                std::fs::create_dir_all(p).map_err(io("creating the layer directory", p))?;
+            }
+            std::fs::rename(&staging, &dir).map_err(io("committing a layer", &dir))?;
+            layer_dirs.push(dir);
         }
 
-        std::fs::rename(&staging, &rootfs).map_err(io("committing the rootfs", &rootfs))?;
+        std::fs::create_dir_all(&image_dir)
+            .map_err(io("creating the image directory", &image_dir))?;
         let mut f =
             std::fs::File::create(&config_path).map_err(io("writing the config", &config_path))?;
         f.write_all(&config_bytes)
@@ -249,18 +288,19 @@ impl Store {
         let tag = self.tag_path(&r.store_key());
         std::fs::write(&tag, &manifest_digest).map_err(io("recording the tag", &tag))?;
 
-        self.materialise(&manifest_digest, &config, report)
+        self.materialise(&manifest_digest, &config, layer_dirs, report)
     }
 
     fn materialise(
         &self,
         digest: &str,
         config: &ImageConfig,
+        layers: Vec<PathBuf>,
         report: extract::Report,
     ) -> Result<Materialised, Error> {
         let c = config.config.clone().unwrap_or_default();
         Ok(Materialised {
-            rootfs: self.image_dir(digest).join("rootfs"),
+            layers,
             digest: digest.to_owned(),
             env: c.env.unwrap_or_default(),
             entrypoint: c.entrypoint.unwrap_or_default(),
@@ -322,7 +362,7 @@ mod tests {
     #[test]
     fn entrypoint_and_cmd_compose_the_way_the_spec_says() {
         let m = Materialised {
-            rootfs: PathBuf::new(),
+            layers: vec![],
             digest: "sha256:x".into(),
             env: vec![],
             entrypoint: vec!["/bin/sh".into(), "-c".into()],
@@ -337,7 +377,7 @@ mod tests {
     #[test]
     fn an_image_with_only_a_cmd_still_has_a_command() {
         let m = Materialised {
-            rootfs: PathBuf::new(),
+            layers: vec![],
             digest: "sha256:x".into(),
             env: vec![],
             entrypoint: vec![],
