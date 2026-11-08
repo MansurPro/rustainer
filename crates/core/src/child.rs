@@ -28,6 +28,7 @@
 
 use core::ffi::{CStr, c_char};
 use std::ffi::{CString, OsStr, OsString};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 
 use crate::mount::{self, PlannedOp};
@@ -42,6 +43,8 @@ pub enum Step {
     Execve = 3,
     Mount = 4,
     PivotRoot = 5,
+    Stdio = 6,
+    AwaitStart = 7,
 }
 
 impl Step {
@@ -52,6 +55,8 @@ impl Step {
             3 => Step::Execve,
             4 => Step::Mount,
             5 => Step::PivotRoot,
+            6 => Step::Stdio,
+            7 => Step::AwaitStart,
             _ => return None,
         })
     }
@@ -63,6 +68,8 @@ impl Step {
             Step::Execve => "executing the container command",
             Step::Mount => "building the container's mount set",
             Step::PivotRoot => "pivoting onto the container's root filesystem",
+            Step::Stdio => "attaching the container's standard streams",
+            Step::AwaitStart => "waiting at the start rendezvous",
         }
     }
 }
@@ -110,8 +117,24 @@ pub struct ChildPlan {
     /// Empty when the container keeps the host's filesystem view.
     mount_ops: Vec<PlannedOp>,
     rootfs: Option<CString>,
+    /// Descriptors to put on 0, 1 and 2 immediately before `execve`.
+    stdio: Option<Stdio>,
+    /// The start rendezvous.
+    ///
+    /// The `OwnedFd` is an `O_PATH` reference held only to keep its number
+    /// valid; the `CString` is `/proc/self/fd/<n>`, built parent-side,
+    /// because after `pivot_root` the FIFO has no pathname the container can
+    /// reach and the child cannot build one anyway.
+    exec_fifo: Option<(OwnedFd, CString)>,
     proceed_rx: OwnedFd,
     err_tx: OwnedFd,
+}
+
+/// What the container's standard streams are attached to.
+pub struct Stdio {
+    pub stdin: OwnedFd,
+    pub stdout: OwnedFd,
+    pub stderr: OwnedFd,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +151,8 @@ impl ChildPlan {
         envp: &[OsString],
         hostname: Option<&OsStr>,
         mounts: Option<mount::MountPlan>,
+        stdio: Option<Stdio>,
+        exec_fifo: Option<OwnedFd>,
         proceed_rx: OwnedFd,
         err_tx: OwnedFd,
     ) -> Result<Self, PlanError> {
@@ -167,6 +192,19 @@ impl ChildPlan {
             None => (Vec::new(), None),
         };
 
+        let exec_fifo = match exec_fifo {
+            Some(fd) => {
+                let path =
+                    CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(|_| {
+                        PlanError::InteriorNul {
+                            what: "the fifo path",
+                        }
+                    })?;
+                Some((fd, path))
+            }
+            None => None,
+        };
+
         Ok(Self {
             _storage: storage,
             exe: exe_ptr,
@@ -175,6 +213,8 @@ impl ChildPlan {
             hostname,
             mount_ops,
             rootfs,
+            stdio,
+            exec_fifo,
             proceed_rx,
             err_tx,
         })
@@ -233,7 +273,33 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::SetHostname, 0, e);
     }
 
-    // 4. Become the container command. `err_tx` is O_CLOEXEC, so a successful
+    // 4. Attach the standard streams. After this point the child has no
+    //    way to report anything except through `err_tx`, which is why the
+    //    failure record exists at all.
+    if let Some(io) = &plan.stdio {
+        for (fd, target) in [(&io.stdin, 0), (&io.stdout, 1), (&io.stderr, 2)] {
+            if let Err(e) = sys::dup_onto(fd, target) {
+                fail(plan, Step::Stdio, target as u8, e);
+            }
+        }
+    }
+
+    // 5. Block at the start rendezvous.
+    //
+    // `open(O_WRONLY)` on a FIFO blocks until a reader opens it, so this is
+    // where a created-but-not-started container waits. Re-opening through
+    // /proc/self/fd is what makes it reachable after the pivot. Everything
+    // above this line is setup; everything below is the user's program.
+    if let Some((_fd, proc_path)) = &plan.exec_fifo {
+        match sys::open_write_blocking(proc_path) {
+            Ok(w) => {
+                let _ = sys::write(&w, &[0u8]);
+            }
+            Err(e) => fail(plan, Step::AwaitStart, 0, e),
+        }
+    }
+
+    // 6. Become the container command. `err_tx` is O_CLOEXEC, so a successful
     //    execve closes it and the parent sees EOF — that, and not a success
     //    message, is how the parent learns this worked.
     let e = unsafe { sys::execve(plan.exe, plan.argv.as_ptr(), plan.envp.as_ptr()) };
@@ -263,6 +329,8 @@ mod tests {
             &args.iter().map(OsString::from).collect::<Vec<_>>(),
             &[OsString::from("PATH=/usr/bin:/bin")],
             Some(OsStr::new("box")),
+            None,
+            None,
             None,
             rx,
             tx,
@@ -295,7 +363,17 @@ mod tests {
     #[test]
     fn interior_nul_is_rejected_not_truncated() {
         let (rx, tx) = sys::pipe_with(sys::PipeFlags::CLOEXEC).unwrap();
-        let result = ChildPlan::build(OsStr::new("/bin/sh\0extra"), &[], &[], None, None, rx, tx);
+        let result = ChildPlan::build(
+            OsStr::new("/bin/sh\0extra"),
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            rx,
+            tx,
+        );
         assert!(matches!(result, Err(PlanError::InteriorNul { .. })));
     }
 
@@ -307,6 +385,8 @@ mod tests {
             Step::Execve,
             Step::Mount,
             Step::PivotRoot,
+            Step::Stdio,
+            Step::AwaitStart,
         ] {
             let encoded = encode(step, 7, Errno::NOENT);
             let (got_step, detail, got_errno) = decode(&encoded).expect("decode");
@@ -329,6 +409,8 @@ mod tests {
             Step::Execve,
             Step::Mount,
             Step::PivotRoot,
+            Step::Stdio,
+            Step::AwaitStart,
         ] {
             assert!(!step.describe().is_empty());
         }

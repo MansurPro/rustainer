@@ -45,8 +45,8 @@ is easier to reason about once the process model is not also in question.
 |---|---|---|
 | 1 | A process in namespaces of its own | **Done** |
 | 2 | A real root filesystem (`pivot_root`) | **Done** |
-| 3 | Lifecycle, supervision and state | Next |
-| 4 | Resource limits (cgroup v2) | |
+| 3 | Lifecycle, supervision and state | **Done** |
+| 4 | Resource limits (cgroup v2) | Next |
 | 5 | Security controls (capabilities, seccomp) | |
 | 6 | Pull and unpack a real image — `run alpine echo hello` | |
 | 7 | Layered filesystem (OverlayFS) | |
@@ -69,6 +69,7 @@ root:
 ```sh
 sudo bash scripts/stage1-success-test.sh
 sudo bash scripts/stage2-success-test.sh
+sudo bash scripts/stage3-success-test.sh
 
 # or with no root at all, if /proc/sys/user/max_user_namespaces > 0
 unshare --user --map-root-user bash scripts/stage2-success-test.sh
@@ -91,25 +92,48 @@ files to `/tmp`, and runs the tests in an unprivileged user namespace.
 ### What works now, and what refuses
 
 ```sh
-rustainer run --rootfs ./alpine-rootfs --network host --hostname boxy /bin/sh
+rustainer run -d --rootfs ./alpine-rootfs --network host --hostname boxy /bin/sh -c 'sleep 60'
+rustainer ps
+rustainer logs <id>
+rustainer stop -t 5 <id>
+rustainer rm <id>
 ```
 
 The container gets its own PID, UTS, IPC and mount namespaces, a root
-filesystem pivoted onto a directory you extracted yourself, a private `/proc`
-reflecting only its own processes, a fresh `tmpfs` on `/dev` with the core
-device nodes, `/dev/pts`, `/dev/shm`, and a read-only `/sys`.
+filesystem pivoted onto a directory you extracted yourself, a private `/proc`,
+a fresh `tmpfs` on `/dev` with the core device nodes, `/dev/pts`, `/dev/shm`,
+and a read-only `/sys`. A supervisor process owns it and outlives the CLI, so
+`run -d`, `ps` after the CLI exits, exit-code collection and `logs` all work
+without a daemon.
 
 There is still no image, no layering, no resource limit, no capability or
 seccomp work, and no network isolation. The flags refuse rather than pretend:
 `--network bridge` names stage 9, and a `--rootfs` that is not a directory
 says so.
 
-Where a facility is genuinely unavailable the engine says what is degraded and
-why, rather than quietly producing less than it looks. Running rootless, for
-example:
+### The engine does not lie about what it does not know
+
+Two behaviours are worth stating because they are easy to get wrong in the
+comfortable direction:
+
+**An exit nobody observed is reported as unknown, never as 0.** Kill a
+container's supervisor and its init, and `ps` says so:
+
+```
+ID             STATUS    PID      EXIT     COMMAND
+9f2c1a4e7b03   unknown   -        ?        /bin/sleep 30
+```
+
+**Where a facility is genuinely unavailable, the engine names what is
+degraded and why** rather than quietly producing less than it looks. Rootless,
+for example:
 
 ```
 rustainer: degraded: device nodes - mknod of a device requires CAP_MKNOD in the
   INITIAL user namespace, and we are in a nested one; the host's nodes are
   bind-mounted instead
 ```
+
+And `stop` takes its full grace period against a container that installed no
+`SIGTERM` handler, because PID 1 in a new PID namespace has no default
+disposition and genuinely does ignore it.
