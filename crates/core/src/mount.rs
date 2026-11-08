@@ -177,6 +177,30 @@ impl Privileges {
             initial_user_ns,
         }
     }
+
+    /// What the CHILD will have, given that it is about to be cloned into
+    /// a user namespace of its own (stage 11).
+    ///
+    /// The plan is built by the parent but every operation in it is
+    /// performed by the child, so it must be built against the child's
+    /// privileges. Probing the parent's and using those is the bug this
+    /// method exists to make impossible: the parent is unprivileged, the
+    /// child is not, and a plan built from the parent's view silently
+    /// degrades everything the child could in fact have done.
+    pub fn in_new_user_namespace(self) -> Self {
+        Self {
+            // Creating a user namespace grants its creator the full
+            // capability set WITHIN it, and the mount operations are
+            // checked against exactly that namespace.
+            sys_admin: true,
+            // Still no, and this is the one people expect to flip. The
+            // mknod check is against the INITIAL user namespace; a nested
+            // one is further from it, not closer. The host's nodes are
+            // bind-mounted instead, and we say so.
+            mknod_devices: false,
+            initial_user_ns: false,
+        }
+    }
 }
 
 fn effective_caps() -> Option<u64> {

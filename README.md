@@ -53,7 +53,14 @@ is easier to reason about once the process model is not also in question.
 | 8 | A network namespace of its own | **Done** |
 | 9 | Bridge, NAT and the outside world | **Done** |
 | 10 | Published ports | **Done** |
-| 11 | Single-ID rootless | Next |
+| 11 | Single-ID rootless | **Done** |
+
+The ladder is complete. What it deliberately never reaches — `exec` and
+`attach`, restart policies, `events`, volumes, `commit` and `build`, push, a
+daemon or HTTP API, Compose-shaped orchestration, checkpoint/restore, drop-in
+OCI runtime compatibility — is listed in `research/pass-2/RND.md` §19, with
+why each is additive given these eleven and why none belongs in a first
+implementation whose purpose is understanding the mechanisms.
 
 ### Building and testing
 
@@ -77,6 +84,10 @@ sudo bash scripts/stage7-success-test.sh
 sudo bash scripts/stage8-success-test.sh
 sudo bash scripts/stage9-success-test.sh
 sudo bash scripts/stage10-success-test.sh
+
+# Stage 11 is the exception: NOT sudo, and not inside unshare either.
+# The engine makes its own user namespace; a wrapper would hide the stage.
+bash scripts/stage11-success-test.sh
 
 # or with no root at all, if /proc/sys/user/max_user_namespaces > 0
 unshare --user --map-root-user bash scripts/stage2-success-test.sh
@@ -203,6 +214,54 @@ we say so instead of appearing to work.
 The flags refuse rather than pretend: `-p` with `--network host` or
 `--network none` says a bridge is required, `udp` refuses rather than silently
 publishing tcp, and a `--rootfs` that is not a directory says so.
+
+**It runs without root, and that is a one-flag change.** An unprivileged
+user runs `rustainer run` with no `sudo`, no `unshare`, no setuid helper and
+no `--rootless` flag. The engine notices it has no `CAP_SYS_ADMIN`, adds
+`CLONE_NEWUSER` to the clone it was going to make anyway, and writes one
+line to the child's `uid_map`:
+
+```
+0 1000 1
+```
+
+One extent, the caller's own id, which is the whole of what an unprivileged
+process may map for itself. The three-process topology rootless is assumed
+to require applies to `subuid`-based multi-extent maps, which are
+deliberately not implemented and say so. `setgroups` is denied before
+`gid_map` is written, in that order, because the reverse fails and leaves
+the container holding the caller's supplementary groups.
+
+That this is a one-flag change is the actual result, not a convenience.
+Rootless was last on the ladder precisely so it could find out whether
+privilege had been expressed as *"we are root, so this will work"* or as
+*"this operation, in this namespace, needs this capability"*. Had it been
+the former, the assumption would now be in hundreds of places that never
+mention a uid, and this would have been a rewrite. The stage 11 success
+test asserts the absence as much as the presence: no rootless-specific
+flag, no setuid bit, the same command line as root.
+
+Two things genuinely cannot work, and are named rather than skipped:
+
+```
+rustainer: the limits you asked for cannot be enforced: this process has no
+  writable cgroup to delegate from. A user namespace grants no authority over
+  the cgroup hierarchy - that is a separate delegation the host has to make.
+  ...
+      systemd-run --user --scope -p Delegate=yes rustainer run ...
+
+rustainer: bridged networking needs CAP_NET_ADMIN in the user namespace that
+  owns the HOST's network namespace, and this process is in a nested one,
+  which can never have it. Degraded: no bridge, no address, no NAT.
+  Run `--network none` for a stack with only loopback, or run as root.
+```
+
+Which of those two refusals a user sees depends on ordering, and the
+ordering is deliberate: the capability check runs before the `ip_forward`
+check, because forwarding is something an operator can fix in one command
+and the missing capability is not. Reporting the fixable one first sends a
+rootless user off to run a `sysctl` that changes nothing about their
+problem.
 
 ### The engine does not lie about what it does not know
 

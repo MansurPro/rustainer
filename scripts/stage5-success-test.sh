@@ -65,7 +65,7 @@ R() { "$B" run --rootfs "$ROOTFS" --network host "$@"; }
 NR() { R --user "$TESTUID:$TESTUID" "$@"; }
 
 # Can we actually become a different uid here? In a single-ID user
-# namespace - `unshare --user --map-root-user`, and the whole of stage 11 -
+# namespace - `unshare --user --map-root-user`, and rootless generally -
 # exactly one id is mapped and setresuid to any other returns EINVAL. That
 # is a real limitation, not a bug, so the test says which path it took
 # rather than quietly asserting less.
@@ -82,8 +82,8 @@ if [ "$NONROOT" = no ]; then
     echo
     echo "0. Only one id is mapped here, so --user must refuse and explain"
     OUT=$(R --user 1000:1000 /bin/true 2>&1); RC=$?
-    [ "$RC" -ne 0 ] && echo "$OUT" | grep -q 'not mapped into this user namespace' \
-        && ok "--user with an unmapped id refuses and names stage 11" \
+    [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "not mapped into the container's user namespace" \
+        && ok "--user with an unmapped id refuses and says why" \
         || bad "--user with an unmapped id did not refuse clearly: $OUT"
     # Everything below needs a second uid; run it as the one id we have, so
     # the capability and seccomp mechanics are still exercised.

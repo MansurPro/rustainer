@@ -81,10 +81,25 @@ pub fn id_is_mapped(map_file: &str, id: u32) -> bool {
 }
 
 impl UserSpec {
-    /// Why this user cannot be entered here, if it cannot.
-    pub fn unmapped_reason(&self) -> Option<String> {
-        let u = id_is_mapped("/proc/self/uid_map", self.uid);
-        let g = id_is_mapped("/proc/self/gid_map", self.gid);
+    /// Why this user cannot be entered in the container, if it cannot.
+    ///
+    /// `new_userns` is stage 11: the container is about to be cloned into
+    /// a user namespace of its own whose map we are about to write. Our
+    /// own map is then the wrong file to consult - it is the initial
+    /// namespace's, where every id is mapped - and reading it is how
+    /// `--user 1000:1000` became `changing group id failed with EINVAL`
+    /// deep in the child instead of a sentence here.
+    pub fn unmapped_reason(&self, new_userns: bool) -> Option<String> {
+        let (u, g) = if new_userns {
+            // We write a single extent, `0 <our euid> 1`. No file to read:
+            // we know the answer because we are the one who decides it.
+            (self.uid == 0, self.gid == 0)
+        } else {
+            (
+                id_is_mapped("/proc/self/uid_map", self.uid),
+                id_is_mapped("/proc/self/gid_map", self.gid),
+            )
+        };
         if u && g {
             return None;
         }
@@ -94,10 +109,11 @@ impl UserSpec {
             _ => format!("gid {}", self.gid),
         };
         Some(format!(
-            "{which} is not mapped into this user namespace, so the container cannot \
-             switch to it - setresuid would return EINVAL. A single-ID namespace maps \
-             exactly one id. Mapping a range needs /etc/subuid and the setuid helpers, \
-             which is stage 11 and deliberately not implemented yet. Run as root, or \
+            "{which} is not mapped into the container's user namespace, so the container \
+             cannot switch to it - setresuid would return EINVAL. A single-ID namespace \
+             maps exactly one id, and running unprivileged is a single-ID namespace: the \
+             only id inside it is 0, which is you. Mapping a range needs /etc/subuid and \
+             the setuid helpers, which are deliberately not implemented. Run as root, or \
              use --user with the id that is mapped."
         ))
     }
@@ -784,5 +800,53 @@ mod tests {
         assert!((Step::SetGid as u8) < (Step::SetUid as u8));
         assert!((Step::ClearKeepCaps as u8) < (Step::SetCaps as u8));
         assert!((Step::NoNewPrivs as u8) < (Step::Seccomp as u8));
+    }
+
+    /// The stage 11 trap: our own map says every id is reachable, because
+    /// we are in the initial namespace. The container's will not.
+    #[test]
+    fn a_new_single_id_namespace_maps_only_root() {
+        let root = UserSpec {
+            uid: 0,
+            gid: 0,
+            groups: Vec::new(),
+        };
+        assert!(root.unmapped_reason(true).is_none());
+
+        for spec in [
+            UserSpec {
+                uid: 1000,
+                gid: 1000,
+                groups: Vec::new(),
+            },
+            UserSpec {
+                uid: 0,
+                gid: 1000,
+                groups: Vec::new(),
+            },
+            UserSpec {
+                uid: 1000,
+                gid: 0,
+                groups: Vec::new(),
+            },
+        ] {
+            let why = spec
+                .unmapped_reason(true)
+                .expect("only id 0 exists in a single-extent map");
+            assert!(why.contains("not mapped"), "{why}");
+        }
+
+        // And without a new namespace the question is about OUR map, where
+        // in the initial namespace every id is reachable.
+        if std::fs::read_to_string("/proc/self/uid_map")
+            .is_ok_and(|m| m.split_whitespace().eq(["0", "0", "4294967295"]))
+        {
+            let spec = UserSpec {
+                uid: 1000,
+                gid: 1000,
+                groups: Vec::new(),
+            };
+            assert!(spec.unmapped_reason(false).is_none());
+        }
     }
 }
