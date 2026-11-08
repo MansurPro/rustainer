@@ -96,11 +96,12 @@ struct RunArgs {
     #[arg(long)]
     read_only: bool,
 
-    /// `none` (the default) gives the container its own network stack with
-    /// nothing in it but loopback. `host` shares the host's, which reaches
-    /// every host-local service including anything trusting 127.0.0.1 and
-    /// the cloud metadata address - so it must be asked for.
-    #[arg(long, default_value = "none")]
+    /// `bridge` (the default) attaches the container to a bridge and gives
+    /// it an address, so it can reach the internet and other containers.
+    /// `none` gives it a stack with nothing but loopback. `host` shares the
+    /// host's, which reaches every host-local service including anything
+    /// trusting 127.0.0.1 and the cloud metadata address.
+    #[arg(long, default_value = "bridge")]
     network: String,
 
     /// Hostname inside the container's UTS namespace.
@@ -240,20 +241,21 @@ fn real_main() -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 
 fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
-    let private_net = match args.network.as_str() {
-        "none" => true,
+    let (private_net, bridge) = match args.network.as_str() {
+        "bridge" => (true, true),
+        "none" => (true, false),
         "host" => {
             eprintln!(
                 "rustainer: --network host shares the host's network stack. The container \
                  can reach every host-local service, including anything that trusts \
                  127.0.0.1 and the cloud metadata address."
             );
-            false
+            (false, false)
         }
         other => bail!(
-            "--network {other} is not supported yet. `none` gives the container its own \
-             stack with only loopback; `host` shares the host's. Bridge networking, which \
-             is what lets containers reach the internet and each other, is stage 9."
+            "--network {other} is not supported. `bridge` gives the container an address \
+             and a route off the machine; `none` gives it only loopback; `host` shares \
+             the host's stack. Custom networks are not implemented."
         ),
     };
 
@@ -393,6 +395,17 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         );
     }
 
+    // An address, before the container exists: the netlink messages the
+    // container sends to configure itself are built from it in the parent.
+    let lease = if bridge {
+        Some(
+            rustainer_core::net::allocate(&paths_root(paths))
+                .context("allocating an address for the container")?,
+        )
+    } else {
+        None
+    };
+
     let id = match args.name {
         Some(n) => {
             if n.is_empty() || n.contains('/') || n.starts_with('.') {
@@ -449,6 +462,8 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         // The runtime state directory is usually a tmpfs and sometimes an
         // overlayfs, and overlayfs cannot host an upperdir at all.
         private_net,
+        bridge,
+        ip: lease.map(|l| l.ip.to_string()),
         overlay_dir: if layers.is_empty() {
             None
         } else {

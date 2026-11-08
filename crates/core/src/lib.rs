@@ -26,7 +26,9 @@
 
 pub mod cgroup;
 pub mod child;
+pub mod firewall;
 pub mod mount;
+pub mod net;
 pub mod security;
 pub mod state;
 pub mod supervise;
@@ -128,6 +130,10 @@ pub struct Spec {
     pub hostname: Option<OsString>,
     /// The image's `WorkingDir`, if it has one.
     pub workdir: Option<OsString>,
+    /// Pre-built rtnetlink messages the container's init sends to
+    /// configure its own interface. Built in the parent because the child
+    /// cannot allocate.
+    pub net_messages: Vec<net::Message>,
     pub namespaces: Namespaces,
 }
 
@@ -299,17 +305,20 @@ pub fn spawn(
         None
     };
     let plan = ChildPlan::build(
-        &spec.exe,
-        &spec.argv,
-        &spec.envp,
-        hostname,
-        spec.workdir.as_deref(),
-        mounts,
-        cgroup_fd.is_some(),
-        spec.namespaces.net,
-        security,
-        stdio,
-        exec_fifo,
+        child::ChildSpec {
+            exe: &spec.exe,
+            argv: &spec.argv,
+            envp: &spec.envp,
+            hostname,
+            workdir: spec.workdir.as_deref(),
+            mounts,
+            cgroup_ns: cgroup_fd.is_some(),
+            loopback: spec.namespaces.net,
+            net_messages: &spec.net_messages,
+            security,
+            stdio,
+            exec_fifo,
+        },
         proceed_rx,
         err_tx,
     )?;
@@ -476,6 +485,7 @@ impl Spec {
             envp: inherited_env(),
             hostname: None,
             workdir: None,
+            net_messages: Vec::new(),
             namespaces: Namespaces::STAGE1,
         }
     }
@@ -505,7 +515,7 @@ mod tests {
     fn a_mount_plan_without_a_mount_namespace_is_refused() {
         let dir = std::env::temp_dir().join("rustainer-guard-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let plan = mount::plan(&dir, Privileges::probe(), None, None).unwrap();
+        let plan = mount::plan(&dir, Privileges::probe(), None, None, &[]).unwrap();
 
         let mut spec = Spec::new("/bin/true", vec![]);
         spec.namespaces = Namespaces::STAGE1; // mount: false
