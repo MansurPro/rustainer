@@ -93,7 +93,10 @@ if ! [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = 1 ]; then
     R /bin/true 2>&1 | grep -q 'sysctl -w net.ipv4.ip_forward=1' \
         && ok "the refusal names the command to run" \
         || bad "forwarding was off and we did not say how to fix it"
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    # Directly, not via sysctl(8): procps is not installed everywhere, and
+    # a missing binary here silently leaves forwarding off, which fails the
+    # next seven assertions for a reason that has nothing to do with them.
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
 fi
 
 echo

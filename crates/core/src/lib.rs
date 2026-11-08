@@ -63,6 +63,16 @@ pub struct Namespaces {
     pub ipc: bool,
     pub mount: bool,
     pub net: bool,
+    /// A user namespace of our own, with a single-extent map of our own
+    /// effective ids (stage 11).
+    ///
+    /// Set only when we do not already have `CAP_SYS_ADMIN`, so running as
+    /// root takes exactly the path it always did. This is the whole of the
+    /// rootless change at this layer: one more clone flag and a map the
+    /// parent writes, because the privilege seam was expressed as "this
+    /// operation, in this namespace, needs this capability" rather than
+    /// "we are root" (RND.md §17, §18.6).
+    pub user: bool,
 }
 
 impl Namespaces {
@@ -75,6 +85,7 @@ impl Namespaces {
         ipc: true,
         mount: false,
         net: false,
+        user: false,
     };
 
     /// Stage 2: adds the mount namespace, which is what makes a private root
@@ -111,6 +122,14 @@ impl Namespaces {
         }
         if self.net {
             f |= sys::CLONE_NEWNET;
+        }
+        // Ordering inside one clone3 is the kernel's business, not ours: a
+        // new user namespace is created first and the others are created
+        // OWNED BY it, which is exactly what grants the capabilities the
+        // rest of this list needs. Unsharing them separately afterwards
+        // would not - the namespaces would belong to the old one.
+        if self.user {
+            f |= sys::CLONE_NEWUSER;
         }
         f
     }
@@ -186,6 +205,30 @@ pub enum Error {
 
     #[error("clone3 failed: {0}")]
     Clone(#[source] Errno),
+
+    #[error(
+        "this process has no CAP_SYS_ADMIN, so it asked for a user namespace of its own \
+         to get it - and the kernel refused it ({0}). Three separate settings can forbid \
+         unprivileged user namespaces, each reporting a different error and none of them \
+         naming itself, so check all three:\n\n    \
+         sysctl user.max_user_namespaces                       # ENOSPC if 0\n    \
+         sysctl kernel.unprivileged_userns_clone               # EPERM if 0 (Debian)\n    \
+         sysctl kernel.apparmor_restrict_unprivileged_userns   # EPERM if 1 (Ubuntu)\n\n\
+         A kernel built without CONFIG_USER_NS reports EINVAL and none of these exist. \
+         Running as root needs none of them."
+    )]
+    // Carried as a plain field, not `#[source]`: the message interpolates
+    // the errno where it reads naturally, and a source would make anyhow's
+    // chain print it a second time at the end of eight lines of advice.
+    UserNamespaceRefused(Errno),
+
+    #[error(
+        "the container's user namespace could not be given an id map, so every id in \
+         it would read as the overflow id 65534: {0}. Only a single-extent map of \
+         this process's own ids is supported - subuid-based multi-ID mapping and \
+         the setuid helpers are not implemented."
+    )]
+    IdMap(#[source] std::io::Error),
 
     #[error("the container never started: {} failed with {errno}", describe(*step, *detail))]
     ChildFailed {
@@ -380,6 +423,14 @@ pub fn spawn(
     flush_stdio();
 
     match unsafe { sys::clone3(&args) } {
+        // Three different settings forbid unprivileged user namespaces and
+        // each reports a DIFFERENT errno, none of which names the cause.
+        // ENOSPC is the memorable one: exceeding user.max_user_namespaces
+        // is reported as "No space left on device", which sends everyone
+        // off to check their disk.
+        Err(e @ (Errno::PERM | Errno::NOSPC | Errno::INVAL)) if spec.namespaces.user => {
+            Err(Error::UserNamespaceRefused(e))
+        }
         Err(e) => Err(Error::Clone(e)),
 
         // SAFETY: this is the child branch, and nothing has allocated since
@@ -397,6 +448,23 @@ pub fn spawn(
             // CLONE_PIDFD was set and the clone succeeded.
             let pidfd =
                 unsafe { <sys::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(pidfd_slot) };
+
+            // The child exists with no mapping at all - every id in it
+            // reads as the overflow id, 65534 - until this is written. It
+            // is parked at the rendezvous, so it observes only the state
+            // after the write, but the window is real and this is the
+            // reason the rendezvous exists.
+            if spec.namespaces.user
+                && let Err(e) = write_single_id_map(pid)
+            {
+                let _ = sys::kill_process(
+                    rustix::process::Pid::from_raw(pid).unwrap(),
+                    sys::Signal::KILL,
+                );
+                let _ = reap_pid(pid);
+                return Err(Error::IdMap(e));
+            }
+
             Ok(Spawned {
                 pid,
                 pidfd,
@@ -406,6 +474,33 @@ pub fn spawn(
             })
         }
     }
+}
+
+/// Map our own effective ids to root inside the child's user namespace.
+///
+/// One extent, our own id, which is the whole of what an unprivileged
+/// process may write for itself. **No helper and no intermediate
+/// process**: the three-process topology rootless is assumed to need
+/// applies to `subuid`-based multi-extent maps, which we do not support
+/// and say so (RND.md §17).
+///
+/// Writing is the parent's job because the child cannot do it: a process
+/// may not write its own map without `CAP_SETUID` in the parent namespace,
+/// which is precisely what it does not have.
+fn write_single_id_map(pid: i32) -> std::io::Result<()> {
+    let uid = rustix::process::geteuid().as_raw();
+    let gid = rustix::process::getegid().as_raw();
+
+    std::fs::write(format!("/proc/{pid}/uid_map"), format!("0 {uid} 1\n"))?;
+
+    // Order is load-bearing and the failure is silent if you get it wrong.
+    // An unprivileged process must disable `setgroups(2)` BEFORE gid_map
+    // may be written at all; afterwards the write returns EPERM and the
+    // container runs with the parent's supplementary groups, which is the
+    // privilege escalation the rule exists to prevent (RND.md §5).
+    std::fs::write(format!("/proc/{pid}/setgroups"), "deny\n")?;
+    std::fs::write(format!("/proc/{pid}/gid_map"), format!("0 {gid} 1\n"))?;
+    Ok(())
 }
 
 /// Create the container, run it to completion, and report how it ended.

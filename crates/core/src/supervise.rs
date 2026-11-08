@@ -113,6 +113,15 @@ pub struct Config {
     /// Ports published to the host.
     #[serde(default)]
     pub ports: Vec<Publish>,
+    /// Run in a user namespace of our own, mapping our effective ids to
+    /// root inside it (stage 11).
+    ///
+    /// Decided once by the CLI and recorded here rather than probed again
+    /// in the supervisor: the two processes must not be able to disagree
+    /// about it, because the mount plan is built from one answer and the
+    /// clone flags from the other.
+    #[serde(default)]
+    pub userns: bool,
 }
 
 impl Config {
@@ -151,6 +160,7 @@ impl Config {
             namespaces: Namespaces {
                 mount: self.rootfs.is_some(),
                 net: self.private_net || self.bridge,
+                user: self.userns,
                 ..Namespaces::STAGE1
             },
         }
@@ -300,9 +310,17 @@ impl Config {
             binds.push((self.write_hosts(state_dir)?, "etc/hosts"));
         }
 
+        // Built against the CHILD's privileges, not ours: when we are
+        // about to clone it into a user namespace of its own, it will have
+        // CAP_SYS_ADMIN there and we do not have it here.
+        let privs = if self.userns {
+            Privileges::probe().in_new_user_namespace()
+        } else {
+            Privileges::probe()
+        };
         Ok(Some(mount::plan(
             Path::new(r),
-            Privileges::probe(),
+            privs,
             cgroup_dir,
             overlay.as_ref(),
             &binds,
@@ -333,6 +351,17 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("syscall: {0}")]
     Sys(#[source] sys::Error),
+
+    #[error(
+        "bridged networking needs CAP_NET_ADMIN in the user namespace that owns the \
+         HOST's network namespace, and this process is in a nested one, which can never \
+         have it. Degraded: no bridge, no address, no NAT, so a container cannot reach \
+         the network or any other container.\n\n\
+         Run `--network none` for a stack with only loopback, or run as root for a \
+         bridge. Rootless networking by way of a setuid helper or a userspace TCP/IP \
+         stack is deliberately not implemented."
+    )]
+    BridgeUnprivileged,
     #[error(
         "the container's init process died before it reached the start rendezvous; \
          it never ran the command"
@@ -784,9 +813,23 @@ fn unpublish_ports(ports: &[Publish]) {
 /// future allocator is concerned. It is created once and reused, never per
 /// container.
 fn plumb_network(pid: i32) -> Result<(), Error> {
-    if !net::ip_forward_enabled() {
-        return Err(Error::ForwardingOff);
+    // Stage 11: rootless, every one of these operations fails with EPERM
+    // and the bare errno names nothing. The gate is CAP_NET_ADMIN in the
+    // user namespace that owns the TARGET namespace - here the host's,
+    // which is owned by the initial one - so a nested namespace cannot
+    // reach it however much capability it holds inside itself.
+    //
+    // Translated at the boundary rather than guarded at the top, because
+    // "are we allowed to do this" has no honest answer short of trying:
+    // under `unshare --user --net` the host side is our own new namespace
+    // and these calls genuinely do succeed.
+    match plumb(pid) {
+        Err(Error::Sys(sys::Error::PERM)) => Err(Error::BridgeUnprivileged),
+        other => other,
     }
+}
+
+fn plumb(pid: i32) -> Result<(), Error> {
     let nl = net::Netlink::open()?;
 
     // The bridge, once. `EEXIST` is the normal case after the first
@@ -814,6 +857,18 @@ fn plumb_network(pid: i32) -> Result<(), Error> {
     nl.request(&net::create_veth(&host_if, "eth0", &ns))?;
     nl.request(&net::set_master(&host_if, bridge_idx))?;
     nl.request(&net::link_up(&host_if))?;
+
+    // Checked here rather than first, because of which refusal is useful.
+    // Forwarding being off is something the operator can fix in one
+    // command; not having CAP_NET_ADMIN over the host's namespace is
+    // something they cannot fix at all without becoming root. Reporting
+    // the fixable one first sends a rootless user off to run a sysctl
+    // that changes nothing about their problem. So the operations that
+    // need the capability go first, and whichever genuinely blocks us is
+    // the one we name.
+    if !net::ip_forward_enabled() {
+        return Err(Error::ForwardingOff);
+    }
 
     // Source NAT, so replies can find their way back. Without it a
     // container sends packets and never receives one: the rest of the
@@ -963,6 +1018,7 @@ mod tests {
             bridge: false,
             ip: None,
             ports: Vec::new(),
+            userns: false,
         };
         c.store(&paths).unwrap();
         let back = Config::load(&paths, "c1").unwrap();

@@ -369,15 +369,24 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
 
     let exe = resolve_exe(&command[0], layer_search.as_deref().or(rootfs.as_deref()))?;
 
+    // Stage 11. Without CAP_SYS_ADMIN here, the only way to get it is to
+    // make a user namespace and be root inside that. We do it ourselves
+    // rather than telling the user to re-run under `unshare`, and the
+    // whole of the change is this flag plus the map the parent writes -
+    // which is the stage's actual success criterion.
+    let userns = !Privileges::probe().sys_admin;
     if rootfs.is_some() || !layers.is_empty() {
-        let privs = Privileges::probe();
-        if !privs.sys_admin {
-            bail!(
-                "a private root filesystem needs CAP_SYS_ADMIN in the user namespace that \
-                 owns this mount namespace, and this process does not have it. Either run \
-                 as root, or re-run inside `unshare --user --map-root-user`."
-            );
-        }
+        // No pre-flight check that user namespaces are permitted. Three
+        // separate knobs can forbid them and each fails differently, so
+        // any check here is a second, worse copy of the one the kernel
+        // performs at clone3 - and one that can disagree with it. The
+        // clone is where the truth is, so that is where the explanation
+        // lives (see `Error::Clone` handling in rustainer-core).
+        let privs = if userns {
+            Privileges::probe().in_new_user_namespace()
+        } else {
+            Privileges::probe()
+        };
         if !privs.mknod_devices {
             eprintln!(
                 "rustainer: degraded: device nodes - mknod of a device requires CAP_MKNOD in \
@@ -395,6 +404,23 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
     let limits_requested =
         args.memory.is_some() || args.cpus.is_some() || args.pids_limit.is_some();
     if limits_requested && let Err(e) = rustainer_core::cgroup::enter_own_leaf() {
+        // Stage 11: rootless this is the normal case, not a malfunction.
+        // A limit accepted and never enforced is how a host OOMs three
+        // weeks later, so it stays a hard error - but it names what is
+        // degraded and how to get the delegation back.
+        if userns {
+            bail!(
+                "the limits you asked for cannot be enforced: this process has no \
+                 writable cgroup to delegate from ({e}). A user namespace grants no \
+                 authority over the cgroup hierarchy - that is a separate delegation \
+                 the host has to make.\n\n\
+                 Degraded: no memory, CPU or PID limit. Either drop the limit flags, or \
+                 get a delegated cgroup first:\n\n    \
+                 systemd-run --user --scope -p Delegate=yes rustainer run ...\n\n\
+                 A limit that is accepted and never enforced is how a host runs out of \
+                 memory three weeks later, so this refuses rather than degrading quietly."
+            );
+        }
         bail!(
             "could not move into our own cgroup leaf, so the limits you asked for cannot \
              be enforced: {e}"
@@ -469,6 +495,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         // overlayfs, and overlayfs cannot host an upperdir at all.
         private_net,
         bridge,
+        userns,
         ip: lease.map(|l| l.ip.to_string()),
         ports: {
             if !args.publish.is_empty() && !bridge {
@@ -506,7 +533,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             None => None,
             Some(u) => {
                 let spec = UserSpec::parse(u).map_err(|e| anyhow::anyhow!("--user: {e}"))?;
-                if let Some(why) = spec.unmapped_reason() {
+                if let Some(why) = spec.unmapped_reason(userns) {
                     bail!("--user {u}: {why}");
                 }
                 Some(spec)
