@@ -268,15 +268,18 @@ fn cname(s: &str) -> String {
     format!("{s}\0")
 }
 
-/// The interface index of `name`, read from sysfs rather than asked for
-/// over netlink: one `read` against one file, versus a dump request and a
-/// walk of the reply.
+/// The interface index of `name`, asked of the kernel directly.
+///
+/// `if_nametoindex` is a `SIOCGIFINDEX` ioctl, not a file read. Reading
+/// `/sys/class/net/<name>/ifindex` looks equivalent and is not: sysfs is
+/// populated by a separate path from the netlink acknowledgement, so a
+/// read immediately after `RTM_NEWLINK` returns can miss - rarely, and
+/// only on a loaded machine, which is the worst way for a bug to behave.
+/// It also answers for the caller's namespace, which sysfs does not when
+/// `/sys` is bind-mounted from the host.
 pub fn if_index(name: &str) -> Option<u32> {
-    std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    let c = std::ffi::CString::new(name).ok()?;
+    index_of(&c)
 }
 
 /// Is IPv4 forwarding on?
@@ -360,7 +363,8 @@ pub fn container_messages(lease: &Lease) -> Vec<Message> {
 }
 
 /// `if_nametoindex`, which is a `SIOCGIFINDEX` ioctl and therefore
-/// answers for the namespace the caller is in.
+/// answers for the namespace the caller is in, from the kernel rather
+/// than from a filesystem that mirrors it.
 ///
 /// # Safety
 ///
