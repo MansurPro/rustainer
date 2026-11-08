@@ -90,6 +90,8 @@ pub struct Report {
     pub ownership_skipped: u64,
     pub whiteouts: u64,
     pub opaque_dirs: u64,
+    /// Directories whose mode was widened so extraction could continue.
+    pub modes_relaxed: u64,
 }
 
 /// A pinned root. Every path in this module resolves through it.
@@ -377,7 +379,23 @@ pub fn apply_layer<R: Read>(
             tar::EntryType::Directory => {
                 let dir = root.parent_dir(&rel)?;
                 let name = file_name_c(&rel)?;
-                match rustix::fs::mkdirat(&dir, name.as_c_str(), Mode::from_bits_truncate(mode)) {
+                // The owner's search bit is forced on. A layer can declare
+                // a directory 0644, and as root that is invisible - root
+                // ignores permission bits - but as any other user nothing
+                // can be created inside it and the rest of the layer fails
+                // with EACCES. Recorded rather than silently applied,
+                // because it is a deviation from what the layer asked for.
+                let wanted = Mode::from_bits_truncate(mode);
+                let effective = mode | 0o700;
+                if effective != mode {
+                    report.modes_relaxed += 1;
+                }
+                let _ = wanted;
+                match rustix::fs::mkdirat(
+                    &dir,
+                    name.as_c_str(),
+                    Mode::from_bits_truncate(effective),
+                ) {
                     Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                     Err(e) => {
                         return Err(Error::Io {
@@ -614,7 +632,11 @@ mod tests {
         gnu.name[..bytes.len()].copy_from_slice(bytes);
         h.set_entry_type(kind);
         h.set_size(size);
-        h.set_mode(0o644);
+        h.set_mode(if kind == tar::EntryType::Directory {
+            0o755
+        } else {
+            0o644
+        });
         h
     }
 
@@ -722,6 +744,26 @@ mod tests {
             d.join("usr/lib/libc.so").exists(),
             "written through the link"
         );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A directory a layer declares unenterable must not stop the rest of
+    /// the layer. Invisible when extracting as root, fatal otherwise.
+    #[test]
+    fn a_directory_with_no_search_bit_is_widened_and_reported() {
+        let d = staging("narrow-dir");
+        let mut dh = header("locked/", tar::EntryType::Directory, 0);
+        dh.set_mode(0o644);
+        let t = tar_with(vec![
+            (dh, Vec::new()),
+            (
+                header("locked/inside", tar::EntryType::Regular, 2),
+                b"ok".to_vec(),
+            ),
+        ]);
+        let r = run(&d, t).expect("a 0644 directory must not stop extraction");
+        assert_eq!(r.modes_relaxed, 1, "the widening must be reported");
+        assert!(d.join("locked/inside").exists());
         std::fs::remove_dir_all(&d).ok();
     }
 
