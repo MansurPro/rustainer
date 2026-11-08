@@ -10,6 +10,7 @@
 //! hosts without us reimplementing either, and it keeps the rule syntax
 //! something an operator can read in `nft list ruleset` and recognise.
 
+use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::process::Command;
 
@@ -31,6 +32,26 @@ pub enum Error {
         args: Vec<String>,
         output: String,
     },
+}
+
+/// One published port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Publish {
+    /// The host address to listen on. `0.0.0.0` means every interface.
+    pub host_ip: Ipv4Addr,
+    pub host_port: u16,
+    pub container_ip: Ipv4Addr,
+    pub container_port: u16,
+}
+
+impl std::fmt::Display for Publish {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{} -> {}:{}",
+            self.host_ip, self.host_port, self.container_ip, self.container_port
+        )
+    }
 }
 
 /// What a backend must do for us. Deliberately small.
@@ -57,6 +78,21 @@ pub trait Firewall {
     fn foreign_drop_policy(&self) -> bool {
         false
     }
+
+    /// Publish one port: translation **and** authorization.
+    ///
+    /// Two rules, not one, and they are not the same thing. The DNAT
+    /// rewrites the destination; the filter accept permits the forward.
+    /// A DNAT without the accept merely does not work - but **an accept
+    /// without the DNAT, or an accept scoped too widely, opens the
+    /// container to anyone who can route to its address.** That asymmetry
+    /// is why partial state here is a security hole rather than a failure,
+    /// and why both rules are written together or not at all.
+    fn publish(&self, p: &Publish, bridge: &str) -> Result<(), Error>;
+
+    /// Remove what `publish` added. Called on teardown, and on the failure
+    /// path of a partial publish.
+    fn unpublish(&self, p: &Publish, bridge: &str);
 
     fn name(&self) -> &'static str;
 }
@@ -174,6 +210,40 @@ impl Firewall for Nft {
         Ok(())
     }
 
+    fn publish(&self, p: &Publish, bridge: &str) -> Result<(), Error> {
+        run_ok(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "ip",
+                TABLE,
+                "prerouting",
+                "{ type nat hook prerouting priority dstnat; }",
+            ],
+        );
+        for (chain, rule) in self.publish_rules(p, bridge) {
+            if !rule_present("nft", &["list", "table", "ip", TABLE], &rule) {
+                run("nft", &["add", "rule", "ip", TABLE, chain, &rule])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn unpublish(&self, p: &Publish, bridge: &str) {
+        // nft has no "delete this rule by text", so each rule's handle has
+        // to be looked up. Cheap, and the alternative - flushing the table
+        // - would take other containers' rules with it.
+        for (chain, rule) in self.publish_rules(p, bridge) {
+            if let Some(handle) = nft_handle(chain, &rule) {
+                run_ok(
+                    "nft",
+                    &["delete", "rule", "ip", TABLE, chain, "handle", &handle],
+                );
+            }
+        }
+    }
+
     fn ensure_forward(&self, bridge: &str) -> Result<(), Error> {
         run_ok(
             "nft",
@@ -196,6 +266,41 @@ impl Firewall for Nft {
         }
         Ok(())
     }
+}
+
+impl Nft {
+    fn publish_rules(&self, p: &Publish, bridge: &str) -> Vec<(&'static str, String)> {
+        // No `ip daddr` on the DNAT: it matches the port on any interface
+        // that is not the bridge itself, which is what stops
+        // container-to-container traffic being translated.
+        let dnat = if p.host_ip.is_unspecified() {
+            format!(
+                "iifname != \"{bridge}\" tcp dport {} counter dnat to {}:{}",
+                p.host_port, p.container_ip, p.container_port
+            )
+        } else {
+            format!(
+                "iifname != \"{bridge}\" ip daddr {} tcp dport {} counter dnat to {}:{}",
+                p.host_ip, p.host_port, p.container_ip, p.container_port
+            )
+        };
+        let accept = format!(
+            "oifname \"{bridge}\" ip daddr {} tcp dport {} counter accept",
+            p.container_ip, p.container_port
+        );
+        vec![("prerouting", dnat), ("forward", accept)]
+    }
+}
+
+fn nft_handle(chain: &str, rule: &str) -> Option<String> {
+    let out = Command::new("nft")
+        .args(["-a", "list", "chain", "ip", TABLE, chain])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let line = text.lines().find(|l| l.contains(rule))?;
+    let (_, after) = line.rsplit_once("# handle ")?;
+    Some(after.trim().to_owned())
 }
 
 pub struct Iptables;
@@ -284,6 +389,38 @@ impl Firewall for Iptables {
         Ok(())
     }
 
+    fn publish(&self, p: &Publish, bridge: &str) -> Result<(), Error> {
+        for (table, chain, rule) in iptables_publish_rules(p, bridge) {
+            let mut check = vec!["-t", table, "-C", chain];
+            check.extend(rule.iter().map(String::as_str));
+            let present = Command::new("iptables")
+                .args(with_wait(&check))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !present {
+                let mut add = vec!["-t", table, "-I", chain];
+                add.extend(rule.iter().map(String::as_str));
+                run_owned("iptables", &with_wait(&add))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn unpublish(&self, p: &Publish, bridge: &str) {
+        for (table, chain, rule) in iptables_publish_rules(p, bridge) {
+            let mut del = vec!["-t", table, "-D", chain];
+            del.extend(rule.iter().map(String::as_str));
+            let _ = Command::new("iptables")
+                .args(with_wait(&del))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
     fn foreign_drop_policy(&self) -> bool {
         Command::new("iptables")
             .args(with_wait(&["-S", "FORWARD"]))
@@ -291,6 +428,44 @@ impl Firewall for Iptables {
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("-P FORWARD DROP"))
             .unwrap_or(false)
     }
+}
+
+fn iptables_publish_rules(
+    p: &Publish,
+    bridge: &str,
+) -> Vec<(&'static str, &'static str, Vec<String>)> {
+    let to = format!("{}:{}", p.container_ip, p.container_port);
+    let mut dnat: Vec<String> = vec!["!".into(), "-i".into(), bridge.to_owned()];
+    if !p.host_ip.is_unspecified() {
+        dnat.push("-d".into());
+        dnat.push(p.host_ip.to_string());
+    }
+    dnat.extend([
+        "-p".into(),
+        "tcp".into(),
+        "--dport".into(),
+        p.host_port.to_string(),
+        "-j".into(),
+        "DNAT".into(),
+        "--to-destination".into(),
+        to,
+    ]);
+    // Translation and authorization are separate rules, and the accept is
+    // scoped to exactly this container and port - not to the bridge at
+    // large, which would publish every port of every container.
+    let accept: Vec<String> = vec![
+        "-o".into(),
+        bridge.to_owned(),
+        "-d".into(),
+        p.container_ip.to_string(),
+        "-p".into(),
+        "tcp".into(),
+        "--dport".into(),
+        p.container_port.to_string(),
+        "-j".into(),
+        "ACCEPT".into(),
+    ];
+    vec![("nat", "PREROUTING", dnat), ("filter", "FORWARD", accept)]
 }
 
 fn rule_present(tool: &str, args: &[&str], needle: &str) -> bool {

@@ -52,8 +52,8 @@ is easier to reason about once the process model is not also in question.
 | 7 | Layered filesystem (OverlayFS) | **Done** |
 | 8 | A network namespace of its own | **Done** |
 | 9 | Bridge, NAT and the outside world | **Done** |
-| 10 | Published ports | Next |
-| 11 | Single-ID rootless | |
+| 10 | Published ports | **Done** |
+| 11 | Single-ID rootless | Next |
 
 ### Building and testing
 
@@ -76,6 +76,7 @@ sudo bash scripts/stage6-success-test.sh
 sudo bash scripts/stage7-success-test.sh
 sudo bash scripts/stage8-success-test.sh
 sudo bash scripts/stage9-success-test.sh
+sudo bash scripts/stage10-success-test.sh
 
 # or with no root at all, if /proc/sys/user/max_user_namespaces > 0
 unshare --user --map-root-user bash scripts/stage2-success-test.sh
@@ -98,7 +99,8 @@ files to `/tmp`, and runs the tests in an unprivileged user namespace.
 ### What works now, and what refuses
 
 ```sh
-rustainer run -d --rootfs ./alpine-rootfs --network host --hostname boxy \
+rustainer run -d --rootfs ./alpine-rootfs --hostname boxy \
+    -p 8080:80 -p 127.0.0.1:5432:5432 \
     -m 512m --cpus 1.5 --pids-limit 128 \
     --user 1000:1000 --cap-drop ALL /bin/sh -c 'sleep 60'
 rustainer ps
@@ -175,10 +177,32 @@ because each namespace has its own loopback.
 parameter to its default when that file is written, so the engine refuses and
 gives you the command instead.
 
-There are still no published ports, so nothing outside the host can reach a
-container. The flags refuse rather than pretend:
-`--network bridge` names stage 9, and a `--rootfs` that is not a directory
-says so.
+**A published port is two rules, written together or not at all.** `-p
+8080:80` is a destination NAT rule that *translates* the address and a filter
+accept that *authorizes* the forward. They are different decisions and a
+half-applied pair is not a broken feature but a security hole: an accept left
+behind without its DNAT opens the container to anyone who can route to its
+address. Every publish is rolled back whole if any part of it fails, and
+teardown asserts nothing is left.
+
+`curl localhost:8080` cannot be served by firewall rules at all. **Loopback is
+deliberately excluded from destination NAT** — translating a `127.0.0.1`
+destination into a routable address turns a packet that could never leave the
+machine into one that can, and the kernel is right to refuse. So the host side
+of every published port is a real `bind(2)` in the supervisor, forwarding to
+the container. Binding is also what makes the port *reserved*: a second
+container publishing the same host port fails immediately with `EADDRINUSE`
+instead of quietly adding a second DNAT rule that never matches.
+
+The backend is whichever of `nft` and `iptables` the host already uses, not
+whichever we prefer. An accept in our table cannot rescue a packet another
+table has dropped, so picking the tool the host is already using is the only
+choice that composes; where a foreign ruleset's `DROP` policy may still win,
+we say so instead of appearing to work.
+
+The flags refuse rather than pretend: `-p` with `--network host` or
+`--network none` says a bridge is required, `udp` refuses rather than silently
+publishing tcp, and a `--rootfs` that is not a directory says so.
 
 ### The engine does not lie about what it does not know
 

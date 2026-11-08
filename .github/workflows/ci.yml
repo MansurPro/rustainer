@@ -67,6 +67,12 @@ jobs:
         run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage8-success-test.sh
       - name: Stage 9 success test
         run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage9-success-test.sh
+      # Published ports are the highest-rate host mutation in the project and
+      # the only place where partial state is a security hole rather than a
+      # failure, so this job asserts teardown as hard as it asserts
+      # reachability.
+      - name: Stage 10 success test
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage10-success-test.sh
       # In a delegated scope, so the resource stage exercises real limits
       # rather than only the refusal path, and so it never touches the
       # runner's own cgroup.
@@ -79,7 +85,7 @@ jobs:
       # redundant: it takes the rootless code paths - device nodes bound
       # instead of mknod'd, /sys bound instead of mounted - and it is the
       # standing check that the privilege seam of RND.md 18.6 still holds.
-      - name: Stages 1-9, unprivileged
+      - name: Stages 1-10, unprivileged
         run: |
           # Ubuntu 24.04 ships an AppArmor brake on unprivileged user
           # namespaces, so `unshare -U` fails with "write failed
@@ -94,7 +100,7 @@ jobs:
             echo "::error::unprivileged user namespaces are unavailable on this runner"
             exit 1
           }
-          for s in 1 2 3 4 5 6 7 8 9; do
+          for s in 1 2 3 4 5 6 7 8 9 10; do
             systemd-run --user --scope -p Delegate=yes -q \
               unshare --user --map-root-user \
               env RUSTAINER_BIN="$PWD/target/release/rustainer" \

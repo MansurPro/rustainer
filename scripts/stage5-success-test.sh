@@ -20,6 +20,11 @@ bad() { FAIL=$((FAIL + 1)); echo "  FAIL  $1"; }
 check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; fi; }
 
 [ "$(uname -s)" = Linux ] || { echo "needs Linux" >&2; exit 2; }
+# The capability-mask assertions below decode a 64-bit hex mask, which
+# shell arithmetic cannot do portably. Without python3 they do not fail
+# honestly - they report "CAP_SYS_ADMIN is in the default bounding set",
+# which is a claim about the kernel this script never checked.
+command -v python3 >/dev/null 2>&1 || { echo "needs python3 to decode capability masks" >&2; exit 2; }
 have_cap_sys_admin() {
     local eff low
     eff=$(awk '/^CapEff:/{print $2}' /proc/self/status) || return 1

@@ -39,8 +39,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::cgroup::{self, Cgroup, Limits};
-use crate::firewall;
+use crate::firewall::{self, Publish};
 use crate::net::{self, Lease};
+use crate::proxy::Forwarder;
 use crate::security::{self, CapabilitySet, Security, UserSpec};
 use crate::state::{self, Lock, Paths, State, Status};
 use crate::{Exit, MountPlan, Namespaces, Privileges, Spec, mount, sys};
@@ -109,6 +110,9 @@ pub struct Config {
     /// do not have to recompute it.
     #[serde(default)]
     pub ip: Option<String>,
+    /// Ports published to the host.
+    #[serde(default)]
+    pub ports: Vec<Publish>,
 }
 
 impl Config {
@@ -474,6 +478,21 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     st.status = Status::Created;
     st.store(paths)?;
 
+    // Published ports: the firewall rules and the userland forwarder for
+    // the loopback case. Before the go-ahead, so a container is never
+    // briefly running with a port published and unauthorised.
+    let _published = match publish_ports(&config) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = sys::kill_process(
+                rustix::process::Pid::from_raw(spawned.pid).unwrap(),
+                sys::Signal::KILL,
+            );
+            let _ = crate::reap_pid(spawned.pid);
+            return Err(e);
+        }
+    };
+
     // Everything the parent owed this child is done.
     spawned.release();
 
@@ -694,6 +713,69 @@ fn reap_into(st: &mut State, pid: i32) -> Exit {
     }
 }
 
+/// Everything a container published, undone when this is dropped.
+///
+/// RAII rather than a call at the end of `supervise`, because everything
+/// between the publish and the teardown can return early with `?`. This is
+/// the only place in the project where leftover state is a **security
+/// hole** rather than a failure: a DNAT without its filter accept merely
+/// does not work, whereas rules outliving their container are inherited by
+/// whichever container is handed that address next (RND.md §17).
+struct Published {
+    /// Dropped first, so the listener stops before the rules go.
+    forwarders: Vec<Forwarder>,
+    ports: Vec<Publish>,
+}
+
+impl Drop for Published {
+    fn drop(&mut self) {
+        // Stop listening before removing the rules, so there is no window
+        // in which the port is reachable but no longer authorised.
+        self.forwarders.clear();
+        unpublish_ports(&self.ports);
+    }
+}
+
+/// Publish every requested port: rules first, then the listener.
+///
+/// Partial failure is undone by dropping the half-built [`Published`], so
+/// there is one rollback path rather than one per failure point.
+fn publish_ports(config: &Config) -> Result<Published, Error> {
+    let mut out = Published {
+        forwarders: Vec::new(),
+        ports: Vec::new(),
+    };
+    if config.ports.is_empty() {
+        return Ok(out);
+    }
+    let fw = firewall::detect().ok_or(firewall::Error::NoBackend)?;
+    for p in &config.ports {
+        // Recorded BEFORE the rules are written. `publish` writes two
+        // rules and can fail between them, so a failed publish has still
+        // mutated the host and the rollback has to know about it.
+        out.ports.push(*p);
+        fw.publish(p, net::BRIDGE)?;
+        // The forwarder covers `curl localhost:<port>`, which no firewall
+        // rule can: loopback is deliberately excluded from destination NAT.
+        out.forwarders
+            .push(Forwarder::start(*p).map_err(Error::Io)?);
+    }
+    Ok(out)
+}
+
+/// Idempotent: removing a rule that is not there is not an error, which is
+/// what lets both the rollback and the teardown call it blindly.
+fn unpublish_ports(ports: &[Publish]) {
+    if ports.is_empty() {
+        return;
+    }
+    if let Some(fw) = firewall::detect() {
+        for p in ports {
+            fw.unpublish(p, net::BRIDGE);
+        }
+    }
+}
+
 /// Create the bridge if needed, make a veth pair, and put the peer
 /// straight into the container's namespace.
 ///
@@ -822,10 +904,15 @@ pub fn remove(paths: &Paths, id: &str, force: bool) -> Result<(), Error> {
     }
     // The writable layer lives outside the state directory, so removing
     // the container has to remove it too or every `rm` leaks a tree.
-    if let Ok(cfg) = Config::load(paths, id)
-        && let Some(d) = &cfg.overlay_dir
-    {
-        let _ = std::fs::remove_dir_all(d);
+    if let Ok(cfg) = Config::load(paths, id) {
+        if let Some(d) = &cfg.overlay_dir {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        // The one case RAII cannot reach: a supervisor killed with
+        // SIGKILL runs no destructor, so its rules outlive it. They are
+        // idempotent to remove, so sweep them here rather than leave a
+        // DNAT pointing at an address the next container will be handed.
+        unpublish_ports(&cfg.ports);
     }
     drop(_lock);
     std::fs::remove_dir_all(paths.dir(id))?;
@@ -875,6 +962,7 @@ mod tests {
             private_net: false,
             bridge: false,
             ip: None,
+            ports: Vec::new(),
         };
         c.store(&paths).unwrap();
         let back = Config::load(&paths, "c1").unwrap();
