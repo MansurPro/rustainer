@@ -34,7 +34,7 @@
 
 use std::io::Write;
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +82,21 @@ pub struct Config {
     pub seccomp_unconfined: bool,
     #[serde(default)]
     pub workdir: Option<String>,
+    /// Extracted layer directories, lowest first. Empty means `rootfs` is
+    /// used directly.
+    #[serde(default)]
+    pub layers: Vec<String>,
+    /// No writable upper: the container's filesystem is read-only.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Where the container's writable upper and work directories go.
+    ///
+    /// Beside the image layers rather than in the runtime state directory,
+    /// because the state directory is often a tmpfs or - inside a
+    /// container - an overlayfs, and **overlayfs cannot be an upperdir**.
+    /// The kernel says so in as many words, which is now surfaced.
+    #[serde(default)]
+    pub overlay_dir: Option<String>,
 }
 
 impl Config {
@@ -157,15 +172,50 @@ impl Config {
         Ok(Security::build(keep, self.user.clone(), filter))
     }
 
-    pub fn mount_plan(&self, cgroup_dir: Option<&Path>) -> Result<Option<MountPlan>, Error> {
-        match &self.rootfs {
-            None => Ok(None),
-            Some(r) => Ok(Some(mount::plan(
-                Path::new(r),
-                Privileges::probe(),
-                cgroup_dir,
-            )?)),
-        }
+    pub fn mount_plan(
+        &self,
+        cgroup_dir: Option<&Path>,
+        state_dir: &Path,
+    ) -> Result<Option<MountPlan>, Error> {
+        let Some(r) = &self.rootfs else {
+            return Ok(None);
+        };
+        let overlay = if self.layers.is_empty() {
+            None
+        } else {
+            // `upper` and `work` are created as SIBLINGS in one directory.
+            // OverlayFS requires them on the same **mount**, and a st_dev
+            // comparison accepts configurations the kernel rejects - so
+            // the guarantee is structural rather than checked.
+            // The upper is created even when read-only: OverlayFS needs
+            // two lower layers when there is no upper at all, so leaving
+            // it out makes a single-layer image unmountable read-only.
+            let (upper, work) = {
+                let base = self
+                    .overlay_dir
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| state_dir.to_path_buf());
+                let u = base.join("upper");
+                let w = base.join("work");
+                std::fs::create_dir_all(&u)?;
+                std::fs::create_dir_all(&w)?;
+                (Some(u), Some(w))
+            };
+            Some(mount::Overlay {
+                layers: self.layers.iter().map(PathBuf::from).collect(),
+                upper,
+                work,
+                read_only: self.read_only,
+            })
+        };
+        std::fs::create_dir_all(r)?;
+        Ok(Some(mount::plan(
+            Path::new(r),
+            Privileges::probe(),
+            cgroup_dir,
+            overlay.as_ref(),
+        )?))
     }
 }
 
@@ -293,7 +343,7 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     if let Some(c) = &cg {
         c.apply(&limits)?;
     }
-    let mounts = config.mount_plan(cg.as_ref().map(|c| c.dir()))?;
+    let mounts = config.mount_plan(cg.as_ref().map(|c| c.dir()), &paths.dir(id))?;
 
     let spawned = crate::spawn(
         &spec,
@@ -596,6 +646,13 @@ pub fn remove(paths: &Paths, id: &str, force: bool) -> Result<(), Error> {
             stop(paths, id, std::time::Duration::from_secs(5))?;
         }
     }
+    // The writable layer lives outside the state directory, so removing
+    // the container has to remove it too or every `rm` leaks a tree.
+    if let Ok(cfg) = Config::load(paths, id)
+        && let Some(d) = &cfg.overlay_dir
+    {
+        let _ = std::fs::remove_dir_all(d);
+    }
     drop(_lock);
     std::fs::remove_dir_all(paths.dir(id))?;
     Ok(())
@@ -638,6 +695,9 @@ mod tests {
             seccomp: None,
             seccomp_unconfined: false,
             workdir: None,
+            layers: Vec::new(),
+            read_only: false,
+            overlay_dir: None,
         };
         c.store(&paths).unwrap();
         let back = Config::load(&paths, "c1").unwrap();

@@ -176,6 +176,15 @@ pub enum Error {
         errno: Errno,
     },
 
+    #[error("the container never started: {detail} failed: {reason} ({errno})")]
+    ChildFailedWithReason {
+        step: Step,
+        detail: String,
+        /// The kernel's own words, read from the `fs_context` descriptor.
+        reason: String,
+        errno: Errno,
+    },
+
     #[error("waiting for the container: {0}")]
     Wait(#[source] Errno),
 
@@ -210,7 +219,20 @@ impl Spawned {
     /// so the pipe is still open and this would block. Call it after the
     /// pidfd says the child is gone.
     pub fn start_failure(&self) -> Option<Error> {
-        let (step, index, errno) = read_failure_record(&self.err_rx)?;
+        let (step, index, errno, extra) = read_failure_record(&self.err_rx)?;
+        if !extra.is_empty() {
+            return Some(Error::ChildFailedWithReason {
+                step,
+                detail: self
+                    .labels
+                    .get(index as usize)
+                    .copied()
+                    .unwrap_or("")
+                    .to_owned(),
+                reason: extra,
+                errno,
+            });
+        }
         let detail = match step {
             Step::Mount => self.labels.get(index as usize).copied(),
             // The security step sends which of its own thirteen sub-steps
@@ -380,10 +402,10 @@ fn flush_stdio() {
 ///
 /// A successful `execve` closes the write end (it is `O_CLOEXEC`) and we see
 /// EOF with nothing read. Anything else is a short, fixed-size record.
-fn read_failure_record(err_rx: &sys::OwnedFd) -> Option<(Step, u8, Errno)> {
-    let mut buf = [0u8; RECORD_LEN];
+fn read_failure_record(err_rx: &sys::OwnedFd) -> Option<(Step, u8, Errno, String)> {
+    let mut buf = [0u8; RECORD_LEN + child::DETAIL_LEN];
     let mut n = 0;
-    while n < RECORD_LEN {
+    while n < buf.len() {
         match sys::read(err_rx, &mut buf[n..]) {
             Ok(0) => break,
             Ok(got) => n += got,
@@ -394,7 +416,14 @@ fn read_failure_record(err_rx: &sys::OwnedFd) -> Option<(Step, u8, Errno)> {
     if n == 0 {
         return None;
     }
-    child::decode(&buf[..n])
+    let (step, index, errno) = child::decode(&buf[..RECORD_LEN.min(n)])?;
+    // Anything past the fixed record is the kernel's own explanation,
+    // which for a mount failure is far more use than the errno.
+    let extra = String::from_utf8_lossy(&buf[RECORD_LEN.min(n)..n])
+        .trim()
+        .trim_start_matches(['e', 'w', 'i', ' '])
+        .to_owned();
+    Some((step, index, errno, extra))
 }
 
 pub(crate) fn reap_pid(pid: libc::pid_t) -> Result<Exit, Error> {
@@ -464,7 +493,7 @@ mod tests {
     fn a_mount_plan_without_a_mount_namespace_is_refused() {
         let dir = std::env::temp_dir().join("rustainer-guard-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let plan = mount::plan(&dir, Privileges::probe(), None).unwrap();
+        let plan = mount::plan(&dir, Privileges::probe(), None, None).unwrap();
 
         let mut spec = Spec::new("/bin/true", vec![]);
         spec.namespaces = Namespaces::STAGE1; // mount: false

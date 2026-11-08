@@ -24,7 +24,7 @@ use clap::{Args, Parser, Subcommand};
 use rustainer_core::security::{self, UserSpec};
 use rustainer_core::state::{Paths, State, Status};
 use rustainer_core::supervise::{self, Config, HANDSHAKE_FD, HANDSHAKE_LEN};
-use rustainer_core::{Privileges, mount, sys};
+use rustainer_core::{Privileges, sys};
 use rustainer_image::Store;
 
 #[derive(Parser)]
@@ -86,6 +86,15 @@ struct RunArgs {
     /// Pull the image again even if it is already in the store.
     #[arg(long)]
     pull: bool,
+
+    /// Stack this directory as a layer, lowest first. Repeatable, and an
+    /// alternative to naming an image.
+    #[arg(long, value_name = "DIR")]
+    layer: Vec<PathBuf>,
+
+    /// No writable upper layer: the container's filesystem is read-only.
+    #[arg(long)]
+    read_only: bool,
 
     /// Network mode. Only `host` is supported, and it is required
     /// explicitly so that sharing the host's network stack is a decision
@@ -247,12 +256,14 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
     let mut workdir: Option<String> = None;
     let mut image_user: Option<String> = None;
 
-    let (rootfs, command) = match &args.rootfs {
-        Some(p) if p == Path::new("/") => {
+    let mut layers: Vec<String> = Vec::new();
+
+    let (rootfs, command) = match (&args.rootfs, args.layer.is_empty()) {
+        (Some(p), true) if p == Path::new("/") => {
             require_absolute(&args.command[0])?;
             (None, args.command.clone())
         }
-        Some(p) => {
+        (Some(p), true) => {
             if !p.is_dir() {
                 bail!(
                     "--rootfs {p:?} is not a directory. It should be an extracted root \
@@ -265,7 +276,18 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
                 args.command.clone(),
             )
         }
-        None => {
+        (_, false) => {
+            // Explicit layers: the rootfs is the mount point we create for
+            // the overlay, not a tree that already exists.
+            for d in &args.layer {
+                if !d.is_dir() {
+                    bail!("--layer {d:?} is not a directory");
+                }
+                layers.push(d.canonicalize()?.to_string_lossy().into_owned());
+            }
+            (Some(String::new()), args.command.clone())
+        }
+        (None, true) => {
             let reference = args.command[0].to_string_lossy().into_owned();
             let store = Store::new(Store::default_root());
             let image = store
@@ -284,10 +306,21 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
                     image.report.xattrs_dropped
                 );
             }
+            if image.report.modes_relaxed > 0 {
+                eprintln!(
+                    "rustainer: widened {} directory mode(s) so the layer could be extracted",
+                    image.report.modes_relaxed
+                );
+            }
 
             image_env = image.env.clone();
             workdir = image.working_dir.clone();
             image_user = image.user.clone();
+            layers = image
+                .layers
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
 
             let override_cmd: Vec<OsString> = args.command[1..].to_vec();
             let cmd = if override_cmd.is_empty() {
@@ -302,13 +335,24 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             } else {
                 override_cmd
             };
-            (Some(image.rootfs.to_string_lossy().into_owned()), cmd)
+            (Some(String::new()), cmd)
         }
     };
 
-    let exe = resolve_exe(&command[0], rootfs.as_deref())?;
+    // With layers, the rootfs is a mount point inside the container's own
+    // state directory, created by the supervisor.
+    let mut rootfs = rootfs;
+    let mut layer_search: Option<String> = None;
+    if !layers.is_empty() {
+        // The topmost layer is where a command is most likely to be found,
+        // and resolving a bare name needs a tree to look in before the
+        // overlay exists.
+        layer_search = layers.last().cloned();
+    }
 
-    if let Some(dir) = &rootfs {
+    let exe = resolve_exe(&command[0], layer_search.as_deref().or(rootfs.as_deref()))?;
+
+    if rootfs.is_some() || !layers.is_empty() {
         let privs = Privileges::probe();
         if !privs.sys_admin {
             bail!(
@@ -317,12 +361,12 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
                  as root, or re-run inside `unshare --user --map-root-user`."
             );
         }
-        // Planned here only to report degradations while someone is still
-        // watching; the supervisor plans it again for real.
-        let plan =
-            mount::plan(Path::new(dir), privs, None).context("planning the container's mounts")?;
-        for d in &plan.degradations {
-            eprintln!("rustainer: degraded: {} - {}", d.what, d.because);
+        if !privs.mknod_devices {
+            eprintln!(
+                "rustainer: degraded: device nodes - mknod of a device requires CAP_MKNOD in \
+                 the INITIAL user namespace, and we are in a nested one; the host's nodes \
+                 are bind-mounted instead"
+            );
         }
     }
 
@@ -379,8 +423,33 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             image_env
         },
         hostname: args.hostname,
-        rootfs,
+        // `None` means the host's filesystem view. An empty string means
+        // "a mount point the supervisor creates", which is what layers
+        // need: there is no tree yet, only an overlay to put there.
+        rootfs: match rootfs.take() {
+            None => None,
+            Some(s) if s.is_empty() => {
+                Some(paths.dir(&id).join("rootfs").to_string_lossy().into_owned())
+            }
+            Some(s) => Some(s),
+        },
         workdir,
+        layers: layers.clone(),
+        read_only: args.read_only,
+        // Beside the layers, on whatever filesystem the image store is on.
+        // The runtime state directory is usually a tmpfs and sometimes an
+        // overlayfs, and overlayfs cannot host an upperdir at all.
+        overlay_dir: if layers.is_empty() {
+            None
+        } else {
+            Some(
+                Store::default_root()
+                    .join("containers")
+                    .join(&id)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        },
         memory: args.memory.as_deref().map(parse_size).transpose()?,
         cpus: args.cpus,
         pids: args.pids_limit,

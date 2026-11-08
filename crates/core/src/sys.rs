@@ -229,7 +229,17 @@ pub use std::os::fd::{AsRawFd, OwnedFd};
 // no copy, no allocation, safe to call from the child (RND.md 15.4.3).
 // ---------------------------------------------------------------------------
 
-pub use rustix::mount::{MountFlags, MountPropagationFlags};
+pub use rustix::mount::{
+    FsMountFlags, FsOpenFlags, MountAttrFlags, MountFlags, MountPropagationFlags, MoveMountFlags,
+    fsconfig_create, fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount,
+};
+
+/// The kernel's own ceiling on an overlay stack.
+///
+/// `OVL_MAX_STACK` in `fs/overlayfs/params.h`, enforced per `lowerdir+`
+/// call. Checked before the syscall so the error names the limit rather
+/// than arriving as a bare EINVAL.
+pub const OVL_MAX_STACK: usize = 500;
 
 /// `MS_SLAVE`.
 ///

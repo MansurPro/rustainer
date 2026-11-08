@@ -18,7 +18,7 @@
 
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::sys::{self, Error as Errno};
 
@@ -98,6 +98,34 @@ pub enum Op {
     /// live inside `/proc`, which does not exist until the child mounts it.
     Mask {
         target: CString,
+    },
+    /// Mount an OverlayFS, assembled with genuine `fsconfig(2)` calls.
+    ///
+    /// **Not** `mount(2)` with a `lowerdir=a:b:c` string. The legacy
+    /// options page is one 4095-byte buffer that the kernel fills and does
+    /// **not** NUL-terminate, so a long layer list is silently truncated
+    /// and the mount succeeds with layers missing. `mount -o lowerdir+=`
+    /// does not escape it either: util-linux still issues a single
+    /// `mount(2)`. Only separate `fsconfig` calls do, which is why this is
+    /// a distinct operation rather than a formatted string.
+    Overlay {
+        /// Lowest first, as the image lists them.
+        layers: Vec<CString>,
+        upper: Option<CString>,
+        work: Option<CString>,
+        target: CString,
+        /// Mount the result read-only.
+        ///
+        /// A mount attribute, not "leave out the upperdir": OverlayFS
+        /// needs **two** lower layers when there is no upper, so an image
+        /// with a single layer cannot be mounted read-only that way at
+        /// all. The upper is still created and simply never writable.
+        read_only: bool,
+        /// `user.overlay.*` instead of `trusted.overlay.*`, required
+        /// outside the initial user namespace and **not** interchangeable:
+        /// layers written under one mode are silently unreadable under the
+        /// other, so a store must be partitioned by it.
+        userxattr: bool,
     },
     /// Bind a path onto itself and make it read-only.
     ///
@@ -199,6 +227,18 @@ fn join(root: &Path, rel: &str) -> std::path::PathBuf {
 pub enum PlanError {
     #[error("a path contains an interior NUL byte")]
     InteriorNul,
+    #[error("an overlay needs at least one layer")]
+    NoLayers,
+    #[error(
+        "{count} layers is more than OverlayFS accepts: the kernel's OVL_MAX_STACK is \
+         {max}. Checked here so the failure names the limit instead of arriving as a \
+         bare EINVAL from the mount."
+    )]
+    TooManyLayers { count: usize, max: usize },
+    #[error(
+        "the layer path {0:?} contains a ':' or ',', which overlay mount options use as separators"
+    )]
+    LayerPathSeparator(OsString),
     #[error("the rootfs {0:?} is not a directory")]
     NotADirectory(OsString),
     #[error("creating the mount point {0:?}: {1}")]
@@ -268,10 +308,27 @@ const DEV_SYMLINKS: &[(&str, &str)] = &[
 ///
 /// Creates the mount points on disk here, in the parent, because `mkdir` in
 /// the child would mean building a path in the child.
+/// Layers to stack onto the rootfs, instead of binding it directly.
+#[derive(Clone, Debug)]
+pub struct Overlay {
+    /// Lowest first.
+    pub layers: Vec<PathBuf>,
+    /// `None` makes the result read-only.
+    pub upper: Option<PathBuf>,
+    /// Mount the result read-only. The upper is still created.
+    pub read_only: bool,
+    /// Must be on the same **mount** as `upper`, not merely the same
+    /// filesystem - a `st_dev` comparison accepts configurations the
+    /// kernel rejects. Guaranteed structurally here by creating the two as
+    /// siblings in one directory.
+    pub work: Option<PathBuf>,
+}
+
 pub fn plan(
     rootfs: &Path,
     privs: Privileges,
     cgroup_dir: Option<&Path>,
+    overlay: Option<&Overlay>,
 ) -> Result<MountPlan, PlanError> {
     let rootfs = rootfs
         .canonicalize()
@@ -328,14 +385,57 @@ pub fn plan(
     );
 
     // --- 19. pivot_root requires new_root to BE a mount point. ----------
-    push(
-        Op::RecursiveBind {
-            source: cstr(&rootfs)?,
-            target: cstr(&rootfs)?,
-        },
-        false,
-        "binding the rootfs onto itself",
-    );
+    //
+    // An overlay already is one, so it replaces the self-bind rather than
+    // being stacked on top of it.
+    match overlay {
+        None => push(
+            Op::RecursiveBind {
+                source: cstr(&rootfs)?,
+                target: cstr(&rootfs)?,
+            },
+            false,
+            "binding the rootfs onto itself",
+        ),
+        Some(o) => {
+            if o.layers.is_empty() {
+                return Err(PlanError::NoLayers);
+            }
+            if o.layers.len() > sys::OVL_MAX_STACK {
+                return Err(PlanError::TooManyLayers {
+                    count: o.layers.len(),
+                    max: sys::OVL_MAX_STACK,
+                });
+            }
+            let mut layers = Vec::with_capacity(o.layers.len());
+            for l in &o.layers {
+                // Colons and commas are the legacy option separators. The
+                // `lowerdir+` form escapes them, but a path containing one
+                // is a sign something is wrong and the failure it produces
+                // elsewhere is unreadable.
+                let bytes = l.as_os_str().as_encoded_bytes();
+                if bytes.contains(&b':') || bytes.contains(&b',') {
+                    return Err(PlanError::LayerPathSeparator(l.clone().into_os_string()));
+                }
+                layers.push(cstr(l)?);
+            }
+            push(
+                Op::Overlay {
+                    layers,
+                    upper: o.upper.as_deref().map(cstr).transpose()?,
+                    work: o.work.as_deref().map(cstr).transpose()?,
+                    target: cstr(&rootfs)?,
+                    read_only: o.read_only,
+                    // Outside the initial user namespace the kernel cannot
+                    // read `trusted.overlay.*`, so whiteouts recorded that
+                    // way are invisible and deleted files reappear.
+                    userxattr: !privs.initial_user_ns,
+                },
+                false,
+                "mounting the overlay",
+            );
+        }
+    }
 
     let mkdir = |rel: &str| -> Result<(), PlanError> {
         let d = join(&rootfs, rel);
@@ -622,18 +722,25 @@ pub fn plan(
 /// # Safety
 ///
 /// Child-side only; see [`crate::child`].
-pub fn apply(plan: &[PlannedOp]) -> Result<(), (u8, Errno)> {
+pub fn apply(plan: &[PlannedOp], detail: &mut [u8; DETAIL_LEN]) -> Result<(), (u8, Errno, usize)> {
     for (i, planned) in plan.iter().enumerate() {
-        if let Err(e) = run_one(&planned.op)
+        let mut n = 0;
+        if let Err(e) = run_one(&planned.op, detail, &mut n)
             && !planned.optional
         {
-            return Err((i as u8, e));
+            return Err((i as u8, e, n));
         }
     }
     Ok(())
 }
 
-fn run_one(op: &Op) -> Result<(), Errno> {
+/// Room for the kernel's own error message, which is the whole reason the
+/// new mount API is worth using: a failed `fsconfig` leaves a readable
+/// explanation on the `fs_context` descriptor, where `mount(2)` leaves only
+/// `EINVAL`.
+pub const DETAIL_LEN: usize = 192;
+
+fn run_one(op: &Op, detail: &mut [u8; DETAIL_LEN], detail_len: &mut usize) -> Result<(), Errno> {
     match op {
         Op::Mount {
             source,
@@ -685,6 +792,69 @@ fn run_one(op: &Op) -> Result<(), Errno> {
             ),
             other => other,
         },
+        Op::Overlay {
+            layers,
+            upper,
+            work,
+            target,
+            read_only,
+            userxattr,
+        } => {
+            let fs = sys::fsopen(c"overlay", sys::FsOpenFlags::FSOPEN_CLOEXEC)?;
+            // Every step below reports through the fs_context on failure.
+            macro_rules! explain {
+                ($e:expr) => {
+                    match $e {
+                        Ok(v) => v,
+                        Err(err) => {
+                            // The kernel leaves a line like
+                            // "e overlayfs: failed to resolve 'x': -2" here.
+                            if let Ok(n) = sys::read(&fs, &mut detail[..]) {
+                                *detail_len = n;
+                            }
+                            return Err(err);
+                        }
+                    }
+                };
+            }
+            // Topmost first: repeated `lowerdir+` calls append, and
+            // overlay's own ordering puts the uppermost lower layer first.
+            for layer in layers.iter().rev() {
+                explain!(sys::fsconfig_set_string(
+                    &fs,
+                    c"lowerdir+",
+                    layer.as_c_str()
+                ));
+            }
+            if let Some(u) = upper {
+                explain!(sys::fsconfig_set_string(&fs, c"upperdir", u.as_c_str()));
+            }
+            if let Some(w) = work {
+                explain!(sys::fsconfig_set_string(&fs, c"workdir", w.as_c_str()));
+            }
+            if *userxattr {
+                explain!(sys::fsconfig_set_flag(&fs, c"userxattr"));
+            }
+            explain!(sys::fsconfig_create(&fs));
+            let mnt = explain!(sys::fsmount(
+                &fs,
+                sys::FsMountFlags::FSMOUNT_CLOEXEC,
+                if *read_only {
+                    sys::MountAttrFlags::MOUNT_ATTR_RDONLY
+                        | sys::MountAttrFlags::MOUNT_ATTR_NODEV
+                        | sys::MountAttrFlags::MOUNT_ATTR_NOSUID
+                } else {
+                    sys::MountAttrFlags::MOUNT_ATTR_NODEV | sys::MountAttrFlags::MOUNT_ATTR_NOSUID
+                },
+            ));
+            sys::move_mount(
+                &mnt,
+                c"",
+                rustix::fs::CWD,
+                target.as_c_str(),
+                sys::MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+            )
+        }
         Op::ReadOnly { target } => {
             sys::mount_bind(target.as_c_str(), target.as_c_str())?;
             sys::mount_setattr_recursive_readonly(target.as_c_str())
@@ -755,7 +925,7 @@ mod tests {
             mknod_devices: false,
             initial_user_ns: false,
         };
-        let plan = plan(&dir, privs, None).unwrap();
+        let plan = plan(&dir, privs, None, None).unwrap();
         let walk = plan
             .ops
             .iter()
@@ -782,7 +952,7 @@ mod tests {
             mknod_devices: false,
             initial_user_ns: false,
         };
-        let plan = plan(&dir, privs, None).unwrap();
+        let plan = plan(&dir, privs, None, None).unwrap();
         let what: Vec<_> = plan.degradations.iter().map(|d| d.what).collect();
         assert!(what.contains(&"device nodes"), "{what:?}");
         assert!(what.contains(&"/sys"), "{what:?}");
@@ -798,7 +968,7 @@ mod tests {
             mknod_devices: true,
             initial_user_ns: true,
         };
-        let plan = plan(&dir, privs, None).unwrap();
+        let plan = plan(&dir, privs, None, None).unwrap();
         assert!(plan.degradations.is_empty(), "{:?}", plan.degradations);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -812,7 +982,7 @@ mod tests {
             mknod_devices: true,
             initial_user_ns: true,
         };
-        let plan = plan(&dir, privs, None).unwrap();
+        let plan = plan(&dir, privs, None, None).unwrap();
         let labels = plan.labels();
         let pos = |needle: &str| labels.iter().position(|l| l.contains(needle)).unwrap();
         assert!(pos("rootfs onto itself") < pos("/proc"));
@@ -840,6 +1010,104 @@ mod tests {
     }
 
     #[test]
+    fn an_overlay_replaces_the_self_bind_rather_than_stacking_on_it() {
+        let dir = std::env::temp_dir().join("rustainer-overlay-plan");
+        std::fs::create_dir_all(&dir).unwrap();
+        let privs = Privileges {
+            sys_admin: true,
+            mknod_devices: true,
+            initial_user_ns: true,
+        };
+        let o = Overlay {
+            layers: vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            upper: Some(PathBuf::from("/u")),
+            work: Some(PathBuf::from("/w")),
+            read_only: false,
+        };
+        let p = plan(&dir, privs, None, Some(&o)).unwrap();
+        let labels = p.labels();
+        assert!(labels.iter().any(|l| l.contains("overlay")));
+        assert!(
+            !labels.iter().any(|l| l.contains("onto itself")),
+            "an overlay IS a mount point; binding over it would hide it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn too_many_layers_names_the_kernel_limit() {
+        let dir = std::env::temp_dir().join("rustainer-overlay-limit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let privs = Privileges {
+            sys_admin: true,
+            mknod_devices: true,
+            initial_user_ns: true,
+        };
+        let o = Overlay {
+            layers: (0..600).map(|i| PathBuf::from(format!("/l{i}"))).collect(),
+            upper: None,
+            work: None,
+            read_only: false,
+        };
+        let Err(e) = plan(&dir, privs, None, Some(&o)) else {
+            panic!("600 layers must be refused before the syscall")
+        };
+        assert!(e.to_string().contains("500"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_layer_path_with_an_option_separator_is_refused() {
+        let dir = std::env::temp_dir().join("rustainer-overlay-colon");
+        std::fs::create_dir_all(&dir).unwrap();
+        let privs = Privileges {
+            sys_admin: true,
+            mknod_devices: true,
+            initial_user_ns: true,
+        };
+        let o = Overlay {
+            layers: vec![PathBuf::from("/has:colon")],
+            upper: None,
+            work: None,
+            read_only: false,
+        };
+        assert!(matches!(
+            plan(&dir, privs, None, Some(&o)),
+            Err(PlanError::LayerPathSeparator(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Outside the initial user namespace the kernel cannot read
+    /// `trusted.overlay.*`, so whiteouts recorded that way are invisible
+    /// and deleted files silently reappear.
+    #[test]
+    fn userxattr_is_chosen_by_the_user_namespace_not_by_preference() {
+        let dir = std::env::temp_dir().join("rustainer-overlay-xattr");
+        std::fs::create_dir_all(&dir).unwrap();
+        let o = Overlay {
+            layers: vec![PathBuf::from("/a")],
+            upper: None,
+            work: None,
+            read_only: false,
+        };
+        for initial in [true, false] {
+            let privs = Privileges {
+                sys_admin: true,
+                mknod_devices: true,
+                initial_user_ns: initial,
+            };
+            let p = plan(&dir, privs, None, Some(&o)).unwrap();
+            let got = p.ops.iter().find_map(|op| match &op.op {
+                Op::Overlay { userxattr, .. } => Some(*userxattr),
+                _ => None,
+            });
+            assert_eq!(got, Some(!initial));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_rootfs_that_is_not_a_directory_is_refused() {
         let f = std::env::temp_dir().join("rustainer-not-a-dir");
         std::fs::write(&f, b"x").unwrap();
@@ -849,7 +1117,7 @@ mod tests {
             initial_user_ns: true,
         };
         assert!(matches!(
-            plan(&f, privs, None),
+            plan(&f, privs, None, None),
             Err(PlanError::NotADirectory(_))
         ));
         std::fs::remove_file(&f).ok();

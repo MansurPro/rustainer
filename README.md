@@ -49,8 +49,8 @@ is easier to reason about once the process model is not also in question.
 | 4 | Resource limits (cgroup v2) | **Done** |
 | 5 | Security controls (capabilities, seccomp) | **Done** |
 | 6 | Pull and unpack a real image — `run alpine echo hello` | **Done** |
-| 7 | Layered filesystem (OverlayFS) | Next |
-| 8 | A network namespace of its own | |
+| 7 | Layered filesystem (OverlayFS) | **Done** |
+| 8 | A network namespace of its own | Next |
 | 9 | Bridge, NAT and the outside world | |
 | 10 | Published ports | |
 | 11 | Single-ID rootless | |
@@ -73,6 +73,7 @@ sudo bash scripts/stage3-success-test.sh
 sudo bash scripts/stage4-success-test.sh
 sudo bash scripts/stage5-success-test.sh
 sudo bash scripts/stage6-success-test.sh
+sudo bash scripts/stage7-success-test.sh
 
 # or with no root at all, if /proc/sys/user/max_user_namespaces > 0
 unshare --user --map-root-user bash scripts/stage2-success-test.sh
@@ -145,8 +146,16 @@ tarball can change the answer. Device nodes from layer content are refused
 outright; absolute hardlink targets are refused; `security.*` xattrs are
 dropped.
 
-There is still no layering — each image extracts to a flat directory — and no
-network isolation. The flags refuse rather than pretend:
+Layers are extracted once, keyed by their uncompressed digest, and shared
+between containers; each container gets a private writable upper. The overlay
+is assembled with **genuine `fsconfig(2)` calls**, never a `lowerdir=a:b:c`
+string: the legacy options page is one 4095-byte buffer the kernel fills and
+does not NUL-terminate, so a long layer list is silently truncated and the
+mount *succeeds* with layers missing. `mount -o lowerdir+=` does not escape
+it either — util-linux still issues a single `mount(2)`. A 300-layer stack
+mounting and reading back in full is the test that proves it.
+
+There is still no network isolation. The flags refuse rather than pretend:
 `--network bridge` names stage 9, and a `--rootfs` that is not a directory
 says so.
 

@@ -38,9 +38,27 @@ fi
 [ -x "$B" ] || { echo "no rustainer binary at '$B'" >&2; exit 2; }
 
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/rustainer-stage6.XXXXXX")
+# OverlayFS refuses an upperdir that is itself on overlayfs, which is
+# exactly where a container's /tmp lives. Give the store a tmpfs when that
+# is the case: tmpfs IS accepted as an upperdir on a current kernel, and
+# the engine reports the kernel's own refusal when it is not.
+MOUNTED_TMPFS=no
+if [ "$(stat -fc %T "$SCRATCH")" = overlayfs ]; then
+    if mount -t tmpfs -o size=2g tmpfs "$SCRATCH" 2>/dev/null; then
+        MOUNTED_TMPFS=yes
+        echo "store on a tmpfs, because the default location is overlayfs"
+    else
+        echo "cannot host an upperdir here (overlayfs) and cannot mount a tmpfs" >&2
+        exit 2
+    fi
+fi
 export RUSTAINER_ROOT="$SCRATCH/state"
 export RUSTAINER_IMAGE_ROOT="$SCRATCH/images"
-trap 'rm -rf "$SCRATCH"' EXIT
+cleanup() {
+    [ "$MOUNTED_TMPFS" = yes ] && umount "$SCRATCH" 2>/dev/null
+    rm -rf "$SCRATCH"
+}
+trap cleanup EXIT
 echo "kernel $(uname -r) $(uname -m), uid $(id -u)"
 echo "image store: $RUSTAINER_IMAGE_ROOT"
 
