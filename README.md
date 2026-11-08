@@ -51,8 +51,8 @@ is easier to reason about once the process model is not also in question.
 | 6 | Pull and unpack a real image — `run alpine echo hello` | **Done** |
 | 7 | Layered filesystem (OverlayFS) | **Done** |
 | 8 | A network namespace of its own | **Done** |
-| 9 | Bridge, NAT and the outside world | Next |
-| 10 | Published ports | |
+| 9 | Bridge, NAT and the outside world | **Done** |
+| 10 | Published ports | Next |
 | 11 | Single-ID rootless | |
 
 ### Building and testing
@@ -75,6 +75,7 @@ sudo bash scripts/stage5-success-test.sh
 sudo bash scripts/stage6-success-test.sh
 sudo bash scripts/stage7-success-test.sh
 sudo bash scripts/stage8-success-test.sh
+sudo bash scripts/stage9-success-test.sh
 
 # or with no root at all, if /proc/sys/user/max_user_namespaces > 0
 unshare --user --map-root-user bash scripts/stage2-success-test.sh
@@ -156,15 +157,26 @@ mount *succeeds* with layers missing. `mount -o lowerdir+=` does not escape
 it either — util-linux still issues a single `mount(2)`. A 300-layer stack
 mounting and reading back in full is the test that proves it.
 
-**The container has its own network stack by default.** It holds loopback,
-up and carrying `127.0.0.1` — which a fresh namespace does *not* give you:
-the kernel installs that address in response to the device coming up, not at
-creation, and an enormous amount of software binds a local listener for its
-own IPC. There is no route off the machine. `--network host` still works and
-now says plainly what it means.
+**Containers reach the internet and each other.** The default is a bridge:
+the container gets its own network namespace, a veth pair whose peer is
+placed directly into that namespace by the message that creates it, an
+address, a default route, and source NAT. `--network none` gives a stack with
+nothing but loopback; `--network host` shares the host's and says plainly
+what that means.
 
-There is still no bridge, no NAT and no published ports, so a container
-cannot reach the internet or another container. The flags refuse rather than pretend:
+`/etc/resolv.conf` and `/etc/hosts` are generated per container and bound in.
+That is part of this stage rather than a later one, and deliberately: a
+container with an address, a route and working NAT has **no nameserver at
+all**, so the stage looks broken in a way every user misdiagnoses. The host's
+resolvers are filtered — `127.0.0.53` is meaningless inside a container,
+because each namespace has its own loopback.
+
+`ip_forward` is read, never written: the kernel resets every other forwarding
+parameter to its default when that file is written, so the engine refuses and
+gives you the command instead.
+
+There are still no published ports, so nothing outside the host can reach a
+container. The flags refuse rather than pretend:
 `--network bridge` names stage 9, and a `--rootfs` that is not a directory
 says so.
 

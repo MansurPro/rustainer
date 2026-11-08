@@ -64,8 +64,10 @@ TAR_OWNER=--no-same-owner
 [ "$(id -u)" = 0 ] && [ "$(awk '{print $1, $2, $3}' /proc/self/uid_map)" = "0 0 4294967295" ] && TAR_OWNER=--same-owner
 tar $TAR_OWNER -xzf "$CACHE" -C "$BASE" || exit 2
 
-# No --network: the default.
-R() { timeout 120 "$B" run --layer "$BASE" "$@"; }
+# `none` explicitly: this stage is about what a namespace with nothing in
+# it looks like, and `bridge` - the default from stage 9 - puts an
+# interface in it.
+R() { timeout 120 "$B" run --network none --layer "$BASE" "$@"; }
 HOSTNET() { timeout 120 "$B" run --network host --layer "$BASE" "$@"; }
 
 HOST_NETNS=$(readlink /proc/self/ns/net)
@@ -141,9 +143,9 @@ check "no nsfs bind mount was left" "$LEFT" "0"
 
 echo
 echo "7. Refusals stay explicit"
-"$B" run --network bridge --layer "$BASE" /bin/true 2>&1 | grep -q 'stage 9' \
-    && ok "--network bridge names the stage that will support it" \
-    || bad "--network bridge did not refuse clearly"
+"$B" run --network nonsense --layer "$BASE" /bin/true 2>&1 | grep -q 'not supported' \
+    && ok "an unknown network mode refuses" \
+    || bad "an unknown network mode was accepted"
 
 echo
 echo "$PASS passed, $FAIL failed"

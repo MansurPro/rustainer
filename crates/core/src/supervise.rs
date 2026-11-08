@@ -39,6 +39,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::cgroup::{self, Cgroup, Limits};
+use crate::firewall;
+use crate::net::{self, Lease};
 use crate::security::{self, CapabilitySet, Security, UserSpec};
 use crate::state::{self, Lock, Paths, State, Status};
 use crate::{Exit, MountPlan, Namespaces, Privileges, Spec, mount, sys};
@@ -100,6 +102,13 @@ pub struct Config {
     /// A network namespace of the container's own.
     #[serde(default)]
     pub private_net: bool,
+    /// Attach to the bridge and get an address. Implies `private_net`.
+    #[serde(default)]
+    pub bridge: bool,
+    /// The address handed to this container, recorded so `ps` and teardown
+    /// do not have to recompute it.
+    #[serde(default)]
+    pub ip: Option<String>,
 }
 
 impl Config {
@@ -122,9 +131,22 @@ impl Config {
             envp: self.envp.iter().map(Into::into).collect(),
             hostname: Some(self.hostname.clone().into()),
             workdir: self.workdir.clone().map(Into::into),
+            net_messages: match (self.bridge, &self.ip) {
+                (true, Some(ip)) => ip
+                    .parse()
+                    .map(|ip| {
+                        net::container_messages(&Lease {
+                            ip,
+                            prefix: net::SUBNET_PREFIX,
+                            gateway: net::GATEWAY,
+                        })
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            },
             namespaces: Namespaces {
                 mount: self.rootfs.is_some(),
-                net: self.private_net,
+                net: self.private_net || self.bridge,
                 ..Namespaces::STAGE1
             },
         }
@@ -175,6 +197,56 @@ impl Config {
         Ok(Security::build(keep, self.user.clone(), filter))
     }
 
+    /// `/etc/resolv.conf` for a container, written to the state directory.
+    ///
+    /// The host's file cannot simply be copied. **`127.0.0.53` is
+    /// meaningless inside a container network namespace**: each namespace
+    /// has its own loopback, so a container sending to `127.0.0.53:53`
+    /// reaches *its own* loopback, where nothing is listening. Since
+    /// systemd-resolved is the default on Ubuntu, Fedora and Arch, copying
+    /// naively produces a container whose DNS silently never answers -
+    /// which every user misdiagnoses as "networking is broken".
+    fn write_resolv_conf(&self, dir: &Path) -> std::io::Result<PathBuf> {
+        let mut servers: Vec<String> = std::fs::read_to_string("/etc/resolv.conf")
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.strip_prefix("nameserver"))
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.starts_with("127.") && !s.is_empty())
+            .collect();
+        if servers.is_empty() {
+            // Every nameserver the host has is a local stub. Fall back to
+            // a public resolver and say so in the file, rather than
+            // writing something that cannot work.
+            servers.push("1.1.1.1".into());
+            servers.push("8.8.8.8".into());
+        }
+        let mut body = String::new();
+        if servers.len() == 2 && servers[0] == "1.1.1.1" {
+            body.push_str(
+                "# The host's resolvers are all on 127.0.0.0/8 (systemd-resolved or similar),\n\
+                 # which is a different loopback inside this container's network namespace.\n",
+            );
+        }
+        for s in &servers {
+            body.push_str(&format!("nameserver {s}\n"));
+        }
+        let path = dir.join("resolv.conf");
+        std::fs::write(&path, body)?;
+        Ok(path)
+    }
+
+    fn write_hosts(&self, dir: &Path) -> std::io::Result<PathBuf> {
+        let mut body =
+            String::from("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
+        if let Some(ip) = &self.ip {
+            body.push_str(&format!("{ip}\t{}\n", self.hostname));
+        }
+        let path = dir.join("hosts");
+        std::fs::write(&path, body)?;
+        Ok(path)
+    }
+
     pub fn mount_plan(
         &self,
         cgroup_dir: Option<&Path>,
@@ -213,11 +285,23 @@ impl Config {
             })
         };
         std::fs::create_dir_all(r)?;
+
+        // Thirty lines of file generation that are a PREREQUISITE of
+        // bridge networking, not a successor to it. A container with an
+        // address, a route and working NAT but no nameserver looks broken
+        // in a way every user misdiagnoses.
+        let mut binds: Vec<(PathBuf, &str)> = Vec::new();
+        if self.bridge {
+            binds.push((self.write_resolv_conf(state_dir)?, "etc/resolv.conf"));
+            binds.push((self.write_hosts(state_dir)?, "etc/hosts"));
+        }
+
         Ok(Some(mount::plan(
             Path::new(r),
             Privileges::probe(),
             cgroup_dir,
             overlay.as_ref(),
+            &binds,
         )?))
     }
 }
@@ -232,6 +316,15 @@ pub enum Error {
     Cgroup(#[from] cgroup::Error),
     #[error(transparent)]
     Seccomp(#[from] security::SeccompError),
+    #[error(transparent)]
+    Firewall(#[from] firewall::Error),
+    #[error(
+        "IPv4 forwarding is off, so a bridged container can reach the bridge and nothing \
+         beyond it. Turning it on here would be a destructive change - the kernel resets \
+         every other forwarding parameter to its default when ip_forward is written - so \
+         run this yourself instead:\n\n    sysctl -w net.ipv4.ip_forward=1\n"
+    )]
+    ForwardingOff,
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("syscall: {0}")]
@@ -348,7 +441,7 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     }
     let mounts = config.mount_plan(cg.as_ref().map(|c| c.dir()), &paths.dir(id))?;
 
-    let spawned = crate::spawn(
+    let mut spawned = crate::spawn(
         &spec,
         mounts,
         Some(config.security()?),
@@ -362,10 +455,27 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     drop(out_w);
     drop(err_w);
 
+    // The host side of the network, before the child is let go. The
+    // container's interface has to exist before the container tries to
+    // configure it, and the go-ahead is what guarantees the ordering.
+    if config.bridge
+        && let Err(e) = plumb_network(spawned.pid)
+    {
+        let _ = sys::kill_process(
+            rustix::process::Pid::from_raw(spawned.pid).unwrap(),
+            sys::Signal::KILL,
+        );
+        let _ = crate::reap_pid(spawned.pid);
+        return Err(e);
+    }
+
     st.init_pid = Some(spawned.pid);
     st.init_start_time = state::start_time(spawned.pid);
     st.status = Status::Created;
     st.store(paths)?;
+
+    // Everything the parent owed this child is done.
+    spawned.release();
 
     // Tell the CLI it may leave. Everything after this point happens with
     // nobody waiting on us.
@@ -584,6 +694,67 @@ fn reap_into(st: &mut State, pid: i32) -> Exit {
     }
 }
 
+/// Create the bridge if needed, make a veth pair, and put the peer
+/// straight into the container's namespace.
+///
+/// The largest irreversible host mutation in the project is here: a bridge
+/// holding an address and an on-link route reserves a subnet as far as any
+/// future allocator is concerned. It is created once and reused, never per
+/// container.
+fn plumb_network(pid: i32) -> Result<(), Error> {
+    if !net::ip_forward_enabled() {
+        return Err(Error::ForwardingOff);
+    }
+    let nl = net::Netlink::open()?;
+
+    // The bridge, once. `EEXIST` is the normal case after the first
+    // container and is not an error.
+    if net::if_index(net::BRIDGE).is_none() {
+        match nl.request(&net::create_bridge(net::BRIDGE)) {
+            Ok(()) | Err(sys::Error::EXIST) => {}
+            Err(e) => return Err(e.into()),
+        }
+        let idx = net::if_index(net::BRIDGE).ok_or(sys::Error::NODEV)?;
+        match nl.request(&net::add_address(idx, net::GATEWAY, net::SUBNET_PREFIX)) {
+            Ok(()) | Err(sys::Error::EXIST) => {}
+            Err(e) => return Err(e.into()),
+        }
+        nl.request(&net::link_up(net::BRIDGE))?;
+    }
+    let bridge_idx = net::if_index(net::BRIDGE).ok_or(sys::Error::NODEV)?;
+
+    // The container's namespace, as a descriptor. The peer goes straight
+    // into it, so its interface never appears on the host even briefly.
+    let ns = std::fs::File::open(format!("/proc/{pid}/ns/net")).map(std::os::fd::OwnedFd::from)?;
+    // Named by pid: short enough for IFNAMSIZ and unique while the
+    // container lives, which is exactly as long as the interface does.
+    let host_if = format!("rtv{pid}");
+    nl.request(&net::create_veth(&host_if, "eth0", &ns))?;
+    nl.request(&net::set_master(&host_if, bridge_idx))?;
+    nl.request(&net::link_up(&host_if))?;
+
+    // Source NAT, so replies can find their way back. Without it a
+    // container sends packets and never receives one: the rest of the
+    // internet has no route to RFC 1918 space, so the SYN-ACK is dropped
+    // and the failure looks like "everything times out".
+    let fw = firewall::detect().ok_or(firewall::Error::NoBackend)?;
+    fw.ensure_masquerade(net::GATEWAY, net::SUBNET_PREFIX, net::BRIDGE)?;
+    // And the forward path. A FORWARD policy of DROP - set by Kubernetes,
+    // libvirt, firewalld and most cloud images - silently blackholes every
+    // container's egress, with a correct address, route and NAT rule in
+    // place. The symptom is "everything times out".
+    if fw.foreign_drop_policy() {
+        eprintln!(
+            "rustainer: this host has a FORWARD policy of DROP that something else set. \
+             Accept rules for {} have been added to our own chain; if another ruleset \
+             drops the packet first, containers will have no egress.",
+            net::BRIDGE
+        );
+    }
+    fw.ensure_forward(net::BRIDGE)?;
+    Ok(())
+}
+
 /// Stop a container: `SIGTERM`, a grace period, then `SIGKILL`.
 ///
 /// The grace period is real, not decorative. A container whose PID 1 never
@@ -702,6 +873,8 @@ mod tests {
             read_only: false,
             overlay_dir: None,
             private_net: false,
+            bridge: false,
+            ip: None,
         };
         c.store(&paths).unwrap();
         let back = Config::load(&paths, "c1").unwrap();

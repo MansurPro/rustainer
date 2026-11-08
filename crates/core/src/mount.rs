@@ -329,6 +329,12 @@ pub fn plan(
     privs: Privileges,
     cgroup_dir: Option<&Path>,
     overlay: Option<&Overlay>,
+    // Host files bound over paths inside the container: (source, relative
+    // target). This is how /etc/resolv.conf and /etc/hosts reach a
+    // container - they are GENERATED PER CONTAINER on the host and bound
+    // in, never part of the image, which is also why editing them inside a
+    // container does not survive a restart.
+    binds: &[(PathBuf, &str)],
 ) -> Result<MountPlan, PlanError> {
     let rootfs = rootfs
         .canonicalize()
@@ -678,6 +684,43 @@ pub fn plan(
         );
     }
 
+    // --- 29. Generated files bound over the image's copies. -------------
+    //
+    // The target is created HERE, by the child, after the overlay is
+    // mounted. Creating it parent-side cannot work: with layers the rootfs
+    // is an empty mount point until the overlay lands, so there is no
+    // /etc to put a file in yet.
+    for (source, rel) in binds {
+        let target = join(&rootfs, rel);
+        if let Some(parent) = Path::new(rel).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            push(
+                Op::Mkdir {
+                    target: cstr(&join(&rootfs, parent.to_str().unwrap_or("")))?,
+                    mode: 0o755,
+                },
+                true,
+                "creating a directory for a generated file",
+            );
+        }
+        push(
+            Op::Touch {
+                target: cstr(&target)?,
+            },
+            true,
+            "creating a bind target for a generated file",
+        );
+        push(
+            Op::Bind {
+                source: cstr(source)?,
+                target: cstr(&target)?,
+            },
+            false,
+            "binding a generated file",
+        );
+    }
+
     // --- 30. Masked and read-only paths. --------------------------------
     //
     // Worth being precise about what this buys. These are
@@ -928,7 +971,7 @@ mod tests {
             mknod_devices: false,
             initial_user_ns: false,
         };
-        let plan = plan(&dir, privs, None, None).unwrap();
+        let plan = plan(&dir, privs, None, None, &[]).unwrap();
         let walk = plan
             .ops
             .iter()
@@ -955,7 +998,7 @@ mod tests {
             mknod_devices: false,
             initial_user_ns: false,
         };
-        let plan = plan(&dir, privs, None, None).unwrap();
+        let plan = plan(&dir, privs, None, None, &[]).unwrap();
         let what: Vec<_> = plan.degradations.iter().map(|d| d.what).collect();
         assert!(what.contains(&"device nodes"), "{what:?}");
         assert!(what.contains(&"/sys"), "{what:?}");
@@ -971,7 +1014,7 @@ mod tests {
             mknod_devices: true,
             initial_user_ns: true,
         };
-        let plan = plan(&dir, privs, None, None).unwrap();
+        let plan = plan(&dir, privs, None, None, &[]).unwrap();
         assert!(plan.degradations.is_empty(), "{:?}", plan.degradations);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -985,7 +1028,7 @@ mod tests {
             mknod_devices: true,
             initial_user_ns: true,
         };
-        let plan = plan(&dir, privs, None, None).unwrap();
+        let plan = plan(&dir, privs, None, None, &[]).unwrap();
         let labels = plan.labels();
         let pos = |needle: &str| labels.iter().position(|l| l.contains(needle)).unwrap();
         assert!(pos("rootfs onto itself") < pos("/proc"));
@@ -1027,7 +1070,7 @@ mod tests {
             work: Some(PathBuf::from("/w")),
             read_only: false,
         };
-        let p = plan(&dir, privs, None, Some(&o)).unwrap();
+        let p = plan(&dir, privs, None, Some(&o), &[]).unwrap();
         let labels = p.labels();
         assert!(labels.iter().any(|l| l.contains("overlay")));
         assert!(
@@ -1052,7 +1095,7 @@ mod tests {
             work: None,
             read_only: false,
         };
-        let Err(e) = plan(&dir, privs, None, Some(&o)) else {
+        let Err(e) = plan(&dir, privs, None, Some(&o), &[]) else {
             panic!("600 layers must be refused before the syscall")
         };
         assert!(e.to_string().contains("500"), "{e}");
@@ -1075,7 +1118,7 @@ mod tests {
             read_only: false,
         };
         assert!(matches!(
-            plan(&dir, privs, None, Some(&o)),
+            plan(&dir, privs, None, Some(&o), &[]),
             Err(PlanError::LayerPathSeparator(_))
         ));
         std::fs::remove_dir_all(&dir).ok();
@@ -1100,7 +1143,7 @@ mod tests {
                 mknod_devices: true,
                 initial_user_ns: initial,
             };
-            let p = plan(&dir, privs, None, Some(&o)).unwrap();
+            let p = plan(&dir, privs, None, Some(&o), &[]).unwrap();
             let got = p.ops.iter().find_map(|op| match &op.op {
                 Op::Overlay { userxattr, .. } => Some(*userxattr),
                 _ => None,
@@ -1120,7 +1163,7 @@ mod tests {
             initial_user_ns: true,
         };
         assert!(matches!(
-            plan(&f, privs, None, None),
+            plan(&f, privs, None, None, &[]),
             Err(PlanError::NotADirectory(_))
         ));
         std::fs::remove_file(&f).ok();

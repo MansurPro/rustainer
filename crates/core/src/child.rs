@@ -50,6 +50,7 @@ pub enum Step {
     Security = 9,
     WorkingDirectory = 10,
     Loopback = 11,
+    Interface = 12,
 }
 
 impl Step {
@@ -66,6 +67,7 @@ impl Step {
             9 => Step::Security,
             10 => Step::WorkingDirectory,
             11 => Step::Loopback,
+            12 => Step::Interface,
             _ => return None,
         })
     }
@@ -83,6 +85,7 @@ impl Step {
             Step::Security => "applying the security posture",
             Step::WorkingDirectory => "entering the image's working directory",
             Step::Loopback => "bringing up the loopback interface",
+            Step::Interface => "configuring the container's network interface",
         }
     }
 }
@@ -144,6 +147,9 @@ pub struct ChildPlan {
     cgroup_ns: bool,
     /// Bring `lo` up, which a new network namespace does not do for us.
     loopback: bool,
+    /// Pre-built rtnetlink messages, with the offset of the interface
+    /// index each one needs patched into it.
+    net_messages: Vec<crate::net::Message>,
     /// Empty when the container keeps the host's filesystem view.
     mount_ops: Vec<PlannedOp>,
     rootfs: Option<CString>,
@@ -176,23 +182,56 @@ pub enum PlanError {
     InteriorNul { what: &'static str },
 }
 
+/// Everything `ChildPlan::build` needs, by name.
+///
+/// A struct rather than a positional argument list: this grew to fourteen
+/// parameters as the ladder went on, and every new one silently shifted
+/// the meaning of the ones after it at every call site.
+#[derive(Default)]
+pub struct ChildSpec<'a> {
+    pub exe: &'a OsStr,
+    pub argv: &'a [OsString],
+    pub envp: &'a [OsString],
+    pub hostname: Option<&'a OsStr>,
+    pub workdir: Option<&'a OsStr>,
+    pub mounts: Option<mount::MountPlan>,
+    pub cgroup_ns: bool,
+    pub loopback: bool,
+    pub net_messages: &'a [crate::net::Message],
+    pub security: Option<Security>,
+    pub stdio: Option<Stdio>,
+    pub exec_fifo: Option<OwnedFd>,
+}
+
+impl<'a> ChildSpec<'a> {
+    pub fn new(exe: &'a OsStr) -> Self {
+        Self {
+            exe,
+            ..Default::default()
+        }
+    }
+}
+
 impl ChildPlan {
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
-        exe: &OsStr,
-        argv: &[OsString],
-        envp: &[OsString],
-        hostname: Option<&OsStr>,
-        workdir: Option<&OsStr>,
-        mounts: Option<mount::MountPlan>,
-        cgroup_ns: bool,
-        loopback: bool,
-        security: Option<Security>,
-        stdio: Option<Stdio>,
-        exec_fifo: Option<OwnedFd>,
+        spec: ChildSpec<'_>,
         proceed_rx: OwnedFd,
         err_tx: OwnedFd,
     ) -> Result<Self, PlanError> {
+        let ChildSpec {
+            exe,
+            argv,
+            envp,
+            hostname,
+            workdir,
+            mounts,
+            cgroup_ns,
+            loopback,
+            net_messages,
+            security,
+            stdio,
+            exec_fifo,
+        } = spec;
         fn cstr(s: &OsStr, what: &'static str) -> Result<CString, PlanError> {
             CString::new(s.as_bytes()).map_err(|_| PlanError::InteriorNul { what })
         }
@@ -255,6 +294,7 @@ impl ChildPlan {
             workdir,
             cgroup_ns,
             loopback,
+            net_messages: net_messages.to_vec(),
             security,
             mount_ops,
             rootfs,
@@ -319,7 +359,41 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::Loopback, 0, e);
     }
 
-    // 4. Build the mount set, then pivot onto it.
+    // 4. Configure our own interface, if one was put here for us.
+    //
+    // The messages were built in the parent: the child cannot allocate, so
+    // it opens one netlink socket and writes bytes that are already
+    // correct. The peer was placed directly into this namespace by the
+    // same RTM_NEWLINK that created it, so there was never a moment when
+    // the container's interface existed on the host.
+    if !plan.net_messages.is_empty() {
+        // Resolved here, not in the parent: "eth0 is index 2" is only true
+        // in a namespace with nothing else in it, and a kernel with the
+        // tunnel modules loaded puts sit0, tunl0 and gre0 there too.
+        let Some(index) = crate::net::index_of(c"eth0") else {
+            fail(plan, Step::Interface, 0, Errno::NODEV);
+        };
+        match crate::net::Netlink::open() {
+            Err(e) => fail(plan, Step::Interface, 0, e),
+            Ok(nl) => {
+                // A stack buffer, because patching the index means writing,
+                // and the plan is shared read-only with the parent's copy.
+                let mut buf = [0u8; 256];
+                for (i, (m, at)) in plan.net_messages.iter().enumerate() {
+                    if m.len() > buf.len() {
+                        fail(plan, Step::Interface, i as u8, Errno::MSGSIZE);
+                    }
+                    buf[..m.len()].copy_from_slice(m);
+                    buf[*at..*at + 4].copy_from_slice(&index.to_ne_bytes());
+                    if let Err(e) = nl.request(&buf[..m.len()]) {
+                        fail(plan, Step::Interface, i as u8, e);
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Build the mount set, then pivot onto it.
     //
     // Both belong here rather than in the parent. The mount namespace is
     // ours, and /proc in particular binds its pid namespace at mount time
@@ -335,7 +409,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 5. Name ourselves. This is the child's job, not the parent's: the new
+    // 6. Name ourselves. This is the child's job, not the parent's: the new
     //    UTS namespace is ours and the parent is not in it.
     if let Some(h) = &plan.hostname
         && let Err(e) = sys::sethostname(h.to_bytes())
@@ -343,7 +417,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::SetHostname, 0, e);
     }
 
-    // 10. Attach the standard streams. After this point the child has no
+    // 11. Attach the standard streams. After this point the child has no
     //    way to report anything except through `err_tx`, which is why the
     //    failure record exists at all.
     if let Some(io) = &plan.stdio {
@@ -354,7 +428,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 6. Enter the image's working directory, while we can still see it.
+    // 7. Enter the image's working directory, while we can still see it.
     //
     // After the pivot and before the privilege drop: a WorkingDir that only
     // root can enter is common in real images.
@@ -364,7 +438,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::WorkingDirectory, 0, e);
     }
 
-    // 7. Open the start rendezvous - but do not wait on it yet.
+    // 8. Open the start rendezvous - but do not wait on it yet.
     //
     // The open must happen while we are still root. After the uid change
     // the process is non-dumpable, which makes `/proc/<pid>/fd` root-owned
@@ -383,7 +457,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 8. Give away privilege: bounding set, user, no_new_privs, seccomp.
+    // 9. Give away privilege: bounding set, user, no_new_privs, seccomp.
     //
     // As close to execve as possible, so as few of our own syscalls as
     // possible run under the filter. Everything above this line needed
@@ -394,12 +468,12 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::Security, step as u8, e);
     }
 
-    // 9. Announce that we are started, now that the posture is in place.
+    // 10. Announce that we are started, now that the posture is in place.
     if let Some(w) = &started {
         let _ = sys::write(w, &[0u8]);
     }
 
-    // 11. Become the container command. `err_tx` is O_CLOEXEC, so a successful
+    // 12. Become the container command. `err_tx` is O_CLOEXEC, so a successful
     //    execve closes it and the parent sees EOF — that, and not a success
     //    message, is how the parent learns this worked.
     let e = unsafe { sys::execve(plan.exe, plan.argv.as_ptr(), plan.envp.as_ptr()) };
@@ -437,18 +511,15 @@ mod tests {
 
     fn plan_for(exe: &str, args: &[&str]) -> ChildPlan {
         let (rx, tx) = sys::pipe_with(sys::PipeFlags::CLOEXEC).unwrap();
+        let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let envp = [OsString::from("PATH=/usr/bin:/bin")];
         ChildPlan::build(
-            OsStr::new(exe),
-            &args.iter().map(OsString::from).collect::<Vec<_>>(),
-            &[OsString::from("PATH=/usr/bin:/bin")],
-            Some(OsStr::new("box")),
-            None,
-            None,
-            false,
-            false,
-            None,
-            None,
-            None,
+            ChildSpec {
+                argv: &argv,
+                envp: &envp,
+                hostname: Some(OsStr::new("box")),
+                ..ChildSpec::new(OsStr::new(exe))
+            },
             rx,
             tx,
         )
@@ -480,21 +551,7 @@ mod tests {
     #[test]
     fn interior_nul_is_rejected_not_truncated() {
         let (rx, tx) = sys::pipe_with(sys::PipeFlags::CLOEXEC).unwrap();
-        let result = ChildPlan::build(
-            OsStr::new("/bin/sh\0extra"),
-            &[],
-            &[],
-            None,
-            None,
-            None,
-            false,
-            false,
-            None,
-            None,
-            None,
-            rx,
-            tx,
-        );
+        let result = ChildPlan::build(ChildSpec::new(OsStr::new("/bin/sh\0extra")), rx, tx);
         assert!(matches!(result, Err(PlanError::InteriorNul { .. })));
     }
 
@@ -512,6 +569,7 @@ mod tests {
             Step::Security,
             Step::WorkingDirectory,
             Step::Loopback,
+            Step::Interface,
         ] {
             let encoded = encode(step, 7, Errno::NOENT);
             let (got_step, detail, got_errno) = decode(&encoded).expect("decode");
@@ -549,6 +607,7 @@ mod tests {
             Step::Security,
             Step::WorkingDirectory,
             Step::Loopback,
+            Step::Interface,
         ] {
             assert!(!step.describe().is_empty());
         }

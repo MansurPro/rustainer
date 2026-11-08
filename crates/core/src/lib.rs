@@ -26,7 +26,9 @@
 
 pub mod cgroup;
 pub mod child;
+pub mod firewall;
 pub mod mount;
+pub mod net;
 pub mod security;
 pub mod state;
 pub mod supervise;
@@ -128,6 +130,10 @@ pub struct Spec {
     pub hostname: Option<OsString>,
     /// The image's `WorkingDir`, if it has one.
     pub workdir: Option<OsString>,
+    /// Pre-built rtnetlink messages the container's init sends to
+    /// configure its own interface. Built in the parent because the child
+    /// cannot allocate.
+    pub net_messages: Vec<net::Message>,
     pub namespaces: Namespaces,
 }
 
@@ -219,9 +225,28 @@ pub struct Spawned {
     pub pidfd: sys::OwnedFd,
     labels: Vec<&'static str>,
     err_rx: sys::OwnedFd,
+    /// The go-ahead, held until the caller says the child may proceed.
+    ///
+    /// **Not** written when the clone returns. Everything the parent must
+    /// do for the child - placing a veth peer in its namespace, writing a
+    /// uid map - happens after the child exists and before it may run, and
+    /// a go-ahead sent too early turns all of it into a race the child
+    /// usually wins on a fast machine and loses on a loaded one.
+    proceed_tx: Option<sys::OwnedFd>,
 }
 
 impl Spawned {
+    /// Let the child proceed. Everything the parent owed it is done.
+    pub fn release(&mut self) {
+        if let Some(tx) = self.proceed_tx.take() {
+            // EPIPE means the child is already gone, which the wait status
+            // explains better than this write could. Rust sets SIGPIPE to
+            // SIG_IGN at startup, so this returns an error rather than
+            // killing us.
+            let _ = sys::write(&tx, &[1u8]);
+        }
+    }
+
     /// The child's failure report, if it sent one.
     ///
     /// Reads until EOF, which a successful `execve` produces by closing the
@@ -299,17 +324,20 @@ pub fn spawn(
         None
     };
     let plan = ChildPlan::build(
-        &spec.exe,
-        &spec.argv,
-        &spec.envp,
-        hostname,
-        spec.workdir.as_deref(),
-        mounts,
-        cgroup_fd.is_some(),
-        spec.namespaces.net,
-        security,
-        stdio,
-        exec_fifo,
+        child::ChildSpec {
+            exe: &spec.exe,
+            argv: &spec.argv,
+            envp: &spec.envp,
+            hostname,
+            workdir: spec.workdir.as_deref(),
+            mounts,
+            cgroup_ns: cgroup_fd.is_some(),
+            loopback: spec.namespaces.net,
+            net_messages: &spec.net_messages,
+            security,
+            stdio,
+            exec_fifo,
+        },
         proceed_rx,
         err_tx,
     )?;
@@ -364,13 +392,6 @@ pub fn spawn(
             // plan here is load-bearing, not tidiness.
             drop(plan);
 
-            // The go-ahead. EPIPE means the child is already gone, which the
-            // wait status will explain better than this write could. Rust
-            // sets SIGPIPE to SIG_IGN at startup, so this returns an error
-            // rather than killing us.
-            let _ = sys::write(&proceed_tx, &[1u8]);
-            drop(proceed_tx);
-
             // SAFETY: the kernel wrote a valid descriptor here, because
             // CLONE_PIDFD was set and the clone succeeded.
             let pidfd =
@@ -380,6 +401,7 @@ pub fn spawn(
                 pidfd,
                 labels,
                 err_rx,
+                proceed_tx: Some(proceed_tx),
             })
         }
     }
@@ -391,7 +413,9 @@ pub fn spawn(
 /// [`supervise`] instead, because the CLI must never be in the container's
 /// process ancestry (RND.md §18.2).
 pub fn run(spec: &Spec, mounts: Option<MountPlan>) -> Result<Exit, Error> {
-    let spawned = spawn(spec, mounts, None, None, None, None)?;
+    let mut spawned = spawn(spec, mounts, None, None, None, None)?;
+    // Nothing is owed to this child, so it may go at once.
+    spawned.release();
     // Safe to read to EOF here: no start rendezvous was given, so the child
     // runs straight through to execve.
     let failure = spawned.start_failure();
@@ -476,6 +500,7 @@ impl Spec {
             envp: inherited_env(),
             hostname: None,
             workdir: None,
+            net_messages: Vec::new(),
             namespaces: Namespaces::STAGE1,
         }
     }
@@ -505,7 +530,7 @@ mod tests {
     fn a_mount_plan_without_a_mount_namespace_is_refused() {
         let dir = std::env::temp_dir().join("rustainer-guard-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let plan = mount::plan(&dir, Privileges::probe(), None, None).unwrap();
+        let plan = mount::plan(&dir, Privileges::probe(), None, None, &[]).unwrap();
 
         let mut spec = Spec::new("/bin/true", vec![]);
         spec.namespaces = Namespaces::STAGE1; // mount: false
