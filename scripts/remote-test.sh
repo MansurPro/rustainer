@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 HOST=${1:-}
 [ -n "$HOST" ] || { sed -n '2,16p' "$0" >&2; exit 2; }
 shift
-STAGES=${*:-1 2 3 4 5}
+STAGES=${*:-1 2 3 4 5 6}
 
 ARCH=$(ssh -o BatchMode=yes "$HOST" 'uname -m')
 case "$ARCH" in
@@ -38,6 +38,12 @@ trap 'rm -rf "$OUT"' EXIT
 docker run --rm --platform "$PLATFORM" -v "$PWD":/w -v "$OUT":/out -w /w \
     -e CARGO_TARGET_DIR=/tmp/t rust:1.96-slim bash -c "
         set -e
+        # The registry client's TLS stack has a C component, so a musl
+        # build needs a musl-targeting compiler. Without it the failure is
+        # a build script exiting 1 with no explanation.
+        apt-get -qq update >/dev/null 2>&1
+        apt-get -qq install -y musl-tools >/dev/null 2>&1
+        export CC_${TARGET//-/_}=musl-gcc
         rustup target add $TARGET >/dev/null 2>&1 || true
         cargo build --release --target $TARGET --quiet
         cargo test --release --target $TARGET --no-run --quiet
