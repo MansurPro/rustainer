@@ -407,14 +407,6 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     st.status = Status::Creating;
     st.store(paths)?;
 
-    // --- the host side of the network ------------------------------------
-    //
-    // Done after the clone, because the container's network namespace does
-    // not exist until then, and before the go-ahead, because the container
-    // must not run with half a network.
-    //
-    // (set up below, once the child exists)
-
     // --- the start rendezvous ------------------------------------------
     let fifo_path = paths.fifo(id);
     if !fifo_path.exists() {
@@ -449,7 +441,7 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     }
     let mounts = config.mount_plan(cg.as_ref().map(|c| c.dir()), &paths.dir(id))?;
 
-    let spawned = crate::spawn(
+    let mut spawned = crate::spawn(
         &spec,
         mounts,
         Some(config.security()?),
@@ -463,6 +455,9 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     drop(out_w);
     drop(err_w);
 
+    // The host side of the network, before the child is let go. The
+    // container's interface has to exist before the container tries to
+    // configure it, and the go-ahead is what guarantees the ordering.
     if config.bridge
         && let Err(e) = plumb_network(spawned.pid)
     {
@@ -478,6 +473,9 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     st.init_start_time = state::start_time(spawned.pid);
     st.status = Status::Created;
     st.store(paths)?;
+
+    // Everything the parent owed this child is done.
+    spawned.release();
 
     // Tell the CLI it may leave. Everything after this point happens with
     // nobody waiting on us.
