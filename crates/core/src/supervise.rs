@@ -97,6 +97,9 @@ pub struct Config {
     /// The kernel says so in as many words, which is now surfaced.
     #[serde(default)]
     pub overlay_dir: Option<String>,
+    /// A network namespace of the container's own.
+    #[serde(default)]
+    pub private_net: bool,
 }
 
 impl Config {
@@ -119,10 +122,10 @@ impl Config {
             envp: self.envp.iter().map(Into::into).collect(),
             hostname: Some(self.hostname.clone().into()),
             workdir: self.workdir.clone().map(Into::into),
-            namespaces: if self.rootfs.is_some() {
-                Namespaces::STAGE2
-            } else {
-                Namespaces::STAGE1
+            namespaces: Namespaces {
+                mount: self.rootfs.is_some(),
+                net: self.private_net,
+                ..Namespaces::STAGE1
             },
         }
     }
@@ -698,6 +701,7 @@ mod tests {
             layers: Vec::new(),
             read_only: false,
             overlay_dir: None,
+            private_net: false,
         };
         c.store(&paths).unwrap();
         let back = Config::load(&paths, "c1").unwrap();

@@ -49,6 +49,7 @@ pub enum Step {
     CgroupNamespace = 8,
     Security = 9,
     WorkingDirectory = 10,
+    Loopback = 11,
 }
 
 impl Step {
@@ -64,6 +65,7 @@ impl Step {
             8 => Step::CgroupNamespace,
             9 => Step::Security,
             10 => Step::WorkingDirectory,
+            11 => Step::Loopback,
             _ => return None,
         })
     }
@@ -80,6 +82,7 @@ impl Step {
             Step::CgroupNamespace => "unsharing the cgroup namespace",
             Step::Security => "applying the security posture",
             Step::WorkingDirectory => "entering the image's working directory",
+            Step::Loopback => "bringing up the loopback interface",
         }
     }
 }
@@ -139,6 +142,8 @@ pub struct ChildPlan {
     workdir: Option<CString>,
     /// Unshare the cgroup namespace once placement has happened.
     cgroup_ns: bool,
+    /// Bring `lo` up, which a new network namespace does not do for us.
+    loopback: bool,
     /// Empty when the container keeps the host's filesystem view.
     mount_ops: Vec<PlannedOp>,
     rootfs: Option<CString>,
@@ -181,6 +186,7 @@ impl ChildPlan {
         workdir: Option<&OsStr>,
         mounts: Option<mount::MountPlan>,
         cgroup_ns: bool,
+        loopback: bool,
         security: Option<Security>,
         stdio: Option<Stdio>,
         exec_fifo: Option<OwnedFd>,
@@ -248,6 +254,7 @@ impl ChildPlan {
             hostname,
             workdir,
             cgroup_ns,
+            loopback,
             security,
             mount_ops,
             rootfs,
@@ -300,7 +307,19 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::CgroupNamespace, 0, e);
     }
 
-    // 3. Build the mount set, then pivot onto it.
+    // 3. Bring up loopback, before anything can want it.
+    //
+    // A fresh network namespace has `lo` DOWN and no 127.0.0.1 at all -
+    // the kernel installs the address in response to the device coming up,
+    // not at creation. Software that binds a local listener for its own
+    // IPC fails in confusing ways without it.
+    if plan.loopback
+        && let Err(e) = sys::bring_up_loopback()
+    {
+        fail(plan, Step::Loopback, 0, e);
+    }
+
+    // 4. Build the mount set, then pivot onto it.
     //
     // Both belong here rather than in the parent. The mount namespace is
     // ours, and /proc in particular binds its pid namespace at mount time
@@ -316,7 +335,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 4. Name ourselves. This is the child's job, not the parent's: the new
+    // 5. Name ourselves. This is the child's job, not the parent's: the new
     //    UTS namespace is ours and the parent is not in it.
     if let Some(h) = &plan.hostname
         && let Err(e) = sys::sethostname(h.to_bytes())
@@ -324,7 +343,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::SetHostname, 0, e);
     }
 
-    // 9. Attach the standard streams. After this point the child has no
+    // 10. Attach the standard streams. After this point the child has no
     //    way to report anything except through `err_tx`, which is why the
     //    failure record exists at all.
     if let Some(io) = &plan.stdio {
@@ -335,7 +354,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 5. Enter the image's working directory, while we can still see it.
+    // 6. Enter the image's working directory, while we can still see it.
     //
     // After the pivot and before the privilege drop: a WorkingDir that only
     // root can enter is common in real images.
@@ -345,7 +364,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::WorkingDirectory, 0, e);
     }
 
-    // 6. Open the start rendezvous - but do not wait on it yet.
+    // 7. Open the start rendezvous - but do not wait on it yet.
     //
     // The open must happen while we are still root. After the uid change
     // the process is non-dumpable, which makes `/proc/<pid>/fd` root-owned
@@ -364,7 +383,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 7. Give away privilege: bounding set, user, no_new_privs, seccomp.
+    // 8. Give away privilege: bounding set, user, no_new_privs, seccomp.
     //
     // As close to execve as possible, so as few of our own syscalls as
     // possible run under the filter. Everything above this line needed
@@ -375,12 +394,12 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::Security, step as u8, e);
     }
 
-    // 8. Announce that we are started, now that the posture is in place.
+    // 9. Announce that we are started, now that the posture is in place.
     if let Some(w) = &started {
         let _ = sys::write(w, &[0u8]);
     }
 
-    // 10. Become the container command. `err_tx` is O_CLOEXEC, so a successful
+    // 11. Become the container command. `err_tx` is O_CLOEXEC, so a successful
     //    execve closes it and the parent sees EOF — that, and not a success
     //    message, is how the parent learns this worked.
     let e = unsafe { sys::execve(plan.exe, plan.argv.as_ptr(), plan.envp.as_ptr()) };
@@ -426,6 +445,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             None,
             None,
             None,
@@ -468,6 +488,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             None,
             None,
             None,
@@ -490,6 +511,7 @@ mod tests {
             Step::CgroupNamespace,
             Step::Security,
             Step::WorkingDirectory,
+            Step::Loopback,
         ] {
             let encoded = encode(step, 7, Errno::NOENT);
             let (got_step, detail, got_errno) = decode(&encoded).expect("decode");
@@ -526,6 +548,7 @@ mod tests {
             Step::CgroupNamespace,
             Step::Security,
             Step::WorkingDirectory,
+            Step::Loopback,
         ] {
             assert!(!step.describe().is_empty());
         }

@@ -560,6 +560,105 @@ pub unsafe fn install_seccomp(prog: &[libc::sock_filter]) -> Result<(), Errno> {
     if rc < 0 { Err(last_errno()) } else { Ok(()) }
 }
 
+// ---------------------------------------------------------------------------
+// Networking
+// ---------------------------------------------------------------------------
+
+/// Bring `lo` up in the current network namespace.
+///
+/// A new network namespace contains exactly one device - `lo` - and it is
+/// **DOWN**, with no `127.0.0.1` address. The address is installed by the
+/// kernel in response to the device coming up, not at creation, so a
+/// container that never does this has no loopback at all. An enormous
+/// amount of software binds a local listener for its own IPC and fails in
+/// confusing ways without one, which is why this happens even for
+/// `--network none`.
+///
+/// Built as a fixed 40-byte message on the stack: the child cannot
+/// allocate, and nothing here varies.
+///
+/// # Safety
+///
+/// Child-side safe: one `socket`, one `send`, one `recv`, no allocation.
+pub fn bring_up_loopback() -> Result<(), Errno> {
+    const RTM_NEWLINK: u16 = 16;
+    const NLM_F_REQUEST: u16 = 0x1;
+    const NLM_F_ACK: u16 = 0x4;
+    const IFLA_IFNAME: u16 = 3;
+    const IFF_UP: u32 = 0x1;
+
+    let mut msg = [0u8; 40];
+    // nlmsghdr
+    msg[0..4].copy_from_slice(&40u32.to_ne_bytes());
+    msg[4..6].copy_from_slice(&RTM_NEWLINK.to_ne_bytes());
+    msg[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+    msg[8..12].copy_from_slice(&1u32.to_ne_bytes()); // seq
+    // pid 0: the kernel fills it in
+    // ifinfomsg: family AF_UNSPEC, type 0, index 0, flags IFF_UP, change IFF_UP
+    msg[24..28].copy_from_slice(&IFF_UP.to_ne_bytes());
+    msg[28..32].copy_from_slice(&IFF_UP.to_ne_bytes());
+    // rtattr IFLA_IFNAME = "lo\0"
+    //
+    // By NAME rather than by index 1. A fresh namespace does put `lo` at
+    // index 1, but naming it costs eight bytes and does not depend on that
+    // staying true.
+    msg[32..34].copy_from_slice(&7u16.to_ne_bytes());
+    msg[34..36].copy_from_slice(&IFLA_IFNAME.to_ne_bytes());
+    msg[36..39].copy_from_slice(b"lo\0");
+
+    // Raw libc, not rustix: netlink is three calls and the packet is ours
+    // either way, so the socket loop stays where the message format is.
+    let sock = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if sock < 0 {
+        return Err(last_errno());
+    }
+    let sock = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(sock) };
+
+    let sent = unsafe {
+        libc::send(
+            sock.as_raw_fd(),
+            msg.as_ptr() as *const libc::c_void,
+            msg.len(),
+            0,
+        )
+    };
+    if sent < 0 {
+        return Err(last_errno());
+    }
+
+    // The ACK carries the kernel's errno for the request, which is the only
+    // way to find out it was rejected: `send` succeeding says nothing.
+    let mut reply = [0u8; 256];
+    let n = unsafe {
+        libc::recv(
+            sock.as_raw_fd(),
+            reply.as_mut_ptr() as *mut libc::c_void,
+            reply.len(),
+            0,
+        )
+    };
+    if n < 0 {
+        return Err(last_errno());
+    }
+    if n as usize >= 20 {
+        let kind = u16::from_ne_bytes([reply[4], reply[5]]);
+        // NLMSG_ERROR == 2; an error field of 0 is an acknowledgement.
+        if kind == 2 {
+            let err = i32::from_ne_bytes([reply[16], reply[17], reply[18], reply[19]]);
+            if err != 0 {
+                return Err(Errno::from_raw_os_error(-err));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

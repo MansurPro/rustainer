@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 HOST=${1:-}
 [ -n "$HOST" ] || { sed -n '2,16p' "$0" >&2; exit 2; }
 shift
-STAGES=${*:-1 2 3 4 5 6 7}
+STAGES=${*:-1 2 3 4 5 6 7 8}
 
 ARCH=$(ssh -o BatchMode=yes "$HOST" 'uname -m')
 case "$ARCH" in

@@ -75,10 +75,21 @@ impl Namespaces {
     };
 
     /// Stage 2: adds the mount namespace, which is what makes a private root
-    /// filesystem possible. Network is stage 8.
+    /// filesystem possible.
     pub const STAGE2: Self = Self {
         mount: true,
         ..Self::STAGE1
+    };
+
+    /// Stage 8: a network stack of its own, containing only loopback.
+    ///
+    /// This is the default from here on. Host networking reaches every
+    /// host-local service, including anything trusting 127.0.0.1 and the
+    /// cloud metadata address, and defaults are the hardest thing to
+    /// change later (RND.md §17).
+    pub const STAGE8: Self = Self {
+        net: true,
+        ..Self::STAGE2
     };
 
     fn to_clone_flags(self) -> u64 {
@@ -295,6 +306,7 @@ pub fn spawn(
         spec.workdir.as_deref(),
         mounts,
         cgroup_fd.is_some(),
+        spec.namespaces.net,
         security,
         stdio,
         exec_fifo,
