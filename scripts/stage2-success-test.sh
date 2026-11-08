@@ -129,13 +129,16 @@ check "the root mount names the bound subtree, which is not a leak" \
 HOST_MOUNTS=$(wc -l < /proc/self/mountinfo)
 CT_MOUNTS=$(R /bin/sh -c 'wc -l < /proc/self/mountinfo' | tr -d ' ')
 echo "  host has $HOST_MOUNTS mounts, container has $CT_MOUNTS"
-# No fixed ceiling: the rootless path costs one extra mount per device node,
-# because each is bind-mounted rather than created with mknod. What matters
-# is that the host's tree was replaced, not inherited.
-if [ "${CT_MOUNTS:-0}" -lt "$HOST_MOUNTS" ]; then
-    ok "the container's mount table is its own, not an inherited copy"
+# Not a count comparison: the container can legitimately have MORE mounts
+# than the host, because masked paths are mounts and the rootless path binds
+# each device node separately. What must hold is that every mount point in
+# the container is one we put there - nothing of the host's tree survived.
+STRAY=$(R /bin/sh -c 'awk "{print \$5}" /proc/self/mountinfo' 2>/dev/null \
+    | grep -vE '^/$|^/proc|^/dev|^/sys' | tr '\n' ' ')
+if [ -z "$STRAY" ]; then
+    ok "every mount in the container is one we created"
 else
-    bad "the container has $CT_MOUNTS mounts against the host's $HOST_MOUNTS"
+    bad "the container has mounts we did not create: $STRAY"
 fi
 for host_only in /run /boot; do
     if [ "$(R /bin/sh -c "grep -c \" $host_only \" /proc/self/mountinfo")" = "0" ]; then

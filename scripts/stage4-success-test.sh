@@ -66,7 +66,16 @@ BASE="/sys/fs/cgroup${OWN%/}"
 # with the session, and moving its processes around would disturb the
 # machine rather than prepare it. There, use
 # `systemd-run --scope -p Delegate=yes` to get a scope of our own instead.
-if [ "$CG_MODE" = unified ] && [ "$OWN" = "/" ] && [ -w "$BASE/cgroup.procs" ]; then
+# Two shapes are safe to prepare: our own cgroup namespace root (a
+# container), and a transient scope we created ourselves - systemd-run names
+# those `run-pNNN-iNNN.scope`. A login session's own scope is deliberately
+# NOT matched: moving someone's shell around to run a test is rude.
+PREPARABLE=no
+case "$OWN" in
+    /) PREPARABLE=yes ;;
+    */run-p*.scope) PREPARABLE=yes ;;
+esac
+if [ "$CG_MODE" = unified ] && [ "$PREPARABLE" = yes ] && [ -w "$BASE/cgroup.procs" ]; then
     # Two traps here, both of which silently skip the whole step:
     #   - `[ -s file ]` is false for every cgroupfs file, because they all
     #     report st_size 0 however much they contain.

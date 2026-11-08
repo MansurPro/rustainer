@@ -47,8 +47,8 @@ is easier to reason about once the process model is not also in question.
 | 2 | A real root filesystem (`pivot_root`) | **Done** |
 | 3 | Lifecycle, supervision and state | **Done** |
 | 4 | Resource limits (cgroup v2) | **Done** |
-| 5 | Security controls (capabilities, seccomp) | Next |
-| 6 | Pull and unpack a real image — `run alpine echo hello` | |
+| 5 | Security controls (capabilities, seccomp) | **Done** |
+| 6 | Pull and unpack a real image — `run alpine echo hello` | Next |
 | 7 | Layered filesystem (OverlayFS) | |
 | 8 | A network namespace of its own | |
 | 9 | Bridge, NAT and the outside world | |
@@ -71,6 +71,7 @@ sudo bash scripts/stage1-success-test.sh
 sudo bash scripts/stage2-success-test.sh
 sudo bash scripts/stage3-success-test.sh
 sudo bash scripts/stage4-success-test.sh
+sudo bash scripts/stage5-success-test.sh
 
 # or with no root at all, if /proc/sys/user/max_user_namespaces > 0
 unshare --user --map-root-user bash scripts/stage2-success-test.sh
@@ -94,7 +95,8 @@ files to `/tmp`, and runs the tests in an unprivileged user namespace.
 
 ```sh
 rustainer run -d --rootfs ./alpine-rootfs --network host --hostname boxy \
-    -m 512m --cpus 1.5 --pids-limit 128 /bin/sh -c 'sleep 60'
+    -m 512m --cpus 1.5 --pids-limit 128 \
+    --user 1000:1000 --cap-drop ALL /bin/sh -c 'sleep 60'
 rustainer ps
 rustainer logs <id>
 rustainer stop -t 5 <id>
@@ -113,8 +115,20 @@ silently degraded to no limits. A requested limit that cannot be applied is a
 hard error, because `--memory=512m` accepted and never enforced is how a host
 OOMs three weeks later.
 
-There is still no image, no layering, no capability or seccomp work, and no
-network isolation. The flags refuse rather than pretend:
+Security controls are on by default: Docker's fourteen capabilities and no
+more, `no_new_privs`, a seccomp filter whose first instruction is a
+fail-closed architecture check, and Docker's masked and read-only path lists.
+`--cap-add`, `--cap-drop`, `--user` and `--security-opt seccomp=<file>` adjust
+them; an OCI seccomp profile written for runc or Docker loads unchanged.
+
+Those three are **one property**, not three hardening items: masked paths are
+per-superblock, so a container that can still call `mount(2)` simply mounts a
+second procfs and gets an unmasked one. They count only together with
+`CAP_SYS_ADMIN` absent from the bounding set and the mount family denied by
+seccomp — the property being enforced is *the container cannot obtain a
+writable `/proc/sys`*.
+
+There is still no image, no layering, and no network isolation. The flags refuse rather than pretend:
 `--network bridge` names stage 9, and a `--rootfs` that is not a directory
 says so.
 

@@ -39,6 +39,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::cgroup::{self, Cgroup, Limits};
+use crate::security::{self, CapabilitySet, Security, UserSpec};
 use crate::state::{self, Lock, Paths, State, Status};
 use crate::{Exit, MountPlan, Namespaces, Privileges, Spec, mount, sys};
 
@@ -62,6 +63,23 @@ pub struct Config {
     pub cpus: Option<f64>,
     #[serde(default)]
     pub pids: Option<u64>,
+    /// Capabilities kept in the bounding set, by name. `None` means the
+    /// default set.
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    pub user: Option<UserSpec>,
+    /// A seccomp profile as JSON, or `None` for the default one.
+    #[serde(default)]
+    pub seccomp: Option<serde_json::Value>,
+    /// Install no filter at all.
+    ///
+    /// A separate flag rather than `seccomp: Some(Null)`, because
+    /// `Option<Value>` round-trips a JSON `null` back to `None` - so the
+    /// marker for "explicitly unconfined" was indistinguishable from
+    /// "unspecified" the moment it passed through the config file.
+    #[serde(default)]
+    pub seccomp_unconfined: bool,
 }
 
 impl Config {
@@ -99,6 +117,43 @@ impl Config {
         }
     }
 
+    /// The resolved security posture, compiled parent-side.
+    pub fn security(&self) -> Result<Security, Error> {
+        let keep = match &self.capabilities {
+            None => security::default_capabilities(),
+            Some(names) => {
+                let mut set = CapabilitySet::empty();
+                for n in names {
+                    match security::capability_by_name(n) {
+                        Some(c) => set |= c,
+                        None => {
+                            return Err(Error::Io(std::io::Error::other(format!(
+                                "unknown capability {n:?}"
+                            ))));
+                        }
+                    }
+                }
+                set
+            }
+        };
+        let profile = if self.seccomp_unconfined {
+            None
+        } else {
+            match &self.seccomp {
+                None => Some(security::default_profile()),
+                Some(v) => Some(
+                    serde_json::from_value(v.clone())
+                        .map_err(|e| security::SeccompError::Parse(e.to_string()))?,
+                ),
+            }
+        };
+        let filter = match profile {
+            None => Vec::new(),
+            Some(p) => security::compile(&p)?,
+        };
+        Ok(Security::build(keep, self.user.clone(), filter))
+    }
+
     pub fn mount_plan(&self, cgroup_dir: Option<&Path>) -> Result<Option<MountPlan>, Error> {
         match &self.rootfs {
             None => Ok(None),
@@ -119,6 +174,8 @@ pub enum Error {
     Plan(#[from] mount::PlanError),
     #[error(transparent)]
     Cgroup(#[from] cgroup::Error),
+    #[error(transparent)]
+    Seccomp(#[from] security::SeccompError),
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("syscall: {0}")]
@@ -204,7 +261,12 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     // --- the start rendezvous ------------------------------------------
     let fifo_path = paths.fifo(id);
     if !fifo_path.exists() {
-        sys::mkfifo(&cpath(&fifo_path)?, 0o600)?;
+        // 0622, deliberately: the container's init opens this for writing
+        // *after* dropping to a non-root user, so a 0600 FIFO owned by the
+        // engine would be unopenable and every container would hang at the
+        // rendezvous. What contains it is the mode of the state directory,
+        // which is asserted 0700 on every startup (RND.md §5.5).
+        sys::mkfifo(&cpath(&fifo_path)?, 0o622)?;
     }
     // O_PATH, not O_WRONLY: a write-open would block here, before the child
     // even exists.
@@ -233,6 +295,7 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     let spawned = crate::spawn(
         &spec,
         mounts,
+        Some(config.security()?),
         Some(stdio),
         Some(fifo_opath),
         cg.as_ref().map(|c| c.fd()),
@@ -567,6 +630,10 @@ mod tests {
             memory: None,
             cpus: None,
             pids: None,
+            capabilities: None,
+            user: None,
+            seccomp: None,
+            seccomp_unconfined: false,
         };
         c.store(&paths).unwrap();
         let back = Config::load(&paths, "c1").unwrap();

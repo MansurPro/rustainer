@@ -32,6 +32,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 
 use crate::mount::{self, PlannedOp};
+use crate::security::{self, Security};
 use crate::sys::{self, Error as Errno, OwnedFd};
 
 /// Which step failed, so the parent can say so without guessing.
@@ -46,6 +47,7 @@ pub enum Step {
     Stdio = 6,
     AwaitStart = 7,
     CgroupNamespace = 8,
+    Security = 9,
 }
 
 impl Step {
@@ -59,6 +61,7 @@ impl Step {
             6 => Step::Stdio,
             7 => Step::AwaitStart,
             8 => Step::CgroupNamespace,
+            9 => Step::Security,
             _ => return None,
         })
     }
@@ -73,6 +76,7 @@ impl Step {
             Step::Stdio => "attaching the container's standard streams",
             Step::AwaitStart => "waiting at the start rendezvous",
             Step::CgroupNamespace => "unsharing the cgroup namespace",
+            Step::Security => "applying the security posture",
         }
     }
 }
@@ -95,8 +99,16 @@ pub fn decode(record: &[u8]) -> Option<(Step, u8, Errno)> {
         return None;
     }
     let step = Step::from_u8(record[0])?;
-    let errno = i32::from_ne_bytes([record[4], record[5], record[6], record[7]]);
-    Some((step, record[1], Errno::from_raw_os_error(errno)))
+    let raw = i32::from_ne_bytes([record[4], record[5], record[6], record[7]]);
+    // rustix's `from_raw_os_error` panics on a value that is not a real
+    // errno, and this record arrives over a pipe. A corrupt or truncated
+    // one must not take the supervisor down with it.
+    let errno = if (1..=4095).contains(&raw) {
+        Errno::from_raw_os_error(raw)
+    } else {
+        Errno::INVAL
+    };
+    Some((step, record[1], errno))
 }
 
 /// Everything the child touches, pre-encoded parent-side.
@@ -122,6 +134,9 @@ pub struct ChildPlan {
     /// Empty when the container keeps the host's filesystem view.
     mount_ops: Vec<PlannedOp>,
     rootfs: Option<CString>,
+    /// Capabilities, user and seccomp. Applied last, because every step of
+    /// it gives something away.
+    security: Option<Security>,
     /// Descriptors to put on 0, 1 and 2 immediately before `execve`.
     stdio: Option<Stdio>,
     /// The start rendezvous.
@@ -157,6 +172,7 @@ impl ChildPlan {
         hostname: Option<&OsStr>,
         mounts: Option<mount::MountPlan>,
         cgroup_ns: bool,
+        security: Option<Security>,
         stdio: Option<Stdio>,
         exec_fifo: Option<OwnedFd>,
         proceed_rx: OwnedFd,
@@ -218,6 +234,7 @@ impl ChildPlan {
             envp: envp_ptrs,
             hostname,
             cgroup_ns,
+            security,
             mount_ops,
             rootfs,
             stdio,
@@ -292,7 +309,7 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         fail(plan, Step::SetHostname, 0, e);
     }
 
-    // 5. Attach the standard streams. After this point the child has no
+    // 8. Attach the standard streams. After this point the child has no
     //    way to report anything except through `err_tx`, which is why the
     //    failure record exists at all.
     if let Some(io) = &plan.stdio {
@@ -303,22 +320,42 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
         }
     }
 
-    // 6. Block at the start rendezvous.
+    // 5. Open the start rendezvous - but do not wait on it yet.
     //
-    // `open(O_WRONLY)` on a FIFO blocks until a reader opens it, so this is
-    // where a created-but-not-started container waits. Re-opening through
-    // /proc/self/fd is what makes it reachable after the pivot. Everything
-    // above this line is setup; everything below is the user's program.
+    // The open must happen while we are still root. After the uid change
+    // the process is non-dumpable, which makes `/proc/<pid>/fd` root-owned
+    // and mode 0500, so re-opening an `O_PATH` descriptor through it fails
+    // EACCES for the container's user. The symptom is every non-root
+    // container hanging at startup with nothing in the logs.
+    //
+    // `open(O_WRONLY)` on a FIFO blocks until a reader appears, so this is
+    // where a created-but-not-started container waits - holding only our
+    // init's credentials, having exec'd nothing.
+    let mut started: Option<OwnedFd> = None;
     if let Some((_fd, proc_path)) = &plan.exec_fifo {
         match sys::open_write_blocking(proc_path) {
-            Ok(w) => {
-                let _ = sys::write(&w, &[0u8]);
-            }
+            Ok(w) => started = Some(w),
             Err(e) => fail(plan, Step::AwaitStart, 0, e),
         }
     }
 
-    // 7. Become the container command. `err_tx` is O_CLOEXEC, so a successful
+    // 6. Give away privilege: bounding set, user, no_new_privs, seccomp.
+    //
+    // As close to execve as possible, so as few of our own syscalls as
+    // possible run under the filter. Everything above this line needed
+    // privilege; nothing below it does.
+    if let Some(sec) = &plan.security
+        && let Err((step, e)) = unsafe { security::apply(sec) }
+    {
+        fail(plan, Step::Security, step as u8, e);
+    }
+
+    // 7. Announce that we are started, now that the posture is in place.
+    if let Some(w) = &started {
+        let _ = sys::write(w, &[0u8]);
+    }
+
+    // 9. Become the container command. `err_tx` is O_CLOEXEC, so a successful
     //    execve closes it and the parent sees EOF — that, and not a success
     //    message, is how the parent learns this worked.
     let e = unsafe { sys::execve(plan.exe, plan.argv.as_ptr(), plan.envp.as_ptr()) };
@@ -350,6 +387,7 @@ mod tests {
             Some(OsStr::new("box")),
             None,
             false,
+            None,
             None,
             None,
             rx,
@@ -392,6 +430,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             rx,
             tx,
         );
@@ -409,6 +448,7 @@ mod tests {
             Step::Stdio,
             Step::AwaitStart,
             Step::CgroupNamespace,
+            Step::Security,
         ] {
             let encoded = encode(step, 7, Errno::NOENT);
             let (got_step, detail, got_errno) = decode(&encoded).expect("decode");
@@ -419,7 +459,16 @@ mod tests {
             );
             assert_eq!(got_errno, Errno::NOENT);
         }
-        assert!(decode(&[9, 0, 0, 0, 0, 0, 0, 0]).is_none(), "unknown step");
+        assert!(
+            decode(&[200, 0, 0, 0, 0, 0, 0, 0]).is_none(),
+            "unknown step"
+        );
+        // A corrupt errno must not panic: rustix refuses to build an Errno
+        // from a value that is not one.
+        assert_eq!(
+            decode(&[1, 0, 0, 0, 0, 0, 0, 0]).map(|(_, _, e)| e),
+            Some(Errno::INVAL)
+        );
         assert!(decode(&[1, 2, 3]).is_none(), "short record");
     }
 
@@ -434,6 +483,7 @@ mod tests {
             Step::Stdio,
             Step::AwaitStart,
             Step::CgroupNamespace,
+            Step::Security,
         ] {
             assert!(!step.describe().is_empty());
         }
