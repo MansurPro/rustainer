@@ -54,11 +54,13 @@ jobs:
         run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage1-success-test.sh
       - name: Stage 2 success test
         run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage2-success-test.sh
+      - name: Stage 3 success test
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage3-success-test.sh
       # The same stages with no root at all, in a user namespace. This is not
       # redundant: it takes the rootless code paths - device nodes bound
       # instead of mknod'd, /sys bound instead of mounted - and it is the
       # standing check that the privilege seam of RND.md 18.6 still holds.
-      - name: Stages 1 and 2, unprivileged
+      - name: Stages 1-3, unprivileged
         run: |
           # Ubuntu 24.04 ships an AppArmor brake on unprivileged user
           # namespaces, so `unshare -U` fails with "write failed
@@ -73,7 +75,7 @@ jobs:
             echo "::error::unprivileged user namespaces are unavailable on this runner"
             exit 1
           }
-          for s in 1 2; do
+          for s in 1 2 3; do
             unshare --user --map-root-user \
               env RUSTAINER_BIN="$PWD/target/release/rustainer" \
               bash "scripts/stage${s}-success-test.sh"

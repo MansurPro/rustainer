@@ -53,6 +53,11 @@ MSG
     exit 2
 fi
 
+# Own state root, so a test run never touches a real one.
+STATE=$(mktemp -d "${TMPDIR:-/tmp}/rustainer-stage1.XXXXXX")
+export RUSTAINER_ROOT="$STATE"
+trap 'rm -rf "$STATE"' EXIT
+
 echo "kernel $(uname -r) $(uname -m), uid $(id -u), userns $(readlink /proc/self/ns/user)"
 # CI builds as the unprivileged runner and passes the binary in, because
 # rustup has no default toolchain for root and installing one just to build
@@ -71,18 +76,11 @@ HOST_NS=$(readlink /proc/self/ns/pid)
 HOST_IPC=$(readlink /proc/self/ns/ipc)
 HOST_HN=$(hostname)
 
-# The direct child of a pid, without procps: ppid is the second field after
-# the last ')' in /proc/<pid>/stat. Split on the LAST ')', because a process
-# can be named "foo) 0 R".
-childof() {
-    for d in /proc/[0-9]*; do
-        [ -r "$d/stat" ] || continue
-        if [ "$(sed 's/.*) //' "$d/stat" | cut -d' ' -f2)" = "$1" ]; then
-            basename "$d"
-            return
-        fi
-    done
-}
+# The container's init pid, asked of our own tooling rather than guessed
+# from the process tree. From stage 3 the CLI is deliberately NOT the
+# container's parent - a supervisor is - so walking children of the CLI
+# would find the supervisor, not init.
+init_pid() { "$B" ps | awk 'NR>1 && $2 == "running" {print $3; exit}'; }
 
 echo
 echo "1. The container is in namespaces of its own"
@@ -105,7 +103,7 @@ echo
 echo "3. Signal death is reported as signal death, not as an exit code"
 # The signal must come from an ancestor namespace. See test 4 for why.
 "$B" run --rootfs / --network host /bin/sleep 20 >/dev/null 2>&1 & RP=$!
-sleep 0.5; C=$(childof "$RP")
+sleep 0.8; C=$(init_pid)
 if [ -n "$C" ]; then
     kill -KILL "$C"; wait "$RP"; check "SIGKILL from an ancestor -> 128+9" "$?" "137"
 else
@@ -119,7 +117,7 @@ echo "4. PID 1 semantics - the part that surprises people"
 # namespace. `stop` therefore cannot assume that signalling means leaving,
 # which is why stage 3's grace period is real rather than decorative.
 "$B" run --rootfs / --network host /bin/sleep 20 >/dev/null 2>&1 & RP=$!
-sleep 0.5; C=$(childof "$RP")
+sleep 0.8; C=$(init_pid)
 if [ -n "$C" ]; then
     kill -TERM "$C"; sleep 0.5
     if kill -0 "$C" 2>/dev/null; then

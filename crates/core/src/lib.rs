@@ -26,7 +26,9 @@
 
 pub mod child;
 pub mod mount;
-mod sys;
+pub mod state;
+pub mod supervise;
+pub mod sys;
 
 use std::ffi::OsString;
 
@@ -182,16 +184,50 @@ fn describe(step: Step, detail: Option<&'static str>) -> String {
     }
 }
 
-/// Create the container, run it to completion, and report how it ended.
+/// A container process that exists but has not necessarily started.
+pub struct Spawned {
+    pub pid: i32,
+    /// From `clone3(CLONE_PIDFD)` — no race at all, and no PID-reuse window.
+    /// Pollable, so a death composes with the start rendezvous in one
+    /// `poll` rather than a timer loop.
+    pub pidfd: sys::OwnedFd,
+    labels: Vec<&'static str>,
+    err_rx: sys::OwnedFd,
+}
+
+impl Spawned {
+    /// The child's failure report, if it sent one.
+    ///
+    /// Reads until EOF, which a successful `execve` produces by closing the
+    /// `O_CLOEXEC` write end. **Do not call this while the child may be
+    /// parked at the start rendezvous** — it has not reached `execve` yet,
+    /// so the pipe is still open and this would block. Call it after the
+    /// pidfd says the child is gone.
+    pub fn start_failure(&self) -> Option<Error> {
+        let (step, index, errno) = read_failure_record(&self.err_rx)?;
+        let detail = if step == Step::Mount {
+            self.labels.get(index as usize).copied()
+        } else {
+            None
+        };
+        Some(Error::ChildFailed {
+            step,
+            detail,
+            errno,
+        })
+    }
+}
+
+/// Create the container process. Returns in the parent only.
 ///
-/// Blocks until the container's init process exits. The caller is the
-/// container's parent, which is correct for stages 1–2 and *wrong* from
-/// stage 3 onward: the CLI must never be in the container's process
-/// ancestry, or detach, `ps` after the CLI exits, exit-code collection and
-/// restart policies all become changes to the process topology rather than
-/// features (RND.md §18.2). Stage 3 forks a supervisor and calls this from
-/// there; the signature does not change.
-pub fn run(spec: &Spec, mounts: Option<MountPlan>) -> Result<Exit, Error> {
+/// The caller decides the topology: stages 1–2 call [`run`], which waits
+/// here; from stage 3 the supervisor calls this and keeps the pidfd.
+pub fn spawn(
+    spec: &Spec,
+    mounts: Option<MountPlan>,
+    stdio: Option<child::Stdio>,
+    exec_fifo: Option<sys::OwnedFd>,
+) -> Result<Spawned, Error> {
     // A mount plan without a mount namespace would be applied to the host:
     // every mount leaks, and `pivot_root` repoints the *host's* root. Refuse
     // rather than trust the caller to have set both.
@@ -218,11 +254,13 @@ pub fn run(spec: &Spec, mounts: Option<MountPlan>) -> Result<Exit, Error> {
         None
     };
     let plan = ChildPlan::build(
-        &spec.exe, &spec.argv, &spec.envp, hostname, mounts, proceed_rx, err_tx,
+        &spec.exe, &spec.argv, &spec.envp, hostname, mounts, stdio, exec_fifo, proceed_rx, err_tx,
     )?;
 
+    let mut pidfd_slot: i32 = -1;
     let mut args = sys::clone_args_zeroed();
-    args.flags = spec.namespaces.to_clone_flags();
+    args.flags = spec.namespaces.to_clone_flags() | sys::CLONE_PIDFD;
+    args.pidfd = &mut pidfd_slot as *mut i32 as u64;
     // Not ORed into `flags` - that is clone(2)'s convention and clone3
     // rejects it there. Without this the parent gets no SIGCHLD and the
     // child is not waitable as a child.
@@ -249,9 +287,9 @@ pub fn run(spec: &Spec, mounts: Option<MountPlan>) -> Result<Exit, Error> {
 
         Ok(Cloned::Parent(pid)) => {
             // The parent holds its own copies of the child's pipe ends.
-            // Until they are closed, the read below can never see EOF - and
-            // EOF is precisely how a successful execve is reported. Dropping
-            // the plan here is load-bearing, not tidiness.
+            // Until they are closed, a read can never see EOF - and EOF is
+            // precisely how a successful execve is reported. Dropping the
+            // plan here is load-bearing, not tidiness.
             drop(plan);
 
             // The go-ahead. EPIPE means the child is already gone, which the
@@ -261,28 +299,37 @@ pub fn run(spec: &Spec, mounts: Option<MountPlan>) -> Result<Exit, Error> {
             let _ = sys::write(&proceed_tx, &[1u8]);
             drop(proceed_tx);
 
-            let failure = read_failure_record(&err_rx);
-
-            // Reap first, always: a child that failed is still a child, and
-            // leaving it unreaped to report an error faster is how zombies
-            // accumulate.
-            let status = reap(pid);
-
-            if let Some((step, index, errno)) = failure {
-                let detail = if step == Step::Mount {
-                    labels.get(index as usize).copied()
-                } else {
-                    None
-                };
-                return Err(Error::ChildFailed {
-                    step,
-                    detail,
-                    errno,
-                });
-            }
-            status
+            // SAFETY: the kernel wrote a valid descriptor here, because
+            // CLONE_PIDFD was set and the clone succeeded.
+            let pidfd =
+                unsafe { <sys::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(pidfd_slot) };
+            Ok(Spawned {
+                pid,
+                pidfd,
+                labels,
+                err_rx,
+            })
         }
     }
+}
+
+/// Create the container, run it to completion, and report how it ended.
+///
+/// Used by stages 1–2 and by tests. From stage 3 the CLI goes through
+/// [`supervise`] instead, because the CLI must never be in the container's
+/// process ancestry (RND.md §18.2).
+pub fn run(spec: &Spec, mounts: Option<MountPlan>) -> Result<Exit, Error> {
+    let spawned = spawn(spec, mounts, None, None)?;
+    // Safe to read to EOF here: no start rendezvous was given, so the child
+    // runs straight through to execve.
+    let failure = spawned.start_failure();
+    // Reap first, always: a child that failed is still a child, and leaving
+    // it unreaped to report an error faster is how zombies accumulate.
+    let status = reap_pid(spawned.pid);
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    status
 }
 
 fn flush_stdio() {
@@ -312,7 +359,7 @@ fn read_failure_record(err_rx: &sys::OwnedFd) -> Option<(Step, u8, Errno)> {
     child::decode(&buf[..n])
 }
 
-fn reap(pid: libc::pid_t) -> Result<Exit, Error> {
+pub(crate) fn reap_pid(pid: libc::pid_t) -> Result<Exit, Error> {
     let pid = sys::Pid::from_raw(pid).ok_or(Error::NoWaitStatus)?;
     loop {
         match sys::waitpid(Some(pid), sys::WaitOptions::empty()) {

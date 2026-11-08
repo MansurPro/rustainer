@@ -13,6 +13,8 @@
 //! | `execve` | `not_implemented::quite_yet` |
 //! | `_exit` | `not_implemented::quite_yet` |
 //! | `mount_setattr` | `not_implemented::yet` |
+//! | `sigprocmask` | `not_implemented::libc_internals` |
+//! | `signalfd` | not wrapped |
 //!
 //! Everything else in the create path — `sethostname`, `pipe2`, `read`,
 //! `write`, `waitpid` — `rustix` provides, and `rustix`'s versions issue the
@@ -213,10 +215,10 @@ fn read_small(path: &core::ffi::CStr) -> Result<Vec<u8>, Errno> {
 // ---------------------------------------------------------------------------
 
 pub use rustix::io::{Errno as Error, read, write};
-pub use rustix::pipe::{PipeFlags, pipe_with};
+pub use rustix::pipe::{PipeFlags, pipe, pipe_with};
 pub use rustix::process::{Pid, WaitOptions, waitpid};
 pub use rustix::system::sethostname;
-pub use std::os::fd::OwnedFd;
+pub use std::os::fd::{AsRawFd, OwnedFd};
 
 // ---------------------------------------------------------------------------
 // Filesystem and mount surface
@@ -377,6 +379,124 @@ pub fn chdir(path: &CStr) -> Result<(), Errno> {
 
 pub fn pivot_root(new_root: &CStr, put_old: &CStr) -> Result<(), Errno> {
     rustix::process::pivot_root(new_root, put_old)
+}
+
+// ---------------------------------------------------------------------------
+// Process supervision
+// ---------------------------------------------------------------------------
+
+pub use rustix::event::{PollFd, PollFlags, poll};
+pub use rustix::process::{
+    PidfdFlags, Signal, kill_process, pidfd_open, set_child_subreaper, setsid,
+};
+
+pub fn dup_onto(src: &OwnedFd, target_raw: i32) -> Result<(), Errno> {
+    // Not rustix::io::dup2, which wants an OwnedFd for the destination and
+    // would close 0/1/2 on drop. The raw call is what we mean: overwrite
+    // this descriptor number, and leave the result NOT close-on-exec, which
+    // dup2 guarantees and is exactly what stdio must be across execve.
+    let rc = unsafe { libc::dup2(src.as_raw_fd(), target_raw) };
+    if rc < 0 { Err(last_errno()) } else { Ok(()) }
+}
+
+pub fn mkfifo(path: &CStr, mode: u32) -> Result<(), Errno> {
+    use rustix::fs::{CWD, Mode, mkfifoat};
+    mkfifoat(CWD, path, Mode::from_bits_truncate(mode))
+}
+
+/// `open(path, O_WRONLY)` — blocks on a FIFO until a reader is present.
+pub fn open_write_blocking(path: &CStr) -> Result<OwnedFd, Errno> {
+    use rustix::fs::{Mode, OFlags, open};
+    open(path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())
+}
+
+/// `open(path, O_RDONLY|O_NONBLOCK)`.
+///
+/// Non-blocking is the whole point: `open(O_RDONLY)` on a FIFO blocks until
+/// a writer appears, and doing that while holding the per-container lock
+/// wedges every other command on that container if the init process died
+/// before it reached the FIFO (RND.md §7.2).
+pub fn open_read_nonblocking(path: &CStr) -> Result<OwnedFd, Errno> {
+    use rustix::fs::{Mode, OFlags, open};
+    open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+/// An `O_PATH` reference to the FIFO, to be handed to the container init.
+///
+/// `O_PATH` and not `O_WRONLY`: a real write-open would block right here,
+/// before the child is even cloned. The init side turns it back into a
+/// writable descriptor through `/proc/self/fd/<n>` after the pivot, which
+/// is also why that path has to be built parent-side.
+pub fn open_path_file(path: &CStr) -> Result<OwnedFd, Errno> {
+    use rustix::fs::{Mode, OFlags, open};
+    open(path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
+}
+
+pub fn open_devnull() -> Result<OwnedFd, Errno> {
+    use rustix::fs::{Mode, OFlags, open};
+    open(c"/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+}
+
+// --- signals, without handlers ---------------------------------------------
+//
+// We never install a signal handler. A handler runs on an arbitrary thread
+// at an arbitrary point and may only call async-signal-safe functions, which
+// is the same constraint as the post-clone window and just as easy to
+// violate. Blocking the signals and reading them as bytes from a descriptor
+// turns them into ordinary poll-able events instead.
+
+/// Block these signals in the calling thread, so they queue rather than act.
+///
+/// Must happen **before** the signalfd is created, or a signal delivered in
+/// between takes its default action - which for SIGINT and SIGTERM is to
+/// kill us.
+pub fn block_signals(signals: &[i32]) -> Result<(), Errno> {
+    unsafe {
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for s in signals {
+            libc::sigaddset(&mut set, *s);
+        }
+        if libc::sigprocmask(libc::SIG_BLOCK, &set, core::ptr::null_mut()) < 0 {
+            return Err(last_errno());
+        }
+    }
+    Ok(())
+}
+
+pub fn signalfd(signals: &[i32]) -> Result<OwnedFd, Errno> {
+    use std::os::fd::FromRawFd;
+    unsafe {
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for s in signals {
+            libc::sigaddset(&mut set, *s);
+        }
+        let fd = libc::signalfd(-1, &set, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
+        if fd < 0 {
+            return Err(last_errno());
+        }
+        Ok(OwnedFd::from_raw_fd(fd))
+    }
+}
+
+/// Read one queued signal number, or `None` if the descriptor is drained.
+pub fn read_signal(fd: &OwnedFd) -> Result<Option<i32>, Errno> {
+    // `struct signalfd_siginfo` is 128 bytes and `ssi_signo` is its first
+    // `__u32`. We need nothing else from it.
+    let mut buf = [0u8; 128];
+    match read(fd, &mut buf) {
+        Ok(128) => Ok(Some(
+            u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as i32
+        )),
+        Ok(_) => Ok(None),
+        Err(Errno::AGAIN) | Err(Errno::INTR) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

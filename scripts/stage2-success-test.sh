@@ -74,6 +74,8 @@ echo "rootfs tarball sha256: $(sha256sum "$CACHE" | cut -d' ' -f1)"
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/rustainer-stage2.XXXXXX")
 cleanup() { rm -rf "$SCRATCH" 2>/dev/null; }
 trap cleanup EXIT
+# Own state root, so a test run never touches a real one.
+export RUSTAINER_ROOT="$SCRATCH/state"
 ROOTFS="$SCRATCH/rootfs"
 ROOTFS_B="$SCRATCH/rootfs-b"
 mkdir -p "$ROOTFS" "$ROOTFS_B"
