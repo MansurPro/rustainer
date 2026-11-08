@@ -98,11 +98,16 @@ fi
 
 echo
 echo "1. A bridged container has an address and a route"
-# `ip -4 addr show` and grep, not `-o`: busybox's ip has no -o.
-IP=$(R /bin/sh -c 'ip addr show eth0 2>/dev/null | awk "/inet /{print \$2}"' 2>/dev/null | tail -1)
-echo "  container address: $IP"
+# `ip addr` and grep, not `-o` or a per-device filter: busybox's ip has
+# neither. Stderr is shown when it comes back empty, because an empty
+# answer here almost always means the container never started.
+IP=$(R /bin/sh -c 'ip addr 2>/dev/null | grep -o "inet 172\.30\.[0-9.]*"' 2>/dev/null | tail -1)
+if [ -z "$IP" ]; then
+    echo "  (no address; container output was:)"
+    R /bin/sh -c 'ip addr' 2>&1 | tail -4 | sed 's/^/    /'
+fi
 case "$IP" in
-    172.30.*/16) ok "it holds an address from the bridge subnet" ;;
+    "inet 172.30."*) ok "it holds an address from the bridge subnet ($IP)" ;;
     *) bad "no address on eth0 (got '$IP')" ;;
 esac
 # Filter with awk, not `ip route show default`: busybox's ip ignores the

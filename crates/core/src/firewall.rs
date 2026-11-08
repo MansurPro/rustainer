@@ -61,8 +61,22 @@ pub trait Firewall {
     fn name(&self) -> &'static str;
 }
 
-/// Pick a backend, preferring the native one.
+/// Pick a backend, preferring **the one the host is already using**.
+///
+/// Not the newest one. This is the open decision of RND.md §15.5.5 meeting
+/// the unresolved question of §11.5, and the second settles it: an
+/// `accept` in our own nftables table cannot rescue a packet that another
+/// ruleset drops first, at any priority. On a host with existing
+/// `iptables` rules - and `iptables` is `iptables-nft` almost everywhere
+/// now - our rules must land in the same table, in the same evaluation
+/// order, or they are decoration. Docker reaches the same conclusion.
+///
+/// So: if `iptables` can tell us about a FORWARD chain, use it. Only a
+/// host with nothing there gets the native backend.
 pub fn detect() -> Option<Box<dyn Firewall>> {
+    if which("iptables") && iptables_has_forward_chain() {
+        return Some(Box::new(Iptables));
+    }
     if which("nft") {
         return Some(Box::new(Nft));
     }
@@ -70,6 +84,14 @@ pub fn detect() -> Option<Box<dyn Firewall>> {
         return Some(Box::new(Iptables));
     }
     None
+}
+
+fn iptables_has_forward_chain() -> bool {
+    Command::new("iptables")
+        .args(["-S", "FORWARD"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 fn which(tool: &str) -> bool {
