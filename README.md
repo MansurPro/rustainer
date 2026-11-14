@@ -56,6 +56,7 @@ is easier to reason about once the process model is not also in question.
 | 11 | Single-ID rootless | **Done** |
 | 12 | `exec` — a second process in a live container | **Done** |
 | 13 | Docker image compatibility, measured against real registries | **Done** |
+| 14 | Measured against Docker, and what measuring found | **Done** |
 
 The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete, and
 stage 12 begins the additive work §19 held back until the mechanisms were
@@ -348,6 +349,57 @@ incompatibility, so the test falls back to `mirror.gcr.io` — a pull-through
 cache of Hub serving the same manifests, blobs and digests — and **says in
 its output how many images came from the mirror**. That also tests the
 pull-through mirror most corporate networks put in front of Hub.
+
+### Measured against Docker
+
+Both engines in one privileged `docker:28-dind` container, so same kernel,
+same CPU, same disk; 40 samples a row, three runs; `bash scripts/bench.sh 40`.
+Full methodology and the reasons behind each row are in
+[`research/COMPARISON.md`](research/COMPARISON.md).
+
+| measurement | rustainer | Docker 28.5.2 | ratio |
+|---|---:|---:|---:|
+| run a container to exit (median) | 11–12 ms | 82–83 ms | **6.9–7.5×** |
+| start detached, stop, remove | 45 ms | 107–108 ms | 2.4× |
+| exec a command in a live container | 7–8 ms | 28–29 ms | 3.5–4.1× |
+| resident per running container | 1 MiB | 18 MiB | **18×** |
+| resident with nothing running | **0 MiB** | 123–125 MiB | — |
+| binaries installed | 5.1 MiB | 200 MiB | **39.8×** |
+| pull a cold image (network) | 0.9–1.0 s | 2.6–2.7 s | 2.7–3.0× |
+
+Most of that is architecture, not craftsmanship. `docker run` is CLI → HTTP
+over a socket → dockerd → gRPC → containerd → a shim → runc → `clone`:
+five processes and two RPC hops before a namespace exists. `rustainer run`
+is CLI → supervisor → `clone3`. Docker's layers buy a restartable daemon, an
+API, and a runtime boundary other tools plug into; this engine buys none of
+them, and 70 ms is what that costs per container. The one row that is
+implementation rather than design is the per-container memory: a Go process
+doing the shim's job will not reach 1 MiB.
+
+**The first run of this benchmark said rustainer was 5.7× *slower*.** 890 ms
+against 155 ms — and the cause was not in the runtime. `run <image>` went
+through `pull`, and `pull` begins by fetching the manifest, so starting a
+container from an image already on disk cost four TLS round-trips before
+anything was cloned. Slow was the smaller half: a fully cached image was
+**unrunnable with no network**, failing at a DNS lookup for an image whose
+every byte was local. The store is now consulted first — Docker's
+`--pull=missing`, which is Docker's default — and `--pull` still means go and
+check. 890 ms → 11 ms, and it works offline.
+
+No correctness test would have found that. Every image assertion passed
+before and after; the container ran, the layers were right, the config was
+obeyed. It took measuring against another implementation to notice a correct
+answer being produced the expensive way, and the offline failure — a real
+functional bug — was only found by asking why the number was bad. The stage
+14 test pins both: a cached image must start inside `unshare --net`, and
+nothing of ours may be resident once no container is running.
+
+What Docker does that this engine does not is the other half of that table,
+and it is the longer list: image build, push, volumes, user-defined networks
+and embedded DNS, an HTTP API, `events`, restart policies, healthchecks, log
+drivers, Compose, swarm, plugins, checkpoint/restore, Windows, cgroup v1.
+The timings measure starting and supervising a container. They are not a
+claim that one tool replaces the other.
 
 ### The engine does not lie about what it does not know
 

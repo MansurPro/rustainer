@@ -233,11 +233,16 @@ fi
 echo
 echo "7. The store is content-addressed, so a second pull extracts nothing"
 LAYERS_BEFORE=$(find "$RUSTAINER_IMAGE_ROOT" -maxdepth 2 -path '*/layers*/*' -prune -type d 2>/dev/null | wc -l)
+IMAGES_BEFORE=$("$B" images | tail -n +2 | grep -c .)
 timeout 300 "$B" pull "$BUSYBOX" >/dev/null 2>&1
 LAYERS_AFTER=$(find "$RUSTAINER_IMAGE_ROOT" -maxdepth 2 -path '*/layers*/*' -prune -type d 2>/dev/null | wc -l)
+IMAGES_AFTER=$("$B" images | tail -n +2 | grep -c .)
 check "re-pulling an image adds no layer directories" "$LAYERS_AFTER" "$LAYERS_BEFORE"
-check "the image is listed once, not twice" \
-    "$("$B" images | awk '$1 ~ /busybox/' | wc -l | tr -d ' ')" "1"
+# Counted as a delta, not as "there is exactly one busybox". With a
+# persistent store - which is how this test avoids Docker Hub's quota - the
+# same image is legitimately present under both its Hub reference and its
+# mirror reference, and an absolute count would call that a bug.
+check "and no second entry in the image list" "$IMAGES_AFTER" "$IMAGES_BEFORE"
 
 echo
 echo "8. A digest-pinned reference is a valid reference"

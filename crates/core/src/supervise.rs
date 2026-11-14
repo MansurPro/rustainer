@@ -427,6 +427,12 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     // process-group leader - which happens when `supervise` is run straight
     // from an interactive shell - and that is harmless, so tolerate it
     // rather than refusing to start.
+    // Called `exe` otherwise, for every container on the machine. The
+    // supervisor is started by executing `/proc/self/exe` - which is what
+    // makes the CVE-2019-5736 seal work - and the kernel names a process
+    // after the final component of the path it executed.
+    let _ = sys::set_process_name("rustainer-sup");
+
     let _ = sys::setsid();
 
     // For descendants only. The search in `find_new_reaper` never crosses a

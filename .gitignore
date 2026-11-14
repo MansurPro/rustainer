@@ -8,3 +8,6 @@
 # cross-built artefacts from scripts/remote-test.sh
 /rustainer-musl-*
 /rustainer-core-tests-*
+
+# Static binary built for benchmarking inside docker-in-docker.
+/rustainer-musl
