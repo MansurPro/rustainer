@@ -344,6 +344,19 @@ struct BuildArgs {
     #[arg(long = "build-arg")]
     build_args: Vec<String>,
 
+    /// The network a RUN step gets: `bridge`, `none`, `host`, or one
+    /// you created. The same values `run --network` takes, because a
+    /// step is an ordinary container.
+    ///
+    /// `none` is the one worth knowing about. A bridge needs
+    /// CAP_NET_ADMIN in the user namespace that owns the HOST's network
+    /// namespace, which a nested one can never have, so without this a
+    /// build is impossible rootless even when no step wants the network.
+    /// It is also how a build is made hermetic: a step that cannot
+    /// reach a registry cannot quietly depend on one.
+    #[arg(long, default_value = "bridge")]
+    network: String,
+
     /// The build context: the directory COPY may read from.
     #[arg(default_value = ".")]
     context: PathBuf,
@@ -2377,7 +2390,7 @@ fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
                 let run = RunArgs {
                     name: Some(step_id.clone()),
                     layer: built.layers.clone(),
-                    network: "bridge".into(),
+                    network: args.network.clone(),
                     hostname: "build".into(),
                     workdir: built.workdir.clone(),
                     user: built.user.clone(),

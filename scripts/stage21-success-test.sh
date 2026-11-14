@@ -89,28 +89,42 @@ printf '#!/bin/sh\necho app-ran\n' > "$CTX/app/run.sh"
 chmod +x "$CTX/app/run.sh"
 echo "outside" > "$SCRATCH/secret.txt"
 
+# Every build here is `--network none`, and for two reasons. A step
+# that cannot reach a registry cannot quietly depend on one, so the
+# test says the same thing on every host; and a bridge needs
+# CAP_NET_ADMIN in the user namespace that owns the HOST's network
+# namespace, which a nested one can never have - so without this the
+# whole stage is unrunnable rootless, even though not one RUN step
+# below wants the network. The default is still `bridge`, and stage 24
+# builds through the API without the flag, which is where that path is
+# covered.
+
 echo
 echo "1. The file is read before anything is built"
 # Every one of these is a line somebody has written, and the cost of
 # getting it wrong is an image that is quietly not what the file says.
 printf 'FROM %s\nFROB x\n' "$IMG" > "$CTX/Dockerfile"
 refuses "an unknown instruction is named" "not a Dockerfile instruction" \
-    "$B" build -t x:1 "$CTX"
+    "$B" build --network none -t x:1 "$CTX"
 printf 'FROM %s\nHEALTHCHECK CMD true\n' "$IMG" > "$CTX/Dockerfile"
 refuses "an instruction we do not implement is refused, not skipped" "not implemented" \
-    "$B" build -t x:1 "$CTX"
+    "$B" build --network none -t x:1 "$CTX"
 printf 'RUN true\n' > "$CTX/Dockerfile"
 refuses "a file with no FROM is refused" "must begin with FROM" \
-    "$B" build -t x:1 "$CTX"
+    "$B" build --network none -t x:1 "$CTX"
 printf 'FROM %s\nCMD ["sh", "-c", "echo \\$X"]\n' "$IMG" > "$CTX/Dockerfile"
 refuses "a bracketed line that is not JSON is refused" "exec form" \
-    "$B" build -t x:1 "$CTX"
+    "$B" build --network none -t x:1 "$CTX"
 printf 'FROM %s\nCOPY ../secret.txt /s\n' "$IMG" > "$CTX/Dockerfile"
 refuses "COPY from outside the context is refused" "build context" \
-    "$B" build -t x:1 "$CTX"
+    "$B" build --network none -t x:1 "$CTX"
 printf 'FROM %s\nRUN exit 4\n' "$IMG" > "$CTX/Dockerfile"
 refuses "a failing step fails the build, with its number and status" "exit status 4" \
-    "$B" build -t x:1 "$CTX"
+    "$B" build --network none -t x:1 "$CTX"
+# The same Dockerfile, so the only thing that differs is the flag: the
+# step never runs, because the network is resolved before it does.
+refuses "a network that does not exist is refused, exactly as it is for run" "network create" \
+    "$B" build --network ghost -t x:1 "$CTX"
 
 echo
 echo "2. A real build produces a runnable image"
@@ -125,7 +139,7 @@ RUN echo built-here > /opt/app/stamp.txt && rm -f /etc/motd
 LABEL org.example.kind=demo
 CMD ["/bin/sh", "-c", "cat /opt/app/greeting.txt /opt/app/stamp.txt; /opt/app/app/run.sh; echo \$GREETING; pwd"]
 EOF
-OUT=$(timeout 600 "$B" build -t demo:1 "$CTX" 2>&1)
+OUT=$(timeout 600 "$B" build --network none -t demo:1 "$CTX" 2>&1)
 RC=$?
 if [ $RC -ne 0 ]; then
     echo "the build failed:"; echo "$OUT" | tail -5; exit 2
@@ -188,10 +202,10 @@ FROM \$BASE
 RUN echo "hello \$WHO" > /who.txt
 CMD ["/bin/cat", "/who.txt"]
 EOF
-timeout 600 "$B" build -t demo:2 --build-arg WHO=operator "$CTX" >/dev/null 2>&1
+timeout 600 "$B" build --network none -t demo:2 --build-arg WHO=operator "$CTX" >/dev/null 2>&1
 check "the argument reached the RUN step" \
     "$(timeout 120 "$B" run --network none demo:2 2>&1 | tail -1)" "hello operator"
-timeout 600 "$B" build -t demo:3 "$CTX" >/dev/null 2>&1
+timeout 600 "$B" build --network none -t demo:3 "$CTX" >/dev/null 2>&1
 check "and the default applies when it is not given" \
     "$(timeout 120 "$B" run --network none demo:3 2>&1 | tail -1)" "hello nobody"
 
@@ -204,9 +218,9 @@ cat > "$CTX/Dockerfile" <<EOF
 FROM $IMG
 COPY greeting.txt /g.txt
 EOF
-timeout 600 "$B" build -t rep:1 "$CTX" >/dev/null 2>&1
+timeout 600 "$B" build --network none -t rep:1 "$CTX" >/dev/null 2>&1
 BEFORE=$(find "$RUSTAINER_IMAGE_ROOT"/layers* -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-timeout 600 "$B" build -t rep:2 "$CTX" >/dev/null 2>&1
+timeout 600 "$B" build --network none -t rep:2 "$CTX" >/dev/null 2>&1
 AFTER=$(find "$RUSTAINER_IMAGE_ROOT"/layers* -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
 check "rebuilding adds no new layer" "$AFTER" "$BEFORE"
 

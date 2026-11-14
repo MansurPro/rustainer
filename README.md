@@ -719,6 +719,7 @@ and asserts that not one row was spliced.
 ```sh
 rustainer build -t myapp:1 .
 rustainer build -t myapp:1 --build-arg VERSION=3.21 -f ./Dockerfile .
+rustainer build -t myapp:1 --network none .      # hermetic, and rootless
 ```
 
 **A build step that changes the filesystem is a container run on the
@@ -730,7 +731,17 @@ same `0:0` character devices the layer store has used since stage 15.
 So the build inherits the engine's isolation, cgroups, networking and
 security posture for free, because it is not a second implementation of
 any of them. A `RUN` step is a real container; if it cannot start, the
-build fails with the same message `run` would give.
+build fails with the same message `run` would give. `--network` takes
+the same values `run --network` does, and is resolved the same way — a
+network that does not exist is refused before any step runs.
+
+`--network none` is the one worth knowing about. A step that cannot
+reach a registry cannot quietly depend on one, so the build says the
+same thing on every machine. It is also what makes a build possible
+**rootless**: a bridge needs `CAP_NET_ADMIN` in the user namespace that
+owns the host's network namespace, and a nested one can never have it,
+so without the flag a build is impossible unprivileged even when no step
+wants the network at all.
 
 The layer is identified by the hash of its uncompressed tar, written in
 OCI's whiteout spelling rather than OverlayFS's — a `0:0` device becomes
