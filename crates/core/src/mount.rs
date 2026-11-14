@@ -348,6 +348,31 @@ pub struct Overlay {
     pub work: Option<PathBuf>,
 }
 
+/// A host path made visible inside the container.
+///
+/// Deliberately a hole in the container's filesystem isolation - that is
+/// what a volume is for - and so the two things that make it safe are
+/// stated rather than assumed:
+///
+/// - **`source` is resolved by the parent, before the pivot.** The
+///   container never influences it, so a symlink inside the image cannot
+///   redirect the mount. This is the same rule the device binds follow,
+///   and the vector CVE-2025-31133 used when it was broken.
+/// - **`target` is a path inside the container**, created by the child
+///   above the overlay. Creating it parent-side would write it underneath
+///   the overlay, where the overlay then hides it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VolumeMount {
+    /// An absolute host path that already exists.
+    pub source: PathBuf,
+    /// An absolute path inside the container.
+    pub target: String,
+    pub read_only: bool,
+    /// Bind a file rather than a directory. Decided by the caller, which
+    /// can stat the source; the child cannot.
+    pub is_file: bool,
+}
+
 pub fn plan(
     rootfs: &Path,
     privs: Privileges,
@@ -359,6 +384,8 @@ pub fn plan(
     // in, never part of the image, which is also why editing them inside a
     // container does not survive a restart.
     binds: &[(PathBuf, &str)],
+    // Volumes and bind mounts, in the order the user gave them.
+    volumes: &[VolumeMount],
 ) -> Result<MountPlan, PlanError> {
     let rootfs = rootfs
         .canonicalize()
@@ -761,6 +788,90 @@ pub fn plan(
         );
     }
 
+    // --- 29b. Volumes and bind mounts. ----------------------------------
+    //
+    // After the generated files, so an explicit `-v` over /etc/hosts wins
+    // over the one we generate, and BEFORE masking, so a volume cannot be
+    // used to un-mask /proc/kcore by mounting over the mask.
+    //
+    // Every intermediate directory is created by the child, one component
+    // at a time: `-v data:/var/lib/app/data` on an image with no
+    // /var/lib/app must work, and `mkdir -p` is not available to a process
+    // that cannot allocate. Each one tolerates EEXIST, so the common case
+    // costs one syscall per component.
+    for v in volumes {
+        let rel = v.target.trim_start_matches('/');
+        let mut walked = String::new();
+        let mut components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+        // The last component is the mount point itself: a directory for a
+        // directory source, an empty file for a file source.
+        let leaf = components.pop();
+        for c in components {
+            walked.push('/');
+            walked.push_str(c);
+            push(
+                Op::Mkdir {
+                    target: cstr(&join(&rootfs, walked.trim_start_matches('/')))?,
+                    mode: 0o755,
+                },
+                false,
+                "creating a directory for a volume",
+            );
+        }
+        if let Some(leaf) = leaf {
+            walked.push('/');
+            walked.push_str(leaf);
+            let target = cstr(&join(&rootfs, walked.trim_start_matches('/')))?;
+            if v.is_file {
+                push(
+                    Op::Touch {
+                        target: target.clone(),
+                    },
+                    true,
+                    "creating a file mount point for a volume",
+                );
+            } else {
+                push(
+                    Op::Mkdir {
+                        target: target.clone(),
+                        mode: 0o755,
+                    },
+                    false,
+                    "creating a mount point for a volume",
+                );
+            }
+            // RECURSIVE, which is what `docker run -v` does and what
+            // people expect: a filesystem mounted under the source - a
+            // disk, a tmpfs, another bind - is visible inside the
+            // container rather than appearing as an empty directory. A
+            // plain bind carries none of them and the symptom is a volume
+            // that looks mounted and is missing most of its contents.
+            //
+            // It is also why `:ro` below has to be recursive: a plain
+            // read-only remount would leave every one of those submounts
+            // writable, which is the same trap /sys hit at stage 2.
+            push(
+                Op::RecursiveBind {
+                    source: cstr(&v.source)?,
+                    target: target.clone(),
+                },
+                false,
+                "mounting a volume",
+            );
+            if v.read_only {
+                // Recursive, like /sys above and for the same reason: a
+                // plain read-only remount leaves every submount of the
+                // source writable, and a bind of a host directory can
+                // easily carry submounts.
+                push(
+                    Op::SetAttrRecursiveReadonly { target },
+                    false,
+                    "making a volume read-only",
+                );
+            }
+        }
+    }
+
     // --- 30. Masked and read-only paths. --------------------------------
     //
     // Worth being precise about what this buys. These are
@@ -1011,7 +1122,7 @@ mod tests {
             mknod_devices: false,
             initial_user_ns: false,
         };
-        let plan = plan(&dir, privs, None, None, &[]).unwrap();
+        let plan = plan(&dir, privs, None, None, &[], &[]).unwrap();
         let walk = plan
             .ops
             .iter()
@@ -1038,7 +1149,7 @@ mod tests {
             mknod_devices: false,
             initial_user_ns: false,
         };
-        let plan = plan(&dir, privs, None, None, &[]).unwrap();
+        let plan = plan(&dir, privs, None, None, &[], &[]).unwrap();
         let what: Vec<_> = plan.degradations.iter().map(|d| d.what).collect();
         assert!(what.contains(&"device nodes"), "{what:?}");
         assert!(what.contains(&"/sys"), "{what:?}");
@@ -1054,7 +1165,7 @@ mod tests {
             mknod_devices: true,
             initial_user_ns: true,
         };
-        let plan = plan(&dir, privs, None, None, &[]).unwrap();
+        let plan = plan(&dir, privs, None, None, &[], &[]).unwrap();
         assert!(plan.degradations.is_empty(), "{:?}", plan.degradations);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1068,7 +1179,7 @@ mod tests {
             mknod_devices: true,
             initial_user_ns: true,
         };
-        let plan = plan(&dir, privs, None, None, &[]).unwrap();
+        let plan = plan(&dir, privs, None, None, &[], &[]).unwrap();
         let labels = plan.labels();
         let pos = |needle: &str| labels.iter().position(|l| l.contains(needle)).unwrap();
         assert!(pos("rootfs onto itself") < pos("/proc"));
@@ -1110,7 +1221,7 @@ mod tests {
             work: Some(PathBuf::from("/w")),
             read_only: false,
         };
-        let p = plan(&dir, privs, None, Some(&o), &[]).unwrap();
+        let p = plan(&dir, privs, None, Some(&o), &[], &[]).unwrap();
         let labels = p.labels();
         assert!(labels.iter().any(|l| l.contains("overlay")));
         assert!(
@@ -1135,7 +1246,7 @@ mod tests {
             work: None,
             read_only: false,
         };
-        let Err(e) = plan(&dir, privs, None, Some(&o), &[]) else {
+        let Err(e) = plan(&dir, privs, None, Some(&o), &[], &[]) else {
             panic!("600 layers must be refused before the syscall")
         };
         assert!(e.to_string().contains("500"), "{e}");
@@ -1158,7 +1269,7 @@ mod tests {
             read_only: false,
         };
         assert!(matches!(
-            plan(&dir, privs, None, Some(&o), &[]),
+            plan(&dir, privs, None, Some(&o), &[], &[]),
             Err(PlanError::LayerPathSeparator(_))
         ));
         std::fs::remove_dir_all(&dir).ok();
@@ -1183,7 +1294,7 @@ mod tests {
                 mknod_devices: true,
                 initial_user_ns: initial,
             };
-            let p = plan(&dir, privs, None, Some(&o), &[]).unwrap();
+            let p = plan(&dir, privs, None, Some(&o), &[], &[]).unwrap();
             let got = p.ops.iter().find_map(|op| match &op.op {
                 Op::Overlay { userxattr, .. } => Some(*userxattr),
                 _ => None,
@@ -1203,7 +1314,7 @@ mod tests {
             initial_user_ns: true,
         };
         assert!(matches!(
-            plan(&f, privs, None, None, &[]),
+            plan(&f, privs, None, None, &[], &[]),
             Err(PlanError::NotADirectory(_))
         ));
         std::fs::remove_file(&f).ok();
