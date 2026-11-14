@@ -158,14 +158,30 @@ echo
 echo "5. Nothing of ours is resident once no container is running"
 # The structural claim the comparison rests on: there is no daemon. If
 # this ever fails, the engine has grown one.
-LEFT=0
-for p in /proc/[0-9]*; do
-    [ -r "$p/cmdline" ] || continue
-    case "$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)" in
-        *rustainer*supervise*) LEFT=$((LEFT + 1)) ;;
-    esac
+# By `comm`, not by a substring of the command line. The supervisor sets
+# its own name with `prctl(PR_SET_NAME)` - section 4 above asserts it -
+# and matching `*rustainer*supervise*` against cmdline instead counted
+# the TEST HARNESS, whose own command line names the binary and, in CI,
+# the stage script that contains the word. A structural claim that fires
+# on its own invocation proves nothing.
+supervisors() { grep -l '^rustainer-sup$' /proc/[0-9]*/comm 2>/dev/null; }
+# Teardown is not instantaneous: `stop` returns when init is gone, and
+# the supervisor then records the exit and releases the network. A
+# bounded wait tells "exits a moment later" apart from "is a daemon".
+for _ in $(seq 30); do
+    [ -z "$(supervisors)" ] && break
+    sleep 0.1
 done
+LEFT=$(supervisors | wc -l | tr -d ' ')
 check "no supervisor outlives its container" "$LEFT" "0"
+if [ "$LEFT" != "0" ]; then
+    # Which one, so the next failure does not need this investigation
+    # again. A supervisor left by an EARLIER stage counts here too, and
+    # that is deliberate - the claim is about the machine, not this test.
+    for c in $(supervisors); do
+        echo "    still there: ${c%/comm} $(tr '\0' ' ' < "${c%comm}cmdline" 2>/dev/null)"
+    done
+fi
 
 echo
 echo "6. The benchmark script runs and produces a table"
