@@ -338,9 +338,20 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         (None, true) => {
             let reference = args.command[0].to_string_lossy().into_owned();
             let store = Store::new(Store::default_root());
-            let image = store
-                .pull(&reference, args.pull)
-                .with_context(|| format!("pulling {reference}"))?;
+            // The store first, the registry only if it has to be. `pull`
+            // begins by fetching the manifest, so going through it for an
+            // image already on disk cost four TLS round-trips before
+            // anything was cloned - 870 of the 890 milliseconds a
+            // container start took - and made a fully cached image
+            // unrunnable with no network at all. This is Docker's
+            // `--pull=missing`, which is Docker's default; `--pull` still
+            // means "go and check".
+            let image = match store.local(&reference) {
+                Some(i) if !args.pull => i,
+                _ => store
+                    .pull(&reference, args.pull)
+                    .with_context(|| format!("pulling {reference}"))?,
+            };
 
             // Say what the extractor refused. A device node in a layer is
             // not a corrupt image - it is a layer asking for a direct path

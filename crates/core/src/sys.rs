@@ -500,6 +500,32 @@ pub fn setns(fd: &OwnedFd, nstype: i32) -> Result<(), Errno> {
     if rc < 0 { Err(last_errno()) } else { Ok(()) }
 }
 
+/// Name this process, as `ps`, `top` and `/proc/<pid>/comm` report it.
+///
+/// Needed because of the CVE-2019-5736 seal. The supervisor is started by
+/// executing `/proc/self/exe` - a path, not a name - so the kernel takes
+/// the final component and every supervisor in `ps` is called **`exe`**.
+/// An operator looking at a loaded machine sees a column of processes
+/// named `exe` with no indication of what they are, and a monitoring rule
+/// written against the binary's name matches nothing.
+///
+/// Truncated by the kernel at 15 bytes plus a NUL, silently.
+pub fn set_process_name(name: &str) -> Result<(), Errno> {
+    let mut buf = [0u8; 16];
+    let n = name.len().min(15);
+    buf[..n].copy_from_slice(&name.as_bytes()[..n]);
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_SET_NAME,
+            buf.as_ptr() as usize,
+            0usize,
+            0usize,
+            0usize,
+        )
+    };
+    if rc < 0 { Err(last_errno()) } else { Ok(()) }
+}
+
 pub fn open_devnull() -> Result<OwnedFd, Errno> {
     use rustix::fs::{Mode, OFlags, open};
     open(c"/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())

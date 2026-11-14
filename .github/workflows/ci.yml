@@ -86,6 +86,12 @@ jobs:
       # incompatibility.
       - name: Stage 13 success test (image compatibility)
         run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage13-success-test.sh
+      # Asserts the two properties the comparison rests on: a cached image
+      # starts with no network at all (inside `unshare --net`, so nothing
+      # on the runner is changed to arrange it), and nothing of ours is
+      # resident once no container is running.
+      - name: Stage 14 success test (local store, no daemon)
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage14-success-test.sh
       # In a delegated scope, so the resource stage exercises real limits
       # rather than only the refusal path, and so it never touches the
       # runner's own cgroup.
@@ -125,7 +131,7 @@ jobs:
             echo "::error::unprivileged user namespaces are unavailable on this runner"
             exit 1
           }
-          for s in 1 2 3 4 5 6 7 8 9 10 12; do
+          for s in 1 2 3 4 5 6 7 8 9 10 12 13 14; do
             systemd-run --user --scope -p Delegate=yes -q \
               unshare --user --map-root-user \
               env RUSTAINER_BIN="$PWD/target/release/rustainer" \

@@ -188,6 +188,55 @@ impl Store {
         Ok(())
     }
 
+    /// Everything the runtime needs, from the store alone, with no network.
+    ///
+    /// `run <image>` used to call [`Self::pull`] unconditionally, and
+    /// `pull` begins by fetching the manifest - so starting a container
+    /// from an image already on disk cost four TLS round-trips to the
+    /// registry before anything was cloned. That was 870 of the 890
+    /// milliseconds a container start took, and, worse than slow, it made
+    /// a cached image **unrunnable offline**: the whole command failed at
+    /// a DNS lookup for an image whose every byte was local.
+    ///
+    /// Returns `None` - never an error - when anything is missing or
+    /// unreadable, so the caller simply falls back to pulling. A store
+    /// that has been partly garbage-collected, or written by a build with
+    /// a different `userxattr` setting, is not a failure; it is a cache
+    /// miss.
+    ///
+    /// This is Docker's `--pull=missing`, which is Docker's default.
+    pub fn local(&self, reference: &str) -> Option<Materialised> {
+        let r = Reference::parse(reference).ok()?;
+        let manifest_digest = std::fs::read_to_string(self.tag_path(&r.store_key())).ok()?;
+        let manifest_digest = manifest_digest.trim();
+        let config_bytes =
+            std::fs::read(self.image_dir(manifest_digest).join("config.json")).ok()?;
+        let config: ImageConfig = serde_json::from_slice(&config_bytes).ok()?;
+
+        // Every layer, in order, and all of them. A missing one means the
+        // extracted tree is incomplete, and half an image is not a cache
+        // hit - overlaying what is left would produce a filesystem that
+        // looks plausible and is wrong.
+        let userxattr = Self::userxattr();
+        let mut layers = Vec::new();
+        for diff_id in &config.rootfs.diff_ids {
+            let dir = self.layer_dir(diff_id, userxattr);
+            if !dir.is_dir() {
+                return None;
+            }
+            layers.push(dir);
+        }
+        if layers.is_empty() {
+            return None;
+        }
+
+        // An empty report, because this call extracted nothing. The
+        // degradations a report carries are about an extraction that has
+        // already happened and was already reported when it did.
+        self.materialise(manifest_digest, &config, layers, extract::Report::default())
+            .ok()
+    }
+
     /// Pull if needed, then return what the runtime needs.
     pub fn pull(&self, reference: &str, force: bool) -> Result<Materialised, Error> {
         let r = Reference::parse(reference).map_err(Error::Reference)?;

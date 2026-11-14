@@ -30,6 +30,8 @@
 # which says so.
 
 set -u
+# A comma decimal separator would break the microsecond arithmetic below.
+export LC_ALL=C
 cd "$(dirname "$0")/.." || exit 1
 
 N=${1:-20}
@@ -39,6 +41,14 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/rustainer-bench.XXXXXX")
 B="${RUSTAINER_BIN:-${CARGO_TARGET_DIR:-target}/release/rustainer}"
 [ -x "$B" ] || { echo "no rustainer binary at '$B'; set RUSTAINER_BIN" >&2; exit 2; }
 
+# overlayfs refuses to host an upperdir, and a container's writable layer
+# is an upperdir. In a container - which is where this benchmark is meant
+# to run - the default work directory is exactly that, so every timing
+# would be a time-to-failure rather than a time-to-run.
+MOUNTED_TMPFS=no
+if [ "$(stat -fc %T "$WORK")" = overlayfs ]; then
+    mount -t tmpfs -o size=6g tmpfs "$WORK" 2>/dev/null && MOUNTED_TMPFS=yes
+fi
 export RUSTAINER_ROOT="$WORK/state"
 export RUSTAINER_IMAGE_ROOT="${RUSTAINER_BENCH_STORE:-$WORK/images}"
 mkdir -p "$RUSTAINER_IMAGE_ROOT"
@@ -46,6 +56,7 @@ mkdir -p "$RUSTAINER_IMAGE_ROOT"
 cleanup() {
     "$B" ps -a 2>/dev/null | tail -n +2 | awk '{print $1}' \
         | while read -r c; do [ -n "$c" ] && "$B" rm --force "$c" >/dev/null 2>&1; done
+    [ "$MOUNTED_TMPFS" = yes ] && umount "$WORK" 2>/dev/null
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -57,17 +68,42 @@ fi
 
 # --- helpers ------------------------------------------------------------
 
-now_ns() { date +%s%N; }
+# Microseconds since the epoch.
+#
+# NOT `date +%s%N`: busybox's date has no %N and prints a literal "N", so
+# every interval computes as zero and the whole benchmark reports 0 ms
+# without failing. Alpine - which is what a docker-in-docker image is -
+# has busybox date even once bash is installed. bash 5's EPOCHREALTIME is
+# built in, needs no process, and cannot silently degrade.
+if [ -n "${EPOCHREALTIME:-}" ]; then
+    now_us() { u=${EPOCHREALTIME}; echo "${u/./}"; }
+elif [ "$(date +%N 2>/dev/null)" != "N" ] && [ -n "$(date +%N 2>/dev/null)" ]; then
+    now_us() { echo $(( $(date +%s%N) / 1000 )); }
+else
+    echo "no sub-second clock here: need bash 5 (EPOCHREALTIME) or GNU date" >&2
+    exit 2
+fi
 
-# Median and p90, in milliseconds, of N runs of a command. `date` rather
-# than `time`, whose resolution and output format both vary by shell.
+# Median and p90, in milliseconds, of N runs of a command. Measured rather
+# than `time`d, whose resolution and output format both vary by shell.
+# A sample from a command that FAILED is a time-to-failure, and averaging
+# those with real ones produces a number that is not about anything. The
+# whole measurement is abandoned instead, loudly.
+TIMEIT_FAILED=no
 timeit() {
     : > "$WORK/samples"
+    TIMEIT_FAILED=no
     for _ in $(seq "$N"); do
-        s=$(now_ns)
-        "$@" >/dev/null 2>&1
-        e=$(now_ns)
-        echo $(( (e - s) / 1000000 )) >> "$WORK/samples"
+        s=$(now_us)
+        if ! "$@" >"$WORK/cmd.out" 2>&1; then
+            TIMEIT_FAILED=yes
+            echo "command failed, so its timing means nothing: $*" >&2
+            sed 's/^/    /' "$WORK/cmd.out" | tail -3 >&2
+            echo "0 0"
+            return 1
+        fi
+        e=$(now_us)
+        echo $(( (e - s) / 1000 )) >> "$WORK/samples"
     done
     sort -n "$WORK/samples" | awk '
         { a[NR] = $1 }
@@ -88,12 +124,19 @@ ratio() {
     }'
 }
 
-# Sum of VmRSS, in MiB, over every process whose comm matches a pattern.
+# Sum of VmRSS, in MiB, over every process whose COMMAND LINE matches.
+#
+# The command line and not `comm`, because `comm` lies here. Our supervisor
+# is started by executing /proc/self/exe - which is what makes the
+# CVE-2019-5736 seal work - and the kernel names a process after the final
+# component of the path it executed, so every supervisor was called `exe`
+# and a comm-based match reported a confident zero. (The engine now also
+# sets its own name, but the cmdline is the thing that cannot drift.)
 rss_of() {
     total=0
     for p in /proc/[0-9]*; do
-        [ -r "$p/comm" ] || continue
-        c=$(cat "$p/comm" 2>/dev/null) || continue
+        [ -r "$p/cmdline" ] || continue
+        c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
         # shellcheck disable=SC2254  # the pattern is meant to glob
         case "$c" in
             $1)
@@ -186,9 +229,9 @@ fi
 # --- 4. memory held per running container -------------------------------
 # What each engine keeps resident to supervise ONE container: our
 # supervisor, versus containerd's shim.
-R_SUP=$(rss_of 'rustainer')
+R_SUP=$(rss_of '*supervise*')
 if [ "$HAVE_DOCKER" = yes ]; then
-    D_SHIM=$(rss_of 'containerd-shim*')
+    D_SHIM=$(rss_of '*containerd-shim*')
     row "resident per running container" "${R_SUP} MiB" "${D_SHIM} MiB" "$(ratio "$D_SHIM" "$R_SUP")"
 else
     row "resident per running container" "${R_SUP} MiB" "n/a" "-"
@@ -202,9 +245,9 @@ fi
 # container is running: the CLI exits and the supervisors are per
 # container. Docker keeps dockerd and containerd resident whether or not
 # anything is running, because the API has to be there to answer.
-R_IDLE=$(rss_of 'rustainer')
+R_IDLE=$(rss_of '*rustainer*')
 if [ "$HAVE_DOCKER" = yes ]; then
-    D_IDLE=$(( $(rss_of 'dockerd') + $(rss_of 'containerd') ))
+    D_IDLE=$(( $(rss_of 'dockerd*') + $(rss_of 'containerd *') + $(rss_of 'containerd') ))
     row "resident with no containers running" "${R_IDLE} MiB" "${D_IDLE} MiB" "$(ratio "$D_IDLE" "${R_IDLE:-0}")"
 else
     row "resident with no containers running" "${R_IDLE} MiB" "n/a" "-"
@@ -228,12 +271,12 @@ fi
 # slowest thing here. It is included because it would be dishonest to show
 # only the rows we win.
 "$B" rmi "$IMG" >/dev/null 2>&1
-s=$(now_ns); timeout 600 "$B" pull "$IMG" >/dev/null 2>&1; e=$(now_ns)
-R_PULL=$(( (e - s) / 1000000 ))
+s=$(now_us); timeout 600 "$B" pull "$IMG" >/dev/null 2>&1; e=$(now_us)
+R_PULL=$(( (e - s) / 1000 ))
 if [ "$HAVE_DOCKER" = yes ]; then
     docker rmi -f "$IMG" >/dev/null 2>&1
-    s=$(now_ns); timeout 600 docker pull -q "$IMG" >/dev/null 2>&1; e=$(now_ns)
-    D_PULL=$(( (e - s) / 1000000 ))
+    s=$(now_us); timeout 600 docker pull -q "$IMG" >/dev/null 2>&1; e=$(now_us)
+    D_PULL=$(( (e - s) / 1000 ))
     row "pull a cold image (1 sample, network)" "${R_PULL} ms" "${D_PULL} ms" "$(ratio "$D_PULL" "$R_PULL")"
 else
     row "pull a cold image (1 sample, network)" "${R_PULL} ms" "n/a" "-"
