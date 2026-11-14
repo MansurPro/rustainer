@@ -119,6 +119,12 @@ jobs:
       # scripts/pty-drive.py provides a terminal to observe from.
       - name: Stage 19 success test (pseudo-terminals)
         run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage19-success-test.sh
+      # The rule worth asserting: `--restart always` does NOT restart a
+      # container the operator stopped, and the flag that says so is
+      # written before the signal because the supervisor reads it the
+      # moment its child dies.
+      - name: Stage 20 success test (restart policies and events)
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage20-success-test.sh
       # In a delegated scope, so the resource stage exercises real limits
       # rather than only the refusal path, and so it never touches the
       # runner's own cgroup.
@@ -158,7 +164,7 @@ jobs:
             echo "::error::unprivileged user namespaces are unavailable on this runner"
             exit 1
           }
-          for s in 1 2 3 4 5 6 7 8 9 10 12 13 14 15 16 17 18 19; do
+          for s in 1 2 3 4 5 6 7 8 9 10 12 13 14 15 16 17 18 19 20; do
             systemd-run --user --scope -p Delegate=yes -q \
               unshare --user --map-root-user \
               env RUSTAINER_BIN="$PWD/target/release/rustainer" \

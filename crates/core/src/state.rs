@@ -189,6 +189,15 @@ pub struct State {
     /// `inspect` can explain a container that exited 127 three days ago.
     #[serde(default)]
     pub error: Option<String>,
+    /// A `stop` was asked for. Read by the supervisor after the container
+    /// exits, so that `--restart always` does not immediately undo what
+    /// the operator just did - which is Docker's rule too, and the only
+    /// one that makes `stop` mean anything.
+    #[serde(default)]
+    pub stop_requested: bool,
+    /// How many times the restart policy has restarted it.
+    #[serde(default)]
+    pub restarts: u32,
 }
 
 impl State {
@@ -210,6 +219,8 @@ impl State {
             rootfs: None,
             hostname: None,
             error: None,
+            stop_requested: false,
+            restarts: 0,
         }
     }
 

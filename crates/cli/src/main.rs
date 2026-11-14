@@ -79,6 +79,8 @@ enum Command {
     /// List or remove named volumes.
     #[command(subcommand)]
     Volume(VolumeCmd),
+    /// Show what the engine has done: starts, exits, restarts, pulls.
+    Events(EventsArgs),
     /// Serve the local web UI and HTTP API.
     Serve(ServeArgs),
     /// Start, stop and inspect a stack of containers described in a file.
@@ -136,6 +138,11 @@ struct RunArgs {
     /// Repeatable.
     #[arg(short = 'v', long = "volume")]
     volumes: Vec<String>,
+
+    /// What to do when the container exits: `no` (the default), `always`,
+    /// `unless-stopped`, or `on-failure[:attempts]`.
+    #[arg(long, default_value = "no")]
+    restart: String,
 
     /// Give the container a pseudo-terminal. Programs ask `isatty(1)` and
     /// behave differently: a shell prints a prompt, `^C` arrives as a
@@ -284,6 +291,21 @@ struct StackArgs {
 }
 
 #[derive(Args)]
+struct EventsArgs {
+    /// Only events from the last N seconds.
+    #[arg(long, default_value_t = 3600)]
+    since: u64,
+
+    /// At most this many, newest last.
+    #[arg(long, default_value_t = 200)]
+    limit: usize,
+
+    /// Keep printing as they happen.
+    #[arg(short, long)]
+    follow: bool,
+}
+
+#[derive(Args)]
 struct ServeArgs {
     /// Address to listen on. Loopback by default, and for a reason: there
     /// is no authentication, and anything that can reach this port can
@@ -373,6 +395,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
         Command::Volume(a) => cmd_volume(a),
+        Command::Events(a) => cmd_events(&paths, a),
         Command::Serve(a) => cmd_serve(cli_root.clone(), a),
         Command::Stack(a) => cmd_stack(&paths, a),
         Command::Supervise { id } => cmd_supervise(&paths, &id),
@@ -633,6 +656,9 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .map(|v| parse_volume(v))
         .collect::<Result<Vec<_>>>()?;
 
+    let (restart_policy, restart_max) = supervise::RestartPolicy::parse(&args.restart)
+        .map_err(|e| anyhow::anyhow!("--restart: {e}"))?;
+
     let config = Config {
         id: id.clone(),
         exe: exe.to_string_lossy().into_owned(),
@@ -683,6 +709,8 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         bridge,
         userns,
         tty: args.tty,
+        restart: restart_policy,
+        restart_max,
         volumes,
         stack: args.stack_name.clone(),
         service: args.service_name.clone(),
@@ -765,6 +793,17 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
     // Release before doing anything slow: `stop` and `rm` on this container
     // must not be blocked by a foreground `run` that is merely waiting.
     drop(lock);
+
+    rustainer_core::events::record(
+        paths,
+        "create",
+        &id,
+        serde_json::json!({
+            "image": config.rootfs.clone().unwrap_or_default(),
+            "command": config.argv.join(" "),
+            "detached": args.detach,
+        }),
+    );
 
     if args.detach {
         // Reap the supervisor's *launcher* relationship: it is our child
@@ -1129,6 +1168,12 @@ fn cmd_pull(args: PullArgs) -> Result<ExitCode> {
         eprintln!("rustainer: refused a device node in the image: {d}");
     }
     warn_about_whiteouts(&image.report);
+    rustainer_core::events::record(
+        &Paths::new(Paths::default_root()),
+        "pull",
+        &args.image,
+        serde_json::json!({ "digest": image.digest }),
+    );
     println!("{}", image.digest);
     Ok(ExitCode::SUCCESS)
 }
@@ -1429,6 +1474,53 @@ fn stack_ps(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
             }
         };
         println!("{name:<24} {status:<9} {pid:<8} {addr:<15} {cmd}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_events(paths: &Paths, args: EventsArgs) -> Result<ExitCode> {
+    use rustainer_core::events;
+    let now = rustainer_core::state::now();
+    let mut since = now.saturating_sub(args.since);
+    let mut seen = 0usize;
+    loop {
+        let batch = events::read(paths, since, args.limit);
+        for e in &batch {
+            let at = e["at"].as_u64().unwrap_or(0);
+            // Printed as a local clock time rather than a unix second:
+            // the reader is looking for "what happened just now", and
+            // 1794678683 answers a different question.
+            let hhmmss = {
+                let secs = at % 86400;
+                format!(
+                    "{:02}:{:02}:{:02}",
+                    secs / 3600,
+                    (secs % 3600) / 60,
+                    secs % 60
+                )
+            };
+            println!(
+                "{hhmmss}  {:<10} {:<14} {}",
+                e["kind"].as_str().unwrap_or("?"),
+                e["id"].as_str().unwrap_or("-"),
+                e["detail"]
+            );
+            since = at.max(since);
+            seen += 1;
+        }
+        if !args.follow {
+            break;
+        }
+        // Polling, not inotify: the file is appended to by processes that
+        // come and go, and a 400ms poll on a small file costs nothing
+        // next to the complexity of watching it properly.
+        std::thread::sleep(Duration::from_millis(400));
+        // `since` is a whole second, so events written later in the same
+        // second would repeat. Step past it once we have seen anything.
+        if seen > 0 {
+            since += 1;
+            seen = 0;
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

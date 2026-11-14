@@ -46,6 +46,85 @@ use crate::security::{self, CapabilitySet, Security, UserSpec};
 use crate::state::{self, Lock, Paths, State, Status};
 use crate::{Exit, MountPlan, Namespaces, Privileges, Spec, mount, sys};
 
+/// What to do when a container's init exits.
+///
+/// Docker's set, with Docker's meanings, including the one that surprises
+/// people: **`Always` does not restart a container the operator stopped**.
+/// A policy that undid `stop` would make `stop` meaningless, so a manual
+/// stop is recorded and both `Always` and `UnlessStopped` honour it. The
+/// difference between the two is what happens at *boot*, which this
+/// engine does not have - there is no daemon to start anything - so here
+/// they differ only in name, and that is said rather than papered over.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    #[default]
+    No,
+    Always,
+    UnlessStopped,
+    OnFailure,
+}
+
+impl RestartPolicy {
+    pub fn parse(s: &str) -> Result<(Self, Option<u32>), String> {
+        let (name, max) = match s.split_once(':') {
+            Some((n, m)) => (
+                n,
+                Some(
+                    m.parse::<u32>()
+                        .map_err(|_| format!("{m:?} is not a number of attempts"))?,
+                ),
+            ),
+            None => (s, None),
+        };
+        let policy = match name {
+            "no" | "" => Self::No,
+            "always" => Self::Always,
+            "unless-stopped" => Self::UnlessStopped,
+            "on-failure" => Self::OnFailure,
+            other => {
+                return Err(format!(
+                    "{other:?} is not a restart policy. Use `no`, `always`, \
+                     `unless-stopped`, or `on-failure[:attempts]`."
+                ));
+            }
+        };
+        if max.is_some() && policy != Self::OnFailure {
+            return Err(format!(
+                "a maximum only applies to `on-failure`; {name} restarts \
+                 until it is stopped"
+            ));
+        }
+        Ok((policy, max))
+    }
+
+    /// Should a container that ended like this be started again?
+    fn should_restart(self, exit: Exit, stopped: bool, restarts: u32, max: Option<u32>) -> bool {
+        if stopped {
+            return false;
+        }
+        match self {
+            Self::No => false,
+            Self::Always | Self::UnlessStopped => true,
+            Self::OnFailure => {
+                let failed = !matches!(exit, Exit::Code(0));
+                failed && max.is_none_or(|m| restarts < m)
+            }
+        }
+    }
+}
+
+/// How long to wait before restart number `n`.
+///
+/// Exponential from 100 ms, capped. Without a backoff, a container whose
+/// command does not exist is an unbounded fork loop that takes the
+/// machine with it - and "the image is wrong" is by far the most common
+/// reason a container exits immediately.
+fn restart_delay(n: u32) -> std::time::Duration {
+    let ms = 100u64.saturating_mul(1u64 << n.min(7));
+    std::time::Duration::from_millis(ms.min(10_000))
+}
+
 /// The container's bundle, written by the CLI and read by the supervisor.
 ///
 /// Deliberately our own shape rather than an OCI `config.json`: the schema
@@ -126,6 +205,12 @@ pub struct Config {
     pub stack: Option<String>,
     #[serde(default)]
     pub service: Option<String>,
+    /// What to do when the container exits.
+    #[serde(default)]
+    pub restart: RestartPolicy,
+    /// Attempts allowed for `on-failure`. `None` is unlimited.
+    #[serde(default)]
+    pub restart_max: Option<u32>,
     /// Give the container a pseudo-terminal rather than pipes.
     ///
     /// Not cosmetic: `isatty(1)` decides whether a shell prints a prompt
@@ -491,7 +576,12 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     st.rootfs.clone_from(&config.rootfs);
     st.hostname = Some(config.hostname.clone());
     st.status = Status::Creating;
+    st.stop_requested = false;
     st.store(paths)?;
+    // A container being started now has not been stopped, whatever a
+    // previous life recorded. `run` creates a fresh directory, so this
+    // only matters for a `supervise` run by hand over an old one.
+    let _ = std::fs::remove_file(stop_sentinel(paths, id));
 
     // --- the start rendezvous ------------------------------------------
     let fifo_path = paths.fifo(id);
@@ -507,94 +597,91 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     // even exists.
     let fifo_opath = sys::open_path_file(&cpath(&fifo_path)?)?;
 
-    // --- stdio ----------------------------------------------------------
-    //
-    // Pipes normally; a pty when `--tty` was asked for, in which case
-    // there is only ONE stream. A terminal merges stdout and stderr by
-    // construction - they are the same device - so a tty container's log
-    // is one file, exactly as Docker's is.
-    //
-    // The supervisor allocates it rather than the CLI, because the
-    // supervisor is what outlives the CLI: `run -dt` has to work, and a
-    // master held by a process that has exited is a container whose
-    // output goes nowhere.
-    let (pty_master, mut pty_slave) = if config.tty {
-        let p = crate::pty::open().map_err(Error::Sys)?;
-        (Some(p.master), Some(p.slave))
-    } else {
-        (None, None)
-    };
-    let (out_r, out_w) = sys::pipe_with(sys::PipeFlags::CLOEXEC)?;
-    let (err_r, err_w) = sys::pipe_with(sys::PipeFlags::CLOEXEC)?;
-    let stdio = match &pty_slave {
-        Some(slave) => crate::child::Stdio {
-            stdin: slave.try_clone()?,
-            stdout: slave.try_clone()?,
-            stderr: slave.try_clone()?,
-        },
-        None => {
-            let devnull = sys::open_devnull()?;
-            crate::child::Stdio {
-                stdin: devnull,
-                stdout: out_w.try_clone()?,
-                stderr: err_w.try_clone()?,
-            }
-        }
-    };
-
-    // Resource limits, before the child exists. A requested limit that
-    // cannot be applied fails here, loudly, rather than producing a
-    // container that silently has none.
+    // Resource limits and published ports are arranged ONCE, above the
+    // restart loop. A restarted container keeps its cgroup, its address
+    // and its published ports: the rules name the address, the address is
+    // in the config, and tearing the whole lot down and back up between
+    // restarts would make a crash-looping container flap the host's
+    // firewall several times a second.
     let limits = config.limits();
     let cg = Cgroup::prepare(id, &limits)?;
     if let Some(c) = &cg {
         c.apply(&limits)?;
     }
-    let mounts = config.mount_plan(cg.as_ref().map(|c| c.dir()), &paths.dir(id))?;
+    let _published = publish_ports(&config)?;
 
-    let mut spawned = crate::spawn(
-        &spec,
-        mounts,
-        crate::Attach {
-            security: Some(config.security()?),
-            stdio: Some(stdio),
-            tty: config.tty,
-            exec_fifo: Some(fifo_opath),
-            cgroup_fd: cg.as_ref().map(|c| c.fd()),
-            ..Default::default()
-        },
-    )?;
+    let mut fifo_once = Some(fifo_opath);
+    let mut restarts = 0u32;
+    let exit = loop {
+        let first_attempt = restarts == 0;
 
-    // Our copies of the child's write ends must go, or the reads below can
-    // never see EOF.
-    drop(out_w);
-    drop(err_w);
+        // --- stdio ----------------------------------------------------------
+        //
+        // Pipes normally; a pty when `--tty` was asked for, in which case
+        // there is only ONE stream. A terminal merges stdout and stderr by
+        // construction - they are the same device - so a tty container's log
+        // is one file, exactly as Docker's is.
+        //
+        // The supervisor allocates it rather than the CLI, because the
+        // supervisor is what outlives the CLI: `run -dt` has to work, and a
+        // master held by a process that has exited is a container whose
+        // output goes nowhere.
+        let (pty_master, mut pty_slave) = if config.tty {
+            let p = crate::pty::open().map_err(Error::Sys)?;
+            (Some(p.master), Some(p.slave))
+        } else {
+            (None, None)
+        };
+        let (out_r, out_w) = sys::pipe_with(sys::PipeFlags::CLOEXEC)?;
+        let (err_r, err_w) = sys::pipe_with(sys::PipeFlags::CLOEXEC)?;
+        let stdio = match &pty_slave {
+            Some(slave) => crate::child::Stdio {
+                stdin: slave.try_clone()?,
+                stdout: slave.try_clone()?,
+                stderr: slave.try_clone()?,
+            },
+            None => {
+                let devnull = sys::open_devnull()?;
+                crate::child::Stdio {
+                    stdin: devnull,
+                    stdout: out_w.try_clone()?,
+                    stderr: err_w.try_clone()?,
+                }
+            }
+        };
 
-    // The host side of the network, before the child is let go. The
-    // container's interface has to exist before the container tries to
-    // configure it, and the go-ahead is what guarantees the ordering.
-    if config.bridge
-        && let Err(e) = plumb_network(spawned.pid)
-    {
-        let _ = sys::kill_process(
-            rustix::process::Pid::from_raw(spawned.pid).unwrap(),
-            sys::Signal::KILL,
-        );
-        let _ = crate::reap_pid(spawned.pid);
-        return Err(e);
-    }
+        // Rebuilt per attempt: the mount set lives in the child's mount
+        // namespace, which died with the last child. The overlay's upper
+        // directory is on disk and is NOT recreated, so a restarted container
+        // keeps everything it wrote - which is what Docker does too.
+        let mounts = config.mount_plan(cg.as_ref().map(|c| c.dir()), &paths.dir(id))?;
 
-    st.init_pid = Some(spawned.pid);
-    st.init_start_time = state::start_time(spawned.pid);
-    st.status = Status::Created;
-    st.store(paths)?;
+        let mut spawned = crate::spawn(
+            &spec,
+            mounts,
+            crate::Attach {
+                security: Some(config.security()?),
+                stdio: Some(stdio),
+                tty: config.tty,
+                // Only the first attempt waits to be started. A restart
+                // is not a `create`, and there is nobody to send the byte.
+                exec_fifo: fifo_once.take(),
+                cgroup_fd: cg.as_ref().map(|c| c.fd()),
+                ..Default::default()
+            },
+        )?;
 
-    // Published ports: the firewall rules and the userland forwarder for
-    // the loopback case. Before the go-ahead, so a container is never
-    // briefly running with a port published and unauthorised.
-    let _published = match publish_ports(&config) {
-        Ok(p) => p,
-        Err(e) => {
+        // Our copies of the child's write ends must go, or the reads below can
+        // never see EOF.
+        drop(out_w);
+        drop(err_w);
+
+        // The host side of the network, before the child is let go. The
+        // container's interface has to exist before the container tries to
+        // configure it, and the go-ahead is what guarantees the ordering.
+        if config.bridge
+            && let Err(e) = plumb_network(spawned.pid)
+        {
             let _ = sys::kill_process(
                 rustix::process::Pid::from_raw(spawned.pid).unwrap(),
                 sys::Signal::KILL,
@@ -602,86 +689,145 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
             let _ = crate::reap_pid(spawned.pid);
             return Err(e);
         }
-    };
 
-    // Everything the parent owed this child is done.
-    spawned.release();
+        st.init_pid = Some(spawned.pid);
+        st.init_start_time = state::start_time(spawned.pid);
+        st.status = Status::Created;
+        st.store(paths)?;
 
-    // Tell the CLI it may leave. Everything after this point happens with
-    // nobody waiting on us.
-    reply_ok(spawned.pid);
+        // Everything the parent owed this child is done.
+        spawned.release();
 
-    // --- wait for the start byte, WITHOUT a blocking open ----------------
-    //
-    // The naive version opens the FIFO read side blocking and reads a byte.
-    // That deadlocks forever whenever the init process died between create
-    // and start, which is trivially reachable: the user's binary does not
-    // exist. Polling the FIFO together with a pidfd turns that into a real
-    // error instead of a hang, with no background thread and no PID-reuse
-    // window.
-    let fifo_read = sys::open_read_nonblocking(&cpath(&fifo_path)?)?;
-    let started = wait_for_start(&fifo_read, &spawned.pidfd)?;
-    if !started {
-        let err = spawned.start_failure().map(Error::Core);
-        let status = reap_into(&mut st, spawned.pid);
+        // Both of these belong to the FIRST attempt only, and the second one
+        // is a real bug if it is not guarded: a restarted child was given no
+        // `exec_fifo`, so it never opens the rendezvous, so the poll below
+        // sees only the pidfd becoming ready and concludes the container
+        // "died before it reached the start rendezvous". The restart policy
+        // then stops after exactly one restart, reporting a failure that did
+        // not happen.
+        if first_attempt {
+            // Tell the CLI it may leave. Everything after this point happens
+            // with nobody waiting on us.
+            reply_ok(spawned.pid);
+
+            // --- wait for the start byte, WITHOUT a blocking open ------------
+            //
+            // The naive version opens the FIFO read side blocking and reads a
+            // byte. That deadlocks forever whenever the init process died
+            // between create and start, which is trivially reachable: the
+            // user's binary does not exist. Polling the FIFO together with a
+            // pidfd turns that into a real error instead of a hang, with no
+            // background thread and no PID-reuse window.
+            let fifo_read = sys::open_read_nonblocking(&cpath(&fifo_path)?)?;
+            let started = wait_for_start(&fifo_read, &spawned.pidfd)?;
+            if !started {
+                let err = spawned.start_failure().map(Error::Core);
+                let status = reap_into(&mut st, spawned.pid);
+                st.status = Status::Exited;
+                st.exited_at = Some(state::now());
+                st.store(paths)?;
+                let _ = status;
+                return Err(err.unwrap_or(Error::DiedBeforeStart));
+            }
+        }
+
+        st.status = Status::Running;
+        st.started_at = Some(state::now());
+        st.store(paths)?;
+        crate::events::record(
+            paths,
+            if first_attempt { "start" } else { "restarted" },
+            id,
+            serde_json::json!({ "pid": spawned.pid, "restarts": restarts }),
+        );
+
+        // --- the steady state ------------------------------------------------
+        let mut out_log = log_file(&paths.stdout_log(id))?;
+        let mut err_log = log_file(&paths.stderr_log(id))?;
+        match &pty_master {
+            Some(master) => {
+                // Our own copy of the slave goes first, and deliberately:
+                // while ANY descriptor on the slave is open the master never
+                // reports EOF, so a relay waiting for one would hang forever
+                // after the command exited. The child plan's copies were
+                // already dropped in the parent after the clone, for the same
+                // reason applied to the error pipe.
+                pty_slave.take();
+                crate::pty::relay(master, 0, 1, |bytes| {
+                    use std::io::Write;
+                    let _ = out_log.write_all(bytes);
+                });
+            }
+            None => pump(&out_r, &err_r, &spawned.pidfd, &mut out_log, &mut err_log)?,
+        }
+
+        // Drain and flush the logs BEFORE writing the terminal status. Writing
+        // `exited` first and then failing to flush produces a container
+        // reported as cleanly exited whose last few KiB of output - the panic
+        // message - is gone (RND.md §5.7).
+        out_log.flush()?;
+        err_log.flush()?;
+
+        // Now that init is gone its `O_CLOEXEC` error pipe is closed, so this
+        // cannot block. A failure recorded here means the child reached the
+        // start rendezvous and then failed - execve of a missing binary is the
+        // common case, and it is the difference between "exited 127" and
+        // "exited 127 because /bin/nonexistent does not exist".
+        let failure = spawned.start_failure();
+        let exit = reap_into(&mut st, spawned.pid);
+
+        // `memory.events`'s `oom_kill` is the only key that means a kill
+        // happened; `max` and `oom` do not. Read before the cgroup is removed.
+        if let Some(c) = &cg {
+            st.oom_killed = c.oom_killed();
+        }
+        if let Some(e) = &failure {
+            eprintln!("rustainer: {e}");
+            st.error = Some(e.to_string());
+        }
         st.status = Status::Exited;
         st.exited_at = Some(state::now());
+        st.stop_requested = stop_was_requested(paths, id);
         st.store(paths)?;
-        let _ = status;
-        return Err(err.unwrap_or(Error::DiedBeforeStart));
-    }
+        crate::events::record(
+            paths,
+            "die",
+            id,
+            serde_json::json!({ "exit": st.exit_code, "signal": st.signal, "oom": st.oom_killed }),
+        );
 
-    st.status = Status::Running;
-    st.started_at = Some(state::now());
-    st.store(paths)?;
-
-    // --- the steady state ------------------------------------------------
-    let mut out_log = log_file(&paths.stdout_log(id))?;
-    let mut err_log = log_file(&paths.stderr_log(id))?;
-    match &pty_master {
-        Some(master) => {
-            // Our own copy of the slave goes first, and deliberately:
-            // while ANY descriptor on the slave is open the master never
-            // reports EOF, so a relay waiting for one would hang forever
-            // after the command exited. The child plan's copies were
-            // already dropped in the parent after the clone, for the same
-            // reason applied to the error pipe.
-            pty_slave.take();
-            crate::pty::relay(master, 0, 1, |bytes| {
-                use std::io::Write;
-                let _ = out_log.write_all(bytes);
-            });
+        // --- restart? --------------------------------------------------------
+        //
+        // The flag is re-read from DISK rather than taken from our own copy:
+        // `stop` is another process, and the whole point of the flag is that
+        // it was set after we last wrote the file. A policy that restarted a
+        // container the operator had just stopped would make `stop`
+        // meaningless.
+        let stopped = stop_was_requested(paths, id);
+        if !config
+            .restart
+            .should_restart(exit, stopped, restarts, config.restart_max)
+        {
+            break exit;
         }
-        None => pump(&out_r, &err_r, &spawned.pidfd, &mut out_log, &mut err_log)?,
-    }
 
-    // Drain and flush the logs BEFORE writing the terminal status. Writing
-    // `exited` first and then failing to flush produces a container
-    // reported as cleanly exited whose last few KiB of output - the panic
-    // message - is gone (RND.md §5.7).
-    out_log.flush()?;
-    err_log.flush()?;
+        restarts += 1;
+        let delay = restart_delay(restarts);
+        crate::events::record(
+            paths,
+            "restart",
+            id,
+            serde_json::json!({ "attempt": restarts, "after_ms": delay.as_millis() as u64 }),
+        );
+        st.restarts = restarts;
+        st.error = None;
+        st.store(paths)?;
+        // Backoff before, not after: without it a container whose command
+        // does not exist is an unbounded fork loop, and "the image is wrong"
+        // is by far the most common reason one exits immediately.
+        std::thread::sleep(delay);
+    };
 
-    // Now that init is gone its `O_CLOEXEC` error pipe is closed, so this
-    // cannot block. A failure recorded here means the child reached the
-    // start rendezvous and then failed - execve of a missing binary is the
-    // common case, and it is the difference between "exited 127" and
-    // "exited 127 because /bin/nonexistent does not exist".
-    let failure = spawned.start_failure();
-    let exit = reap_into(&mut st, spawned.pid);
-
-    // `memory.events`'s `oom_kill` is the only key that means a kill
-    // happened; `max` and `oom` do not. Read before the cgroup is removed.
-    if let Some(c) = &cg {
-        st.oom_killed = c.oom_killed();
-    }
-    if let Some(e) = &failure {
-        eprintln!("rustainer: {e}");
-        st.error = Some(e.to_string());
-    }
-    st.status = Status::Exited;
-    st.exited_at = Some(state::now());
-    st.store(paths)?;
     if let Some(c) = &cg {
         c.remove();
     }
@@ -997,7 +1143,31 @@ fn plumb(pid: i32) -> Result<(), Error> {
 /// drops `SIGKILL` too when the sender is inside the namespace with
 /// `SIG_DFL`. Only a signal from an ancestor namespace gets through, which
 /// is why this runs here and not in the container.
+/// Where a requested stop is recorded.
+///
+/// A file of its own, and not a field in `state.json`, because the two
+/// writers are different processes. The supervisor rewrites the whole
+/// state file several times per restart from its own in-memory copy, so
+/// a flag set there by `stop` is overwritten within milliseconds - and
+/// the symptom is `--restart always` cheerfully undoing a stop, which is
+/// exactly the behaviour the flag exists to prevent.
+///
+/// Two writers, two files, no lock needed: existence is the whole value.
+fn stop_sentinel(paths: &Paths, id: &str) -> std::path::PathBuf {
+    paths.dir(id).join("stop-requested")
+}
+
+fn stop_was_requested(paths: &Paths, id: &str) -> bool {
+    stop_sentinel(paths, id).exists()
+}
+
 pub fn stop(paths: &Paths, id: &str, grace: std::time::Duration) -> Result<(), Error> {
+    // Recorded BEFORE the signal, not after. The supervisor reads it the
+    // moment its child dies, and between the signal and a later write
+    // there is a window in which it sees nothing and restarts the
+    // container that was just stopped.
+    let _ = std::fs::write(stop_sentinel(paths, id), b"");
+    crate::events::record(paths, "stop", id, serde_json::json!({}));
     let st = State::load(paths, id)?;
     if st.observed_status() != Status::Running && st.observed_status() != Status::Created {
         return Ok(());
@@ -1042,6 +1212,7 @@ fn wait_for_supervisor(st: &State) -> Result<(), Error> {
 ///
 /// Refuses a running container rather than orphaning its supervisor.
 pub fn remove(paths: &Paths, id: &str, force: bool) -> Result<(), Error> {
+    crate::events::record(paths, "remove", id, serde_json::json!({ "force": force }));
     let _lock = Lock::acquire(&paths.lock_file(id))?;
     if let Ok(st) = State::load(paths, id) {
         let observed = st.observed_status();
@@ -1099,6 +1270,8 @@ mod tests {
             argv: vec!["sh".into()],
             envp: vec!["PATH=/bin".into()],
             hostname: "box".into(),
+            restart: RestartPolicy::No,
+            restart_max: None,
             tty: false,
             volumes: Vec::new(),
             peers: Vec::new(),

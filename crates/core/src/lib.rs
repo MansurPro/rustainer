@@ -26,6 +26,7 @@
 
 pub mod cgroup;
 pub mod child;
+pub mod events;
 pub mod exec;
 pub mod firewall;
 pub mod mount;

@@ -62,6 +62,7 @@ is easier to reason about once the process model is not also in question.
 | 17 | A local API, and a page that uses it | **Done** |
 | 18 | Stacks — several containers from one file | **Done** |
 | 19 | Pseudo-terminals — `run -it`, `exec -it` | **Done** |
+| 20 | Restart policies and an event log | **Done** |
 
 The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete.
 Stages 12 onwards are the additive work §19 held back until the mechanisms
@@ -669,6 +670,44 @@ is exactly what `-t` is distinguishable from. `scripts/pty-drive.py`
 provides one, and the test checks what a pipeline cannot show: `stty size`
 inside reports the window outside, and `^C` fires the container's own
 `INT` trap.
+
+### Restart policies, and a record of what happened
+
+```sh
+rustainer run -d --restart on-failure:3 alpine:3.21 ./flaky
+rustainer events --follow
+```
+
+`no`, `always`, `unless-stopped`, `on-failure[:attempts]` — Docker's set
+with Docker's meanings, including the one that surprises people:
+**`always` does not restart a container the operator stopped.** A policy
+that undid `stop` would make `stop` meaningless.
+
+That flag is written by `stop` **before** it signals, and it lives in a
+file of its own rather than in `state.json`. The two writers are different
+processes, and the supervisor rewrites the whole state file several times
+per restart from its own in-memory copy — so a flag set there is
+overwritten within milliseconds. Two writers, two files, no lock needed:
+existence is the whole value. (This was a real bug, caught by the test
+that asserts a stopped container stays stopped.)
+
+The backoff is exponential from 100 ms, capped at 10 s. Without one, a
+container whose command does not exist is an unbounded fork loop that
+takes the machine with it — and "the image is wrong" is by far the most
+common reason a container exits immediately.
+
+A restart keeps the container's **identity**: same id, same cgroup, same
+address, same published ports, same accumulating log. Tearing all of that
+down and back up between attempts would make a crash-looping container
+flap the host's firewall several times a second.
+
+**`events` is a file, not a socket**, because there is no daemon. It has
+to work when the only thing running is a supervisor started an hour ago by
+a CLI that has long exited. Every writer opens `O_APPEND` and writes one
+line in one `write`, which Linux does not interleave below `PIPE_BUF` — so
+no lock is needed, and that is why the line length is capped rather than
+the file being locked. The test runs four crash-looping containers at once
+and asserts that not one row was spliced.
 
 ### The engine does not lie about what it does not know
 
