@@ -54,6 +54,14 @@ trap 'rm -rf "$SCRATCH"' EXIT
 CG_MODE=none
 [ "$(stat -fc %t /sys/fs/cgroup 2>/dev/null)" = "63677270" ] && CG_MODE=unified
 OWN=$(awk -F: '/^0::/{print $3}' /proc/self/cgroup)
+# Strip the engine's own leaf if we are sitting in it. `rustainer.supervisor`
+# is the name `cgroup::delegating_parent()` removes when deciding where
+# containers go, so a harness that has stepped aside into it must strip it
+# too - otherwise this probes the cgroup it is INSIDE rather than the one
+# containers are created in, and that one can never have controllers
+# enabled precisely because we are in it. The symptom is a host with a
+# perfectly good delegated scope reporting "controllers enableable: no".
+OWN=${OWN%/rustainer.supervisor}
 BASE="/sys/fs/cgroup${OWN%/}"
 
 # Environment preparation, not engine behaviour: when we are root in our own

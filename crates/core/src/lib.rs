@@ -26,6 +26,7 @@
 
 pub mod cgroup;
 pub mod child;
+pub mod exec;
 pub mod firewall;
 pub mod mount;
 pub mod net;
@@ -330,18 +331,40 @@ impl Spawned {
     }
 }
 
+/// Everything [`spawn`] attaches to the child that is not part of *what to
+/// run*.
+///
+/// A struct and not five more positional parameters, for the reason
+/// [`child::ChildSpec`] already gives: the list grew once per ladder stage,
+/// and each addition silently changed the meaning of the arguments after it
+/// at every call site.
+#[derive(Default)]
+pub struct Attach<'a> {
+    /// Capabilities, user and seccomp, compiled parent-side.
+    pub security: Option<security::Security>,
+    /// Descriptors for 0, 1 and 2. `None` leaves the parent's in place.
+    pub stdio: Option<child::Stdio>,
+    /// The `create`/`start` rendezvous. `None` runs straight through.
+    pub exec_fifo: Option<sys::OwnedFd>,
+    /// Directory fd for `CLONE_INTO_CGROUP`.
+    pub cgroup_fd: Option<&'a sys::OwnedFd>,
+    /// Existing namespaces the **child** joins before anything else, in
+    /// order. Non-empty only for `exec`.
+    pub join: Vec<sys::OwnedFd>,
+}
+
 /// Create the container process. Returns in the parent only.
 ///
 /// The caller decides the topology: stages 1–2 call [`run`], which waits
 /// here; from stage 3 the supervisor calls this and keeps the pidfd.
-pub fn spawn(
-    spec: &Spec,
-    mounts: Option<MountPlan>,
-    security: Option<security::Security>,
-    stdio: Option<child::Stdio>,
-    exec_fifo: Option<sys::OwnedFd>,
-    cgroup_fd: Option<&sys::OwnedFd>,
-) -> Result<Spawned, Error> {
+pub fn spawn(spec: &Spec, mounts: Option<MountPlan>, attach: Attach<'_>) -> Result<Spawned, Error> {
+    let Attach {
+        security,
+        stdio,
+        exec_fifo,
+        cgroup_fd,
+        join,
+    } = attach;
     // A mount plan without a mount namespace would be applied to the host:
     // every mount leaks, and `pivot_root` repoints the *host's* root. Refuse
     // rather than trust the caller to have set both.
@@ -375,6 +398,7 @@ pub fn spawn(
             hostname,
             workdir: spec.workdir.as_deref(),
             mounts,
+            join,
             cgroup_ns: cgroup_fd.is_some(),
             loopback: spec.namespaces.net,
             net_messages: &spec.net_messages,
@@ -509,7 +533,7 @@ fn write_single_id_map(pid: i32) -> std::io::Result<()> {
 /// [`supervise`] instead, because the CLI must never be in the container's
 /// process ancestry (RND.md §18.2).
 pub fn run(spec: &Spec, mounts: Option<MountPlan>) -> Result<Exit, Error> {
-    let mut spawned = spawn(spec, mounts, None, None, None, None)?;
+    let mut spawned = spawn(spec, mounts, Attach::default())?;
     // Nothing is owed to this child, so it may go at once.
     spawned.release();
     // Safe to read to EOF here: no start rendezvous was given, so the child

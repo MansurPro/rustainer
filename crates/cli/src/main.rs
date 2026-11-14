@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use rustainer_core::exec;
 use rustainer_core::firewall::Publish;
 use rustainer_core::security::{self, UserSpec};
 use rustainer_core::state::{Paths, State, Status};
@@ -65,6 +66,8 @@ enum Command {
     Rm(RmArgs),
     /// Print a container's captured output.
     Logs(LogsArgs),
+    /// Run a command inside a running container.
+    Exec(ExecArgs),
     /// Download an image and extract it into the local store.
     Pull(PullArgs),
     /// List images in the local store.
@@ -108,6 +111,11 @@ struct RunArgs {
     /// Hostname inside the container's UTS namespace.
     #[arg(long, default_value = "container")]
     hostname: String,
+
+    /// Working directory inside the container. Overrides the image's
+    /// `WorkingDir`.
+    #[arg(short = 'w', long)]
+    workdir: Option<String>,
 
     /// Memory limit, e.g. 512m, 2g. Enforced by cgroup v2 memory.max.
     #[arg(short = 'm', long)]
@@ -203,6 +211,28 @@ struct LogsArgs {
     id: String,
 }
 
+#[derive(Args)]
+struct ExecArgs {
+    /// Working directory inside the container. Defaults to the container's.
+    #[arg(short = 'w', long)]
+    workdir: Option<String>,
+
+    /// Extra environment entry, `KEY=VALUE`. Wins over the container's own.
+    #[arg(short = 'e', long = "env")]
+    env: Vec<String>,
+
+    /// Run as `uid[:gid]`. Defaults to the user the container runs as.
+    #[arg(short = 'u', long)]
+    user: Option<String>,
+
+    id: String,
+
+    /// The command, and its arguments. Searched in the container's PATH
+    /// directories when it is not an absolute path.
+    #[arg(trailing_var_arg = true, required = true)]
+    command: Vec<String>,
+}
+
 fn main() -> ExitCode {
     // RND.md §18.10, and the first thing this binary does. A container that
     // can write to `/proc/self/exe` overwrites the runtime binary itself -
@@ -235,6 +265,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Stop(a) => cmd_stop(&paths, a),
         Command::Rm(a) => cmd_rm(&paths, a),
         Command::Logs(a) => cmd_logs(&paths, a),
+        Command::Exec(a) => cmd_exec(&paths, a),
         Command::Pull(a) => cmd_pull(a),
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
@@ -487,7 +518,8 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             }
             Some(s) => Some(s),
         },
-        workdir,
+        // The flag wins over the image's `WorkingDir`.
+        workdir: args.workdir.clone().or(workdir),
         layers: layers.clone(),
         read_only: args.read_only,
         // Beside the layers, on whatever filesystem the image store is on.
@@ -786,6 +818,23 @@ fn cmd_ps(paths: &Paths, args: PsArgs) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_exec(paths: &Paths, args: ExecArgs) -> Result<ExitCode> {
+    let user = match &args.user {
+        None => None,
+        Some(u) => Some(UserSpec::parse(u).map_err(|e| anyhow::anyhow!("--user: {e}"))?),
+    };
+    let req = exec::Request {
+        argv: args.command,
+        env: args.env,
+        workdir: args.workdir,
+        user,
+    };
+    let exit = exec::exec(paths, &args.id, &req).with_context(|| format!("exec in {}", args.id))?;
+    // The exec'd command's status, not ours: `rustainer exec sh -c 'exit 7'`
+    // has to be usable in a shell conditional the same way `docker exec` is.
+    Ok(ExitCode::from(exit.to_shell_status().min(255) as u8))
 }
 
 fn cmd_stop(paths: &Paths, args: StopArgs) -> Result<ExitCode> {

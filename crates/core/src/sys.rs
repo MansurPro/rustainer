@@ -468,6 +468,38 @@ pub fn unshare_cgroup_namespace() -> Result<(), Errno> {
     if rc < 0 { Err(last_errno()) } else { Ok(()) }
 }
 
+/// Open a namespace file for [`setns`].
+///
+/// **Not `O_PATH`.** `setns(2)` resolves the namespace through the file's
+/// `f_op` table, and an `O_PATH` descriptor carries `empty_fops` instead of
+/// `ns_file_operations`, so the call fails `EINVAL` with nothing to suggest
+/// the descriptor is the problem. Everywhere else in this file `O_PATH` is
+/// the right answer for "a reference, not an open file"; here it is not.
+pub fn open_namespace(path: &CStr) -> Result<OwnedFd, Errno> {
+    use rustix::fs::{Mode, OFlags, open};
+    open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+}
+
+/// Join an existing namespace.
+///
+/// `nstype` is `0` for "whatever this descriptor is", which is what we want:
+/// the descriptor came from `/proc/<pid>/ns/<name>`, so its type is already
+/// decided and asserting it again only adds a way to be wrong.
+///
+/// Two properties of this call shape the caller:
+///
+/// - **`CLONE_NEWPID` does not move the caller.** It sets the namespace that
+///   the caller's *next child* is created in, and the caller itself stays
+///   where it is. Joining a pid namespace therefore means `setns` followed
+///   by a fork, and the forked child is the one inside.
+/// - **`CLONE_NEWUSER` and `CLONE_NEWNS` require a single-threaded caller**,
+///   `EINVAL` otherwise. The no-async rule this project enforces for
+///   `clone3` (§15.6) is what makes `exec` possible at all.
+pub fn setns(fd: &OwnedFd, nstype: i32) -> Result<(), Errno> {
+    let rc = unsafe { libc::setns(fd.as_raw_fd(), nstype) };
+    if rc < 0 { Err(last_errno()) } else { Ok(()) }
+}
+
 pub fn open_devnull() -> Result<OwnedFd, Errno> {
     use rustix::fs::{Mode, OFlags, open};
     open(c"/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())

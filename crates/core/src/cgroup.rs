@@ -428,6 +428,33 @@ pub fn enter_own_leaf() -> std::io::Result<()> {
     write_file(&leaf.join("cgroup.procs"), &std::process::id().to_string())
 }
 
+/// The cgroup another process lives in, as a directory descriptor.
+///
+/// For `exec`: a second process in a container must land under the same
+/// limits as the first, and `CLONE_INTO_CGROUP` wants a directory fd.
+///
+/// The path is read back from `/proc/<pid>/cgroup` rather than rebuilt from
+/// the container id. Rebuilding it would have to re-derive
+/// [`delegating_parent`] from *this* process, and `exec` may well run from
+/// a different login session - and therefore a different slice - than the
+/// `run` that created the container. The kernel already knows the answer.
+///
+/// One sharp edge: a `/proc/<pid>/cgroup` read reports the path relative to
+/// the **reader's** cgroup namespace, not the subject's. Read from the host
+/// namespace - which is where `exec` runs, before any `setns` - it is the
+/// full path. Read from inside the container it would be `/`, which would
+/// silently resolve to the root cgroup. This is why the open happens first.
+pub fn open_existing(pid: i32) -> Option<OwnedFd> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let rel = s.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    if rel == "/" {
+        return None;
+    }
+    let dir = PathBuf::from(CGROUP_ROOT).join(rel.trim_start_matches('/'));
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    crate::sys::open_path_dir(&c).ok()
+}
+
 /// The `0::` line of `/proc/self/cgroup` — our location within the hierarchy.
 pub fn own_cgroup() -> Option<String> {
     let s = std::fs::read_to_string("/proc/self/cgroup").ok()?;

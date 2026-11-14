@@ -100,10 +100,29 @@ impl UserSpec {
                 id_is_mapped("/proc/self/gid_map", self.gid),
             )
         };
-        if u && g {
+        self.explain(u, g)
+    }
+
+    /// Why this user cannot be entered in a container that is **already
+    /// running**, if it cannot.
+    ///
+    /// `exec` joins a user namespace instead of creating one, so neither
+    /// branch of [`Self::unmapped_reason`] applies: our own map describes a
+    /// namespace the command will not run in, and there is no map we are
+    /// about to write. The container's own map is the only file that
+    /// answers the question, and the kernel keeps it at a readable path.
+    pub fn unmapped_in(&self, pid: i32) -> Option<String> {
+        self.explain(
+            id_is_mapped(&format!("/proc/{pid}/uid_map"), self.uid),
+            id_is_mapped(&format!("/proc/{pid}/gid_map"), self.gid),
+        )
+    }
+
+    fn explain(&self, uid_ok: bool, gid_ok: bool) -> Option<String> {
+        if uid_ok && gid_ok {
             return None;
         }
-        let which = match (u, g) {
+        let which = match (uid_ok, gid_ok) {
             (false, false) => format!("uid {} and gid {}", self.uid, self.gid),
             (false, true) => format!("uid {}", self.uid),
             _ => format!("gid {}", self.gid),
