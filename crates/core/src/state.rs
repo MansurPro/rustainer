@@ -36,6 +36,25 @@ impl Paths {
 
     /// `$RUSTAINER_ROOT`, else `/run/rustainer` for root, else
     /// `$XDG_RUNTIME_DIR/rustainer`, else a per-uid directory under `/tmp`.
+    /// Where data that must outlive a reboot lives: volumes, networks,
+    /// images.
+    ///
+    /// Not the same as the runtime root, which is usually a tmpfs. Kept
+    /// here so the supervisor can find the network records without
+    /// depending on the image crate.
+    pub fn data_root() -> PathBuf {
+        if let Some(v) = std::env::var_os("RUSTAINER_IMAGE_ROOT") {
+            return PathBuf::from(v);
+        }
+        if rustix::process::geteuid().is_root() {
+            return PathBuf::from("/var/lib/rustainer");
+        }
+        match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h).join(".local/share/rustainer"),
+            None => PathBuf::from("/tmp/rustainer-images"),
+        }
+    }
+
     pub fn default_root() -> PathBuf {
         if let Some(v) = std::env::var_os("RUSTAINER_ROOT") {
             return PathBuf::from(v);

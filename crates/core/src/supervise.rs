@@ -41,7 +41,6 @@ use serde::{Deserialize, Serialize};
 use crate::cgroup::{self, Cgroup, Limits};
 use crate::firewall::{self, Publish};
 use crate::net::{self, Lease};
-use crate::proxy::Forwarder;
 use crate::security::{self, CapabilitySet, Security, UserSpec};
 use crate::state::{self, Lock, Paths, State, Status};
 use crate::{Exit, MountPlan, Namespaces, Privileges, Spec, mount, sys};
@@ -185,6 +184,13 @@ pub struct Config {
     /// Attach to the bridge and get an address. Implies `private_net`.
     #[serde(default)]
     pub bridge: bool,
+    /// Which bridge, when it is not the default one.
+    ///
+    /// `None` means the engine's own `rustainer0`, which is what every
+    /// container used before user-defined networks existed - so an old
+    /// container's config still deserialises to exactly what it meant.
+    #[serde(default)]
+    pub network: Option<net::Network>,
     /// The address handed to this container, recorded so `ps` and teardown
     /// do not have to recompute it.
     #[serde(default)]
@@ -259,16 +265,25 @@ impl Config {
             hostname: Some(self.hostname.clone().into()),
             workdir: self.workdir.clone().map(Into::into),
             net_messages: match (self.bridge, &self.ip) {
-                (true, Some(ip)) => ip
-                    .parse()
-                    .map(|ip| {
-                        net::container_messages(&Lease {
-                            ip,
-                            prefix: net::SUBNET_PREFIX,
-                            gateway: net::GATEWAY,
+                (true, Some(ip)) => {
+                    // The container's OWN network, not the default one.
+                    // Taking the prefix and gateway from the constants
+                    // gave a container on a user-defined network an
+                    // address in its subnet and a default route into
+                    // somebody else's - which the kernel reports as
+                    // ENETUNREACH while configuring eth0, a long way
+                    // from the mistake.
+                    let n = self.network.clone().unwrap_or_default();
+                    ip.parse()
+                        .map(|ip| {
+                            net::container_messages(&Lease {
+                                ip,
+                                prefix: n.prefix,
+                                gateway: n.gateway,
+                            })
                         })
-                    })
-                    .unwrap_or_default(),
+                        .unwrap_or_default()
+                }
                 _ => Vec::new(),
             },
             namespaces: Namespaces {
@@ -656,6 +671,7 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
         // keeps everything it wrote - which is what Docker does too.
         let mounts = config.mount_plan(cg.as_ref().map(|c| c.dir()), &paths.dir(id))?;
 
+        let network = config.network.clone().unwrap_or_default();
         let mut spawned = crate::spawn(
             &spec,
             mounts,
@@ -680,7 +696,7 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
         // container's interface has to exist before the container tries to
         // configure it, and the go-ahead is what guarantees the ordering.
         if config.bridge
-            && let Err(e) = plumb_network(spawned.pid)
+            && let Err(e) = plumb_network(spawned.pid, &network)
         {
             let _ = sys::kill_process(
                 rustix::process::Pid::from_raw(spawned.pid).unwrap(),
@@ -741,6 +757,14 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
             serde_json::json!({ "pid": spawned.pid, "restarts": restarts }),
         );
 
+        // Everyone on this network learns about us, and we learn about
+        // them. After the state says Running, because that is what the
+        // scan looks for - doing it earlier finds nobody, including
+        // ourselves.
+        if config.bridge {
+            refresh_network_hosts(paths, &network.name);
+        }
+
         // --- the steady state ------------------------------------------------
         let mut out_log = log_file(&paths.stdout_log(id))?;
         let mut err_log = log_file(&paths.stderr_log(id))?;
@@ -789,6 +813,13 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
         st.exited_at = Some(state::now());
         st.stop_requested = stop_was_requested(paths, id);
         st.store(paths)?;
+        // And the network learns we are gone. A stale entry is worse
+        // than a missing one: a name resolving to an address nothing
+        // answers on gives a connection timeout instead of a lookup
+        // failure, which is a much longer afternoon.
+        if config.bridge {
+            refresh_network_hosts(paths, &network.name);
+        }
         crate::events::record(
             paths,
             "die",
@@ -994,8 +1025,15 @@ fn reap_into(st: &mut State, pid: i32) -> Exit {
 /// does not work, whereas rules outliving their container are inherited by
 /// whichever container is handed that address next (RND.md §17).
 struct Published {
+    /// Which bridge the rules were written for, so the teardown removes
+    /// the ones that exist rather than the ones a default would name.
+    bridge: String,
     /// Dropped first, so the listener stops before the rules go.
-    forwarders: Vec<Forwarder>,
+    ///
+    /// Child PROCESSES, not threads: the supervisor must still be able
+    /// to call `clone3`, and `clone3` refuses a process that has ever
+    /// had a second thread.
+    forwarders: Vec<crate::proxy::Child>,
     ports: Vec<Publish>,
 }
 
@@ -1004,7 +1042,7 @@ impl Drop for Published {
         // Stop listening before removing the rules, so there is no window
         // in which the port is reachable but no longer authorised.
         self.forwarders.clear();
-        unpublish_ports(&self.ports);
+        unpublish_ports_on(&self.ports, &self.bridge);
     }
 }
 
@@ -1013,24 +1051,33 @@ impl Drop for Published {
 /// Partial failure is undone by dropping the half-built [`Published`], so
 /// there is one rollback path rather than one per failure point.
 fn publish_ports(config: &Config) -> Result<Published, Error> {
+    let bridge = config
+        .network
+        .as_ref()
+        .map(|n| n.bridge.clone())
+        .unwrap_or_else(|| net::BRIDGE.to_owned());
     let mut out = Published {
+        bridge: bridge.clone(),
         forwarders: Vec::new(),
         ports: Vec::new(),
     };
     if config.ports.is_empty() {
         return Ok(out);
     }
+    // The container's own bridge: a DNAT scoped to the wrong interface
+    // translates nothing, and the symptom is a published port that is
+    // open and silent.
     let fw = firewall::detect().ok_or(firewall::Error::NoBackend)?;
     for p in &config.ports {
         // Recorded BEFORE the rules are written. `publish` writes two
         // rules and can fail between them, so a failed publish has still
         // mutated the host and the rollback has to know about it.
         out.ports.push(*p);
-        fw.publish(p, net::BRIDGE)?;
+        fw.publish(p, &bridge)?;
         // The forwarder covers `curl localhost:<port>`, which no firewall
         // rule can: loopback is deliberately excluded from destination NAT.
         out.forwarders
-            .push(Forwarder::start(*p).map_err(Error::Io)?);
+            .push(crate::proxy::Child::start("/proc/self/exe", *p).map_err(Error::Io)?);
     }
     Ok(out)
 }
@@ -1038,12 +1085,16 @@ fn publish_ports(config: &Config) -> Result<Published, Error> {
 /// Idempotent: removing a rule that is not there is not an error, which is
 /// what lets both the rollback and the teardown call it blindly.
 fn unpublish_ports(ports: &[Publish]) {
+    unpublish_ports_on(ports, net::BRIDGE);
+}
+
+fn unpublish_ports_on(ports: &[Publish], bridge: &str) {
     if ports.is_empty() {
         return;
     }
     if let Some(fw) = firewall::detect() {
         for p in ports {
-            fw.unpublish(p, net::BRIDGE);
+            fw.unpublish(p, bridge);
         }
     }
 }
@@ -1055,7 +1106,7 @@ fn unpublish_ports(ports: &[Publish]) {
 /// holding an address and an on-link route reserves a subnet as far as any
 /// future allocator is concerned. It is created once and reused, never per
 /// container.
-fn plumb_network(pid: i32) -> Result<(), Error> {
+fn plumb_network(pid: i32, n: &net::Network) -> Result<(), Error> {
     // Stage 11: rootless, every one of these operations fails with EPERM
     // and the bare errno names nothing. The gate is CAP_NET_ADMIN in the
     // user namespace that owns the TARGET namespace - here the host's,
@@ -1066,30 +1117,54 @@ fn plumb_network(pid: i32) -> Result<(), Error> {
     // "are we allowed to do this" has no honest answer short of trying:
     // under `unshare --user --net` the host side is our own new namespace
     // and these calls genuinely do succeed.
-    match plumb(pid) {
+    match plumb(pid, n) {
         Err(Error::Sys(sys::Error::PERM)) => Err(Error::BridgeUnprivileged),
         other => other,
     }
 }
 
-fn plumb(pid: i32) -> Result<(), Error> {
+/// Every user-defined network's bridge, read from the records the CLI
+/// writes.
+///
+/// Read rather than remembered: the supervisor is started once per
+/// container and a network may have been created since, so a cached list
+/// would isolate against yesterday's set.
+fn known_bridges() -> Vec<String> {
+    let dir = crate::state::Paths::data_root().join("networks");
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.path().extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(t) = std::fs::read_to_string(e.path())
+                && let Ok(n) = serde_json::from_str::<net::Network>(&t)
+            {
+                out.push(n.bridge);
+            }
+        }
+    }
+    out
+}
+
+fn plumb(pid: i32, n: &net::Network) -> Result<(), Error> {
     let nl = net::Netlink::open()?;
 
     // The bridge, once. `EEXIST` is the normal case after the first
     // container and is not an error.
-    if net::if_index(net::BRIDGE).is_none() {
-        match nl.request(&net::create_bridge(net::BRIDGE)) {
+    if net::if_index(&n.bridge).is_none() {
+        match nl.request(&net::create_bridge(&n.bridge)) {
             Ok(()) | Err(sys::Error::EXIST) => {}
             Err(e) => return Err(e.into()),
         }
-        let idx = net::if_index(net::BRIDGE).ok_or(sys::Error::NODEV)?;
-        match nl.request(&net::add_address(idx, net::GATEWAY, net::SUBNET_PREFIX)) {
+        let idx = net::if_index(&n.bridge).ok_or(sys::Error::NODEV)?;
+        match nl.request(&net::add_address(idx, n.gateway, n.prefix)) {
             Ok(()) | Err(sys::Error::EXIST) => {}
             Err(e) => return Err(e.into()),
         }
-        nl.request(&net::link_up(net::BRIDGE))?;
+        nl.request(&net::link_up(&n.bridge))?;
     }
-    let bridge_idx = net::if_index(net::BRIDGE).ok_or(sys::Error::NODEV)?;
+    let bridge_idx = net::if_index(&n.bridge).ok_or(sys::Error::NODEV)?;
 
     // The container's namespace, as a descriptor. The peer goes straight
     // into it, so its interface never appears on the host even briefly.
@@ -1118,7 +1193,7 @@ fn plumb(pid: i32) -> Result<(), Error> {
     // internet has no route to RFC 1918 space, so the SYN-ACK is dropped
     // and the failure looks like "everything times out".
     let fw = firewall::detect().ok_or(firewall::Error::NoBackend)?;
-    fw.ensure_masquerade(net::GATEWAY, net::SUBNET_PREFIX, net::BRIDGE)?;
+    fw.ensure_masquerade(n.gateway, n.prefix, &n.bridge)?;
     // And the forward path. A FORWARD policy of DROP - set by Kubernetes,
     // libvirt, firewalld and most cloud images - silently blackholes every
     // container's egress, with a correct address, route and NAT rule in
@@ -1128,10 +1203,22 @@ fn plumb(pid: i32) -> Result<(), Error> {
             "rustainer: this host has a FORWARD policy of DROP that something else set. \
              Accept rules for {} have been added to our own chain; if another ruleset \
              drops the packet first, containers will have no egress.",
-            net::BRIDGE
+            &n.bridge
         );
     }
-    fw.ensure_forward(net::BRIDGE)?;
+    fw.ensure_forward(&n.bridge)?;
+
+    // Every bridge we know about, so the chain is correct as a whole
+    // rather than only for the network this container happens to be on.
+    // Rebuilt from empty each time, which is what makes a removed
+    // network stop being isolated against.
+    let mut bridges: Vec<String> = vec![net::BRIDGE.to_owned()];
+    bridges.extend(known_bridges());
+    bridges.sort();
+    bridges.dedup();
+    if bridges.len() > 1 {
+        fw.ensure_isolation(&bridges)?;
+    }
     Ok(())
 }
 
@@ -1143,6 +1230,84 @@ fn plumb(pid: i32) -> Result<(), Error> {
 /// drops `SIGKILL` too when the sender is inside the namespace with
 /// `SIG_DFL`. Only a signal from an ancestor namespace gets through, which
 /// is why this runs here and not in the container.
+/// Rewrite the `/etc/hosts` of every container on a network so they can
+/// find each other by name.
+///
+/// # Why not DNS
+///
+/// Docker runs a resolver at 127.0.0.11 inside each container's network
+/// namespace. That needs a process living in that namespace, and this
+/// engine has no daemon to be one - a per-container resolver would be a
+/// second thing to supervise, and a crashed one is a container whose
+/// networking is silently half-broken.
+///
+/// The file is already bind-mounted from the state directory, so writing
+/// it again is all it takes: `std::fs::write` truncates the same inode
+/// and the container sees the new contents on its next lookup. glibc and
+/// musl both re-read `/etc/hosts` per lookup, so nothing has to be told.
+///
+/// The honest limit, stated rather than discovered: this resolves names,
+/// not records. No SRV, no round-robin over several addresses for one
+/// name, and a process that cached a lookup before a peer appeared keeps
+/// its answer. In exchange, `cat /etc/hosts` is the whole debugging
+/// story.
+pub fn refresh_network_hosts(paths: &Paths, network: &str) {
+    let mut members: Vec<(String, String, String)> = Vec::new();
+    for id in paths.list().unwrap_or_default() {
+        let Ok(cfg) = Config::load(paths, &id) else {
+            continue;
+        };
+        if !cfg.bridge {
+            continue;
+        }
+        let name = cfg
+            .network
+            .as_ref()
+            .map(|n| n.name.as_str())
+            .unwrap_or("bridge");
+        if name != network {
+            continue;
+        }
+        let running = State::load(paths, &id)
+            .map(|s| matches!(s.observed_status(), Status::Running | Status::Created))
+            .unwrap_or(false);
+        if !running {
+            continue;
+        }
+        if let Some(ip) = &cfg.ip {
+            members.push((id.clone(), cfg.hostname.clone(), ip.clone()));
+        }
+    }
+
+    for (id, _, _) in &members {
+        let Ok(cfg) = Config::load(paths, id) else {
+            continue;
+        };
+        let mut body =
+            String::from("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
+        if let Some(ip) = &cfg.ip {
+            body.push_str(&format!("{ip}\t{}\n", cfg.hostname));
+        }
+        for (peer_id, peer_host, peer_ip) in &members {
+            if peer_id == id {
+                continue;
+            }
+            // Both spellings: the container id, which is what `ps`
+            // shows, and the hostname, which is what a config file
+            // inside the container is likely to name.
+            body.push_str(&format!("{peer_ip}\t{peer_id}\n"));
+            if peer_host != peer_id {
+                body.push_str(&format!("{peer_ip}\t{peer_host}\n"));
+            }
+        }
+        // A stack's own peer list still applies, and is kept.
+        for (name, ip) in &cfg.peers {
+            body.push_str(&format!("{ip}\t{name}\n"));
+        }
+        let _ = std::fs::write(paths.dir(id).join("hosts"), body);
+    }
+}
+
 /// Where a requested stop is recorded.
 ///
 /// A file of its own, and not a field in `state.json`, because the two
@@ -1270,6 +1435,7 @@ mod tests {
             argv: vec!["sh".into()],
             envp: vec!["PATH=/bin".into()],
             hostname: "box".into(),
+            network: None,
             restart: RestartPolicy::No,
             restart_max: None,
             tty: false,

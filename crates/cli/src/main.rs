@@ -85,6 +85,9 @@ enum Command {
     /// List or remove named volumes.
     #[command(subcommand)]
     Volume(VolumeCmd),
+    /// Create, list or remove user-defined networks.
+    #[command(subcommand)]
+    Network(NetworkCmd),
     /// Show what the engine has done: starts, exits, restarts, pulls.
     Events(EventsArgs),
     /// Serve the local web UI and HTTP API.
@@ -95,6 +98,21 @@ enum Command {
     /// Internal: become the supervisor for an already-prepared container.
     #[command(hide = true)]
     Supervise { id: String },
+
+    /// Internal: forward a host port to a container, in a process of its
+    /// own.
+    ///
+    /// A process rather than a thread in the supervisor, because the
+    /// supervisor has to be able to call `clone3` and `clone3` refuses a
+    /// process that has ever had a second thread.
+    #[command(hide = true)]
+    Forward {
+        /// An already-bound listening socket, inherited across the exec.
+        #[arg(long)]
+        fd: i32,
+        #[arg(long)]
+        to: String,
+    },
 }
 
 // `Default` so a stack can build one field by field. clap fills every
@@ -360,6 +378,21 @@ struct ServeArgs {
 }
 
 #[derive(Subcommand)]
+enum NetworkCmd {
+    /// Create a network with a bridge and subnet of its own.
+    Create {
+        name: String,
+        /// `10.89.N.0/24` by default, picked from what is free.
+        #[arg(long)]
+        subnet: Option<String>,
+    },
+    /// List networks.
+    Ls,
+    /// Remove a network. Refused while containers are on it.
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
 enum VolumeCmd {
     /// List named volumes.
     Ls,
@@ -438,10 +471,12 @@ fn real_main() -> Result<ExitCode> {
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
         Command::Volume(a) => cmd_volume(a),
+        Command::Network(a) => cmd_network(&paths, a),
         Command::Events(a) => cmd_events(&paths, a),
         Command::Serve(a) => cmd_serve(cli_root.clone(), a),
         Command::Stack(a) => cmd_stack(&paths, a),
         Command::Supervise { id } => cmd_supervise(&paths, &id),
+        Command::Forward { fd, to } => cmd_forward(fd, &to),
     }
 }
 
@@ -461,11 +496,22 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             );
             (false, false)
         }
-        other => bail!(
-            "--network {other} is not supported. `bridge` gives the container an address \
-             and a route off the machine; `none` gives it only loopback; `host` shares \
-             the host's stack. Custom networks are not implemented."
-        ),
+        other => {
+            if networks_dir().join(format!("{other}.json")).exists() {
+                (true, true)
+            } else {
+                bail!(
+                    "--network {other} is not a network. `bridge` gives the container an \
+                     address on the engine's own bridge; `none` gives it only loopback; \
+                     `host` shares the host's stack. Make a network of your own with \
+                     `rustainer network create {other}`."
+                )
+            }
+        }
+    };
+    let network_def = match args.network.as_str() {
+        "bridge" | "none" | "host" => None,
+        other => Some(load_network(other)?),
     };
 
     // Three shapes, chosen by --rootfs:
@@ -654,6 +700,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
 
     // An address, before the container exists: the netlink messages the
     // container sends to configure itself are built from it in the parent.
+    let net_def = network_def.clone().unwrap_or_default();
     let lease = match (bridge, &args.ip) {
         (false, Some(ip)) => bail!(
             "--ip {ip} needs --network bridge: with `none` there is no interface to \
@@ -667,11 +714,11 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             ip: ip
                 .parse()
                 .with_context(|| format!("--ip {ip:?} is not an IPv4 address"))?,
-            prefix: rustainer_core::net::SUBNET_PREFIX,
-            gateway: rustainer_core::net::GATEWAY,
+            prefix: net_def.prefix,
+            gateway: net_def.gateway,
         }),
         (true, None) => Some(
-            rustainer_core::net::allocate(&paths_root(paths))
+            rustainer_core::net::allocate_in(&paths_root(paths), &net_def)
                 .context("allocating an address for the container")?,
         ),
     };
@@ -750,6 +797,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         // overlayfs, and overlayfs cannot host an upperdir at all.
         private_net,
         bridge,
+        network: network_def.clone(),
         userns,
         tty: args.tty,
         restart: restart_policy,
@@ -1261,6 +1309,194 @@ fn parse_add_host(spec: &str) -> Result<(String, String)> {
     Ok((name.to_owned(), addr.to_string()))
 }
 
+/// Where user-defined networks are recorded.
+///
+/// Beside the volumes, because a network outlives a reboot in the same
+/// way: the bridge does not, but the NAME, the subnet and the containers
+/// that reference it all do, and recreating the bridge from the record is
+/// what the first container on it does anyway.
+fn networks_dir() -> PathBuf {
+    Store::default_root().join("networks")
+}
+
+fn load_network(name: &str) -> Result<rustainer_core::net::Network> {
+    let p = networks_dir().join(format!("{name}.json"));
+    let text = std::fs::read_to_string(&p)
+        .with_context(|| format!("no network {name:?}. `rustainer network ls` lists them."))?;
+    serde_json::from_str(&text).with_context(|| format!("reading the network {name:?}"))
+}
+
+fn all_networks() -> Vec<rustainer_core::net::Network> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(networks_dir()) {
+        for e in rd.flatten() {
+            if e.path().extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(t) = std::fs::read_to_string(e.path())
+                && let Ok(n) = serde_json::from_str(&t)
+            {
+                out.push(n);
+            }
+        }
+    }
+    out.sort_by(|a: &rustainer_core::net::Network, b| a.name.cmp(&b.name));
+    out
+}
+
+fn cmd_network(paths: &Paths, cmd: NetworkCmd) -> Result<ExitCode> {
+    use rustainer_core::net::Network;
+    match cmd {
+        NetworkCmd::Create { name, subnet } => {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                bail!("{name:?} is not a usable network name");
+            }
+            if matches!(name.as_str(), "bridge" | "none" | "host") {
+                bail!(
+                    "{name:?} is one of the three built-in network modes, so a network \
+                     of that name could never be selected"
+                );
+            }
+            std::fs::create_dir_all(networks_dir())?;
+            let path = networks_dir().join(format!("{name}.json"));
+            if path.exists() {
+                bail!("a network called {name:?} already exists");
+            }
+            let existing = all_networks();
+            let (gateway, prefix) = match &subnet {
+                Some(cidr) => parse_subnet(cidr)?,
+                None => {
+                    // 10.89.N.0/24, taking the first N nobody is using.
+                    // Deliberately not in 172.16/12: Docker allocates
+                    // there, and two engines on one host colliding on a
+                    // subnet is a routing bug nobody enjoys.
+                    let used: Vec<u8> = existing
+                        .iter()
+                        .filter(|n| n.gateway.octets()[..2] == [10, 89])
+                        .map(|n| n.gateway.octets()[2])
+                        .collect();
+                    let third = (0u8..=254)
+                        .find(|n| !used.contains(n))
+                        .ok_or_else(|| anyhow::anyhow!("no free subnet in 10.89.0.0/16"))?;
+                    (std::net::Ipv4Addr::new(10, 89, third, 1), 24)
+                }
+            };
+            for n in &existing {
+                if n.gateway == gateway {
+                    bail!("the network {:?} already uses {gateway}", n.name);
+                }
+            }
+            let net = Network {
+                name: name.clone(),
+                bridge: Network::bridge_for(&name),
+                gateway,
+                prefix,
+            };
+            std::fs::write(&path, serde_json::to_vec_pretty(&net)?)?;
+            rustainer_core::events::record(
+                paths,
+                "network-create",
+                &name,
+                serde_json::json!({ "subnet": format!("{gateway}/{prefix}"), "bridge": net.bridge }),
+            );
+            println!("{name}");
+        }
+        NetworkCmd::Ls => {
+            println!(
+                "{:<20} {:<20} {:<18} CONTAINERS",
+                "NAME", "SUBNET", "BRIDGE"
+            );
+            let mut rows = vec![Network::default()];
+            rows.extend(all_networks());
+            for n in rows {
+                let count = containers_on(paths, &n.name).len();
+                println!(
+                    "{:<20} {:<20} {:<18} {}",
+                    n.name,
+                    format!("{}/{}", n.gateway, n.prefix),
+                    n.bridge,
+                    count
+                );
+            }
+        }
+        NetworkCmd::Rm { name } => {
+            if name.contains('/') || name.contains("..") {
+                bail!("{name:?} is not a network name");
+            }
+            let on_it = containers_on(paths, &name);
+            if !on_it.is_empty() {
+                bail!(
+                    "{} container(s) are still on {name}: {}. Remove them first - \
+                     taking the network away under a running container leaves it with \
+                     an address nothing routes.",
+                    on_it.len(),
+                    on_it.join(", ")
+                );
+            }
+            let path = networks_dir().join(format!("{name}.json"));
+            if !path.exists() {
+                bail!("no network {name:?}");
+            }
+            std::fs::remove_file(&path)?;
+            rustainer_core::events::record(paths, "network-remove", &name, serde_json::json!({}));
+            println!("{name}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `10.89.3.0/24` or `10.89.3.1/24` - the gateway is always `.1`.
+fn parse_subnet(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
+    let (addr, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("{cidr:?} is not a CIDR subnet like 10.89.3.0/24"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{prefix:?} is not a prefix length"))?;
+    if !(8..=24).contains(&prefix) {
+        bail!("a prefix of /{prefix} is not supported; use between /8 and /24");
+    }
+    let a: std::net::Ipv4Addr = addr
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{addr:?} is not an IPv4 address"))?;
+    let o = a.octets();
+    Ok((std::net::Ipv4Addr::new(o[0], o[1], o[2], 1), prefix))
+}
+
+/// Which containers are on a network right now.
+///
+/// Read from the containers themselves rather than from a membership
+/// list: a list would be a second thing to keep correct, and a container
+/// that died without updating it would leave the network permanently
+/// un-removable.
+fn containers_on(paths: &Paths, network: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for id in paths.list().unwrap_or_default() {
+        let Ok(cfg) = Config::load(paths, &id) else {
+            continue;
+        };
+        let name = cfg
+            .network
+            .as_ref()
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| "bridge".into());
+        if name != network || !cfg.bridge {
+            continue;
+        }
+        if State::load(paths, &id)
+            .map(|s| matches!(s.observed_status(), Status::Running | Status::Created))
+            .unwrap_or(false)
+        {
+            out.push(id);
+        }
+    }
+    out
+}
+
 fn volumes_root() -> PathBuf {
     Store::default_root().join("volumes")
 }
@@ -1519,6 +1755,44 @@ fn stack_ps(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
         println!("{name:<24} {status:<9} {pid:<8} {addr:<15} {cmd}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_forward(fd: i32, to: &str) -> Result<ExitCode> {
+    use rustainer_core::firewall::Publish;
+    use std::os::fd::FromRawFd;
+    let (a, p) = to
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("{to:?} is not address:port"))?;
+    let container_ip: std::net::Ipv4Addr = a
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{a:?} is not an IPv4 address"))?;
+    let container_port: u16 = p
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{p:?} is not a port"))?;
+    // SAFETY: the supervisor bound this listener and dup'd it onto this
+    // descriptor immediately before the execve that produced us.
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    let local = listener.local_addr()?;
+    let (host_ip, host_port) = match local {
+        std::net::SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
+        _ => bail!("the inherited listener is not IPv4"),
+    };
+    let mut f = rustainer_core::proxy::Forwarder::from_listener(
+        listener,
+        Publish {
+            host_ip,
+            host_port,
+            container_ip,
+            container_port,
+        },
+    )
+    .with_context(|| format!("forwarding {local} to {to}"))?;
+    // Until killed. The supervisor owns this process and ends it when the
+    // container's ports are torn down.
+    loop {
+        std::thread::park();
+        let _ = &mut f;
+    }
 }
 
 fn cmd_events(paths: &Paths, args: EventsArgs) -> Result<ExitCode> {

@@ -65,6 +65,8 @@ is easier to reason about once the process model is not also in question.
 | 20 | Restart policies and an event log | **Done** |
 | 21 | `build` — images from a Dockerfile | **Done** |
 | 22 | `push` — upload an image to a registry | **Done** |
+| 23 | User-defined networks, and names across them | **Done** |
+| 24 | A terminal in the page, and the rest of the app | **Done** |
 
 The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete.
 Stages 12 onwards are the additive work §19 held back until the mechanisms
@@ -792,6 +794,89 @@ only on the way back, as a `diff_id` mismatch on layer 0.
 
 Pull now keeps the manifest it fetched, which is what lets a pulled image
 be pushed on at all, and `build` writes one for the image it made.
+
+### User-defined networks
+
+```sh
+rustainer network create app
+rustainer network create data --subnet 10.90.7.0/24
+rustainer run -d --name web --network app  nginx:1.27-alpine
+rustainer run -d --name db  --network data postgres:17-alpine
+```
+
+A network is three things: a bridge, a subnet, and **a boundary**. The
+first two are easy, and the third is what a naive implementation quietly
+leaves out — `ip_forward` is on and both bridges are on the same host, so
+the kernel routes between them happily. Names not resolving across
+networks makes it *look* isolated, right up until somebody types an
+address. The stage 23 test types the address.
+
+Isolation is Docker's shape, because it is the shape that works: one
+chain matches "left one of our bridges and is not going back to the same
+one", a second drops it if its destination is another of ours. Pairwise
+rules would be N² and would need reordering every time a network is
+added. The jump is **deleted and re-inserted at position 1 every time**,
+because `ensure_forward` inserts its blanket accepts at the top — so
+without that, every container started after the first pushed its accepts
+above the jump and isolation stopped working from the second container
+onwards. That is a real bug this found, and the test now starts a later
+container specifically to catch it coming back.
+
+**Names resolve through `/etc/hosts`, not DNS.** Docker runs a resolver
+at 127.0.0.11 inside each container's network namespace; that needs a
+process living in that namespace, and this engine has no daemon to be
+one — a per-container resolver would be a second thing to supervise, and
+a crashed one is a container whose networking is silently half-broken.
+The file is already bind-mounted from the state directory, `std::fs::write`
+truncates the same inode, and both glibc and musl re-read `/etc/hosts`
+per lookup. So writing it again *is* the mechanism, and it is rewritten
+for every member whenever one joins or leaves.
+
+The honest limit, stated rather than discovered: this resolves names, not
+records. No SRV, no round-robin over several addresses for one name, and
+a process that cached a lookup before a peer appeared keeps its answer.
+In exchange, `cat /etc/hosts` is the whole debugging story.
+
+The bridge interface is **not** named after the network. `IFNAMSIZ` is 16
+including the NUL, and a kernel that truncates silently would give two
+long network names the same bridge, so the interface is `rtb` plus twelve
+hex of the name's hash and the human name lives only in the engine's own
+files.
+
+### A terminal in the page
+
+`rustainer serve` now gives you a **real interactive shell in the
+browser** — the prompt, `^C`, the exit status, all of it — reached with
+`⌘K` → *Shell into &lt;container&gt;*.
+
+The shape is the same rule as every other mutation: the server allocates
+the pty and spawns the **CLI** with the slave as its stdio. It does not
+create the container process itself, because it is multi-threaded and
+`clone3` refuses a process that has ever had a second thread. A terminal
+in a browser, sitting on top of the oldest invariant in the engine.
+
+Output is **polled by offset**, not streamed, because a websocket is a
+second protocol, a second framing and a second set of failure modes for a
+page that already polls everything else twice a second. The thing that
+makes that safe is that two reads from one offset return the same bytes —
+and the page had exactly that bug: two polls in flight both asked from the
+same offset, so every keystroke's echo was drawn twice and the line turned
+to mush. Fixed by serialising the polls, and the test now asserts the
+server's half of it.
+
+The emulator is **deliberately partial, not half-finished**: printable
+characters, carriage return, newline, backspace, and the two erase
+sequences a prompt actually uses. Full ANSI is cursor addressing, scroll
+regions, alternate screens and 256-colour attributes — a project in its
+own right, and `rustainer exec -it` in a real terminal already does all of
+it. The page says so rather than pretending `vi` will be fine.
+
+Also in the page now: **Events**, colour-coded, where you can watch a
+crash-looping container restart in real time; **Networks**, with container
+counts; **Build**, from a context path; a **command palette** on `⌘K` that
+reaches every view, every container and every action in two keystrokes.
+
+And still, every action shows the command that performed it.
 
 ### The engine does not lie about what it does not know
 

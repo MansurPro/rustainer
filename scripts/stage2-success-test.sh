@@ -221,7 +221,7 @@ echo
 echo "8. Refusals stay explicit"
 "$B" run --rootfs "$SCRATCH/host-marker" --network host /bin/true 2>&1 | grep -q 'not a directory' \
     && ok "a non-directory rootfs refuses" || bad "a non-directory rootfs did not refuse"
-"$B" run --rootfs "$ROOTFS" --network nonsense /bin/true 2>&1 | grep -q 'not supported' \
+"$B" run --rootfs "$ROOTFS" --network nonsense /bin/true 2>&1 | grep -q 'is not a network' \
     && ok "an unknown network mode refuses" || bad "an unknown network mode was accepted"
 
 echo

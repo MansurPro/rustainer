@@ -155,6 +155,25 @@
   .bar > i.hot { background: var(--warn); }
   .bar > i.full { background: var(--bad); }
 
+  .term {
+    background: #07090d; color: #dfe4ec; font-family: var(--mono); font-size: 12.5px;
+    line-height: 1.45; padding: 10px 12px; height: 46vh; overflow: auto;
+    white-space: pre-wrap; word-break: break-all; outline: none; cursor: text;
+  }
+  .term:focus { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent); }
+  .term .cur { background: var(--accent); color: #07090d; }
+
+  /* ⌘K. The one affordance that makes a dense tool feel fast. */
+  #palette { border: none; background: transparent; padding: 0; width: min(620px, calc(100vw - 32px)); }
+  #palette::backdrop { background: rgba(0,0,0,0.5); }
+  #palette .box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  #palette input { border: none; border-bottom: 1px solid var(--line); border-radius: 0; padding: 13px 15px; font-size: 15px; }
+  #palette input:focus { outline: none; }
+  #palette ul { list-style: none; margin: 0; padding: 5px; max-height: 50vh; overflow: auto; }
+  #palette li { padding: 8px 11px; border-radius: 7px; cursor: pointer; display: flex; gap: 10px; align-items: center; }
+  #palette li[aria-selected="true"] { background: var(--panel-2); }
+  #palette li small { color: var(--dim); margin-left: auto; font-family: var(--mono); font-size: 11px; }
+
   /* The command strip: every action says what it ran. */
   #cmdlog {
     position: fixed; right: 14px; bottom: 14px; width: min(560px, calc(100vw - 28px));
@@ -201,6 +220,8 @@
   <nav>
     <button data-view="containers" aria-current="true">Containers</button>
     <button data-view="stacks">Stacks</button>
+    <button data-view="networks">Networks</button>
+    <button data-view="events">Events</button>
     <button data-view="images">Images</button>
     <button data-view="volumes">Volumes</button>
   </nav>
@@ -235,13 +256,30 @@
     </div>
   </section>
 
+  <section id="view-networks" hidden>
+    <div class="card">
+      <h2>Networks</h2>
+      <div id="networks"></div>
+    </div>
+  </section>
+
+  <section id="view-events" hidden>
+    <div class="card">
+      <h2>Events <span class="spacer"></span>
+        <span class="dim" style="font-size:11px;text-transform:none;letter-spacing:0">newest last</span>
+      </h2>
+      <div id="events"></div>
+    </div>
+  </section>
+
   <section id="view-images" hidden>
     <div class="card">
       <h2>
         Images
         <span class="spacer"></span>
-        <input id="pullref" placeholder="alpine:3.21" style="width: 220px; padding: 3px 8px; font-size: 12px;">
+        <input id="pullref" placeholder="alpine:3.21" style="width: 200px; padding: 3px 8px; font-size: 12px;">
         <button class="act" id="pull">Pull</button>
+        <button class="act" id="build">Build…</button>
       </h2>
       <div id="images"></div>
     </div>
@@ -260,6 +298,13 @@
     <button class="act" style="padding:1px 7px" id="cmdclear">clear</button></h3>
   <ol id="cmdlist"></ol>
 </div>
+
+<dialog id="palette">
+  <div class="box">
+    <input id="palette-q" placeholder="Jump to a container, or type a command…" autocomplete="off">
+    <ul id="palette-list"></ul>
+  </div>
+</dialog>
 
 <dialog id="dlg">
   <h2 id="dlg-title"></h2>
@@ -323,6 +368,7 @@ const ago = (secs) => {
 };
 
 // --- state --------------------------------------------------------------
+const VIEWS = ["containers", "stacks", "networks", "events", "images", "volumes"];
 let view = "containers";
 let filter = "";
 let openRow = null;           // container id whose detail panel is open
@@ -336,7 +382,7 @@ for (const b of document.querySelectorAll("nav button")) {
   b.onclick = () => {
     view = b.dataset.view;
     for (const o of document.querySelectorAll("nav button")) o.setAttribute("aria-current", String(o === b));
-    for (const s of ["containers", "stacks", "images", "volumes"]) $("#view-" + s).hidden = s !== view;
+    for (const s of VIEWS) $("#view-" + s).hidden = s !== view;
     refresh();
   };
 }
@@ -346,6 +392,10 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault(); $("#filter").focus();
   }
   if (e.key === "Escape" && $("#dlg").open) $("#dlg").close();
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    openPalette();
+  }
 });
 
 // --- system -------------------------------------------------------------
@@ -489,7 +539,7 @@ function buildDetail() {
     el("span", { className: "mono", style: "text-transform:none;letter-spacing:0;color:var(--text)" }, c.id),
     el("span", { className: "spacer" }),
   ]);
-  for (const name of ["logs", "exec", "inspect"]) {
+  for (const name of ["logs", "terminal", "exec", "inspect"]) {
     head.append(el("button", {
       className: "act", textContent: name,
       style: detailTab === name ? "border-color:var(--accent);color:var(--accent)" : "",
@@ -503,6 +553,8 @@ function buildDetail() {
   if (detailTab === "logs") {
     body.append(el("pre", { className: "log", id: "logtext", textContent: "loading…" }));
     refreshLogs(true);
+  } else if (detailTab === "terminal") {
+    body.append(terminalPane(c));
   } else if (detailTab === "exec") {
     const pad = el("div", { className: "pad" });
     const inp = el("input", { placeholder: "ps -o pid,comm", value: execCommand });
@@ -558,6 +610,200 @@ function inspectTable(c) {
   }
   tb.append(body);
   return tb;
+}
+
+// --- a terminal ---------------------------------------------------------
+//
+// Enough of a terminal emulator to run a shell, and no more. Printable
+// characters, carriage return, newline, backspace, bell ignored, and the
+// two erase sequences a prompt actually uses; every other CSI sequence is
+// consumed and dropped.
+//
+// That is a deliberate stopping point rather than a half-finished one.
+// Full ANSI is cursor addressing, scroll regions, alternate screens and
+// 256-colour attributes - it is a project, and `rustainer exec -it` in a
+// real terminal already does all of it. What this gives you is a shell
+// with a working prompt in the page, and it says so rather than pretending
+// `vi` will be fine.
+function makeScreen() {
+  return { lines: [""], row: 0, col: 0 };
+}
+
+function feed(scr, text) {
+  let i = 0;
+  const put = (ch) => {
+    const line = scr.lines[scr.row] ?? "";
+    scr.lines[scr.row] = line.slice(0, scr.col) + ch + line.slice(scr.col + 1);
+    scr.col++;
+  };
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\x1b") {
+      // CSI: ESC [ params letter. Anything else: skip the next char.
+      if (text[i + 1] === "[") {
+        let j = i + 2;
+        while (j < text.length && !/[A-Za-z]/.test(text[j])) j++;
+        const params = text.slice(i + 2, j);
+        const final = text[j];
+        if (final === "K") {
+          // Erase in line, which a prompt redraw uses constantly.
+          const line = scr.lines[scr.row] ?? "";
+          scr.lines[scr.row] = params === "1" ? " ".repeat(scr.col) + line.slice(scr.col) : line.slice(0, scr.col);
+        } else if (final === "J" && (params === "2" || params === "3")) {
+          scr.lines = [""];
+          scr.row = 0;
+          scr.col = 0;
+        } else if (final === "C") {
+          scr.col += Math.max(1, parseInt(params || "1", 10));
+        } else if (final === "D") {
+          scr.col = Math.max(0, scr.col - Math.max(1, parseInt(params || "1", 10)));
+        }
+        i = j + 1;
+        continue;
+      }
+      i += 2;
+      continue;
+    }
+    if (ch === "\r") { scr.col = 0; i++; continue; }
+    if (ch === "\n") {
+      scr.row++;
+      scr.col = 0;
+      while (scr.lines.length <= scr.row) scr.lines.push("");
+      i++;
+      continue;
+    }
+    if (ch === "\b") { scr.col = Math.max(0, scr.col - 1); i++; continue; }
+    if (ch === "\x07") { i++; continue; }
+    if (ch < " ") { i++; continue; }
+    while (scr.lines.length <= scr.row) scr.lines.push("");
+    while ((scr.lines[scr.row] ?? "").length < scr.col) scr.lines[scr.row] += " ";
+    put(ch);
+    i++;
+  }
+  // Keep the scrollback bounded; a session left open all day should not
+  // become the page's memory problem.
+  if (scr.lines.length > 2000) {
+    const cut = scr.lines.length - 2000;
+    scr.lines.splice(0, cut);
+    scr.row -= cut;
+  }
+}
+
+function render(scr) {
+  const out = scr.lines.slice();
+  const r = Math.max(0, Math.min(scr.row, out.length - 1));
+  const line = out[r] ?? "";
+  // The cursor, drawn as an inverted cell so you can see where you are.
+  out[r] = line.slice(0, scr.col) + "\u0000" + (line[scr.col] ?? " ") + "\u0000" + line.slice(scr.col + 1);
+  return out.join("\n");
+}
+
+let termSession = null;
+let termPoll = null;
+let termOffset = 0;
+
+function terminalPane(c) {
+  const wrap = el("div");
+  const scr = makeScreen();
+  const view = el("div", { className: "term", tabIndex: 0 });
+  const paint = () => {
+    const text = render(scr);
+    view.replaceChildren();
+    // Split on the cursor markers so the cursor can be a span without
+    // ever interpreting the container's output as HTML.
+    const parts = text.split("\u0000");
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 1) view.append(el("span", { className: "cur" }, parts[i]));
+      else view.append(document.createTextNode(parts[i]));
+    }
+    view.scrollTop = view.scrollHeight;
+  };
+  paint();
+
+  const bar = el("div", { className: "pad", style: "display:flex;gap:8px;align-items:center;padding:10px 14px 0" });
+  const cmd = el("input", { value: "/bin/sh", style: "max-width:220px" });
+  const start = el("button", { className: "act", textContent: "open a shell" });
+  const stop = el("button", { className: "act danger", textContent: "close", disabled: true });
+  bar.append(el("span", { className: "dim", style: "font-size:11px" }, "shell"), cmd, start, stop);
+  wrap.append(bar, view,
+    el("div", { className: "hint", style: "padding:6px 14px 12px" },
+      "A real pty: the prompt, ^C and exit status all work. Enough emulation for a " +
+      "shell, not for a full-screen program - `rustainer exec -it` in a real terminal is."));
+
+  // One poll at a time, always. Two in flight both ask from the same
+  // offset and both get the same bytes, so every keystroke's echo was
+  // drawn twice and the line turned to mush. The interval and the
+  // after-a-keystroke nudge share this guard.
+  let polling = false;
+  const poll = async () => {
+    if (!termSession || polling) return;
+    polling = true;
+    try {
+      const r = await api(`/api/term/${termSession}/out?from=${termOffset}`);
+      if (r.error) { termSession = null; return; }
+      if (r.next != null) termOffset = r.next;
+      if (r.data) { feed(scr, r.data); paint(); }
+      if (r.done) {
+        feed(scr, "\r\n[session ended]\r\n");
+        paint();
+        await closeTerm();
+      }
+    } finally {
+      polling = false;
+    }
+  };
+
+  let sending = Promise.resolve();
+  const closeTerm = async () => {
+    if (termPoll) { clearInterval(termPoll); termPoll = null; }
+    if (termSession) { await api(`/api/term/${termSession}`, { method: "DELETE" }); termSession = null; }
+    start.disabled = false; stop.disabled = true;
+  };
+
+  start.onclick = async () => {
+    await closeTerm();
+    scr.lines = [""]; scr.row = 0; scr.col = 0; termOffset = 0;
+    const r = await api(`/api/containers/${c.id}/term`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command: cmd.value, rows: 24, cols: 100 }),
+    });
+    logCommand(["exec", "-it", c.id, ...cmd.value.trim().split(/\s+/)], r);
+    if (r.error) { feed(scr, `\r\n[${r.error}]\r\n`); paint(); return; }
+    termSession = r.session;
+    start.disabled = true; stop.disabled = false;
+    view.focus();
+    termPoll = setInterval(poll, 250);
+  };
+  stop.onclick = closeTerm;
+
+  view.onkeydown = async (e) => {
+    if (!termSession) return;
+    let data = null;
+    if (e.key === "Enter") data = "\r";
+    else if (e.key === "Backspace") data = "\x7f";
+    else if (e.key === "Tab") data = "\t";
+    else if (e.key === "Escape") data = "\x1b";
+    else if (e.key === "ArrowUp") data = "\x1b[A";
+    else if (e.key === "ArrowDown") data = "\x1b[B";
+    else if (e.key === "ArrowRight") data = "\x1b[C";
+    else if (e.key === "ArrowLeft") data = "\x1b[D";
+    else if (e.ctrlKey && e.key.length === 1) {
+      // ^C and friends, as the byte the pty turns into a signal.
+      const code = e.key.toUpperCase().charCodeAt(0) - 64;
+      if (code > 0 && code < 32) data = String.fromCharCode(code);
+    } else if (e.key.length === 1) data = e.key;
+    if (data == null) return;
+    e.preventDefault();
+    // Chained, not fired in parallel: typing fast enough to overlap two
+    // POSTs can deliver them out of order, and a shell reading `sl`
+    // instead of `ls` is a confusing bug to look at.
+    sending = sending.then(() =>
+      api(`/api/term/${termSession}/in`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data }),
+      })).then(poll);
+  };
+  return wrap;
 }
 
 async function refreshLogs(force) {
@@ -641,8 +887,7 @@ function renderStacks(list) {
           openRow = m.id; view = "containers";
           for (const o of document.querySelectorAll("nav button"))
             o.setAttribute("aria-current", String(o.dataset.view === "containers"));
-          for (const v of ["containers", "stacks", "images", "volumes"])
-            $("#view-" + v).hidden = v !== "containers";
+          for (const v of VIEWS) $("#view-" + v).hidden = v !== "containers";
           renderContainers(lastContainers); buildDetail();
         },
       }));
@@ -803,6 +1048,170 @@ $("#new-container").onclick = () => {
   f.image.focus();
 };
 
+function renderNetworks(list) {
+  const box = $("#networks");
+  const t = el("table");
+  t.append(el("thead", {}, el("tr", {}, [
+    el("th", {}, "Name"), el("th", {}, "Subnet"),
+    el("th", { className: "hide-s" }, "Bridge"), el("th", {}, "Containers"), el("th", {}, ""),
+  ])));
+  const tb = el("tbody");
+  for (const n of list) {
+    const members = lastContainers.filter((c) =>
+      c.status === "running" && (c.network || "bridge") === n.name);
+    const acts = el("div", { className: "actions" });
+    if (!n.builtin) {
+      acts.append(el("button", {
+        className: "act danger", textContent: "remove",
+        onclick: (e) => act(e.target, ["network", "rm", n.name],
+          "/api/networks/" + encodeURIComponent(n.name), "DELETE"),
+      }));
+    }
+    tb.append(el("tr", {}, [
+      el("td", { className: "mono" }, [n.name, n.builtin ? el("span", { className: "dim" }, "  built-in") : ""]),
+      el("td", { className: "mono dim" }, n.subnet),
+      el("td", { className: "mono dim hide-s" }, n.bridge),
+      el("td", { className: "mono" }, String(members.length)),
+      el("td", {}, acts),
+    ]));
+  }
+  t.append(tb);
+  box.replaceChildren(t);
+}
+
+function renderEvents(list) {
+  const box = $("#events");
+  if (!list.length) {
+    box.replaceChildren(el("div", { className: "empty" }, "Nothing has happened yet."));
+    return;
+  }
+  const t = el("table");
+  t.append(el("thead", {}, el("tr", {}, [
+    el("th", {}, "When"), el("th", {}, "What"),
+    el("th", {}, "Subject"), el("th", { className: "hide-s" }, "Detail"),
+  ])));
+  const tb = el("tbody");
+  const colour = { die: "var(--bad)", restart: "var(--warn)", start: "var(--ok)", restarted: "var(--ok)" };
+  for (const e of list.slice().reverse()) {
+    const at = new Date((e.at || 0) * 1000);
+    tb.append(el("tr", {}, [
+      el("td", { className: "mono dim nowrap" }, at.toLocaleTimeString()),
+      el("td", { className: "mono nowrap", style: `color:${colour[e.kind] || "var(--text)"}` }, e.kind),
+      el("td", { className: "mono truncate" }, String(e.id ?? "")),
+      el("td", { className: "mono dim truncate hide-s" }, JSON.stringify(e.detail ?? {})),
+    ]));
+  }
+  t.append(tb);
+  box.replaceChildren(t);
+}
+
+$("#build").onclick = () => {
+  const dlg = $("#dlg");
+  $("#dlg-title").textContent = "Build an image";
+  const tag = el("input", { placeholder: "myapp:1" });
+  const ctx = el("input", { placeholder: "/path/to/context", value: "." });
+  const file = el("input", { placeholder: "(context)/Dockerfile" });
+  const out = el("pre", { className: "log", style: "margin-top:12px;max-height:34vh" });
+  $("#dlg-body").replaceChildren(
+    el("div", { className: "field" }, [el("label", {}, "tag"), tag]),
+    el("div", { className: "field" }, [el("label", {}, "build context"), ctx,
+      el("div", { className: "hint" },
+        "A path on the machine running the engine, not on this one. COPY may " +
+        "only read inside it.")]),
+    el("div", { className: "field" }, [el("label", {}, "dockerfile"), file]),
+    out,
+  );
+  const go = el("button", { className: "act", textContent: "Build" });
+  go.onclick = async () => {
+    go.disabled = true; go.textContent = "building…";
+    out.textContent = "…";
+    const body = { tag: tag.value.trim(), context: ctx.value.trim(), file: file.value.trim() };
+    const r = await api("/api/build", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const argv = ["build", "-t", body.tag];
+    if (body.file) argv.push("-f", body.file);
+    argv.push(body.context || ".");
+    logCommand(argv, r);
+    out.textContent = [r.stdout, r.stderr].filter(Boolean).join("\n") || "(no output)";
+    out.scrollTop = out.scrollHeight;
+    go.disabled = false; go.textContent = "Build";
+    if (r.ok) refresh();
+  };
+  $("#dlg-foot").replaceChildren(
+    el("button", { className: "act", textContent: "Close", onclick: () => dlg.close() }), go);
+  dlg.showModal();
+  tag.focus();
+};
+
+// --- the command palette ------------------------------------------------
+// The one affordance that makes a dense tool feel fast, and the reason a
+// keyboard-first page beats a mouse-first one: everything is two
+// keystrokes away whether or not it is on screen.
+const paletteActions = () => {
+  const items = [];
+  for (const v of VIEWS) {
+    items.push({ label: "Go to " + v, hint: "view", run: () => selectView(v) });
+  }
+  items.push({ label: "Run a container…", hint: "action", run: () => $("#new-container").click() });
+  items.push({ label: "Build an image…", hint: "action", run: () => { selectView("images"); $("#build").click(); } });
+  for (const c of lastContainers) {
+    items.push({
+      label: c.id + (c.stack ? "  (" + c.stack + ")" : ""),
+      hint: c.status,
+      run: () => { selectView("containers"); openRow = c.id; detailTab = "logs"; renderContainers(lastContainers); buildDetail(); },
+    });
+    if (c.status === "running") {
+      items.push({
+        label: "Shell into " + c.id, hint: "terminal",
+        run: () => { selectView("containers"); openRow = c.id; detailTab = "terminal"; renderContainers(lastContainers); buildDetail(); },
+      });
+      items.push({
+        label: "Stop " + c.id, hint: "action",
+        run: () => act(document.createElement("button"), ["stop", "-t", "5", c.id], "/api/containers/" + c.id + "/stop"),
+      });
+    }
+  }
+  return items;
+};
+
+function selectView(v) {
+  view = v;
+  for (const o of document.querySelectorAll("nav button")) o.setAttribute("aria-current", String(o.dataset.view === v));
+  for (const s of VIEWS) $("#view-" + s).hidden = s !== v;
+  refresh();
+}
+
+let paletteItems = [];
+let paletteIndex = 0;
+function openPalette() {
+  const dlg = $("#palette");
+  const q = $("#palette-q");
+  q.value = "";
+  const draw = () => {
+    const needle = q.value.toLowerCase();
+    paletteItems = paletteActions().filter((i) => i.label.toLowerCase().includes(needle)).slice(0, 40);
+    paletteIndex = Math.min(paletteIndex, Math.max(0, paletteItems.length - 1));
+    const ul = $("#palette-list");
+    ul.replaceChildren(...paletteItems.map((i, n) => {
+      const li = el("li", { }, [i.label, el("small", {}, i.hint)]);
+      li.setAttribute("aria-selected", String(n === paletteIndex));
+      li.onclick = () => { dlg.close(); i.run(); };
+      return li;
+    }));
+  };
+  q.oninput = () => { paletteIndex = 0; draw(); };
+  q.onkeydown = (e) => {
+    if (e.key === "ArrowDown") { paletteIndex = Math.min(paletteIndex + 1, paletteItems.length - 1); draw(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { paletteIndex = Math.max(paletteIndex - 1, 0); draw(); e.preventDefault(); }
+    else if (e.key === "Enter") { const i = paletteItems[paletteIndex]; dlg.close(); if (i) i.run(); e.preventDefault(); }
+  };
+  draw();
+  dlg.showModal();
+  q.focus();
+}
+
 // --- refresh loop -------------------------------------------------------
 async function refresh() {
   if (view === "containers") {
@@ -828,6 +1237,13 @@ async function refresh() {
   } else if (view === "stacks") {
     const list = await api("/api/containers");
     if (Array.isArray(list)) { lastContainers = list; renderStacks(list); }
+  } else if (view === "networks") {
+    const [nets, list] = await Promise.all([api("/api/networks"), api("/api/containers")]);
+    if (Array.isArray(list)) lastContainers = list;
+    renderNetworks(Array.isArray(nets) ? nets : []);
+  } else if (view === "events") {
+    const evs = await api("/api/events?limit=300");
+    renderEvents(Array.isArray(evs) ? evs : []);
   } else if (view === "images") {
     renderImages(await api("/api/images") || []);
   } else {
