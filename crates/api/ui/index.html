@@ -1,0 +1,843 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rustainer</title>
+<!--
+  One file. No build step, no package manager, no CDN.
+
+  Not minimalism for its own sake: this page has to work on a machine with
+  no network, because the engine it drives works on a machine with no
+  network. A dashboard that needs to fetch a framework before it can tell
+  you what is running is a dashboard that is useless exactly when you need
+  it. Everything here is inline, and the page is served from the engine's
+  own binary.
+
+  The one deliberate difference from every other container GUI: every
+  action shows the command it ran. A tool that hides the command teaches
+  you nothing and leaves you helpless when it is not installed.
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115;
+    --panel: #161a21;
+    --panel-2: #1c2129;
+    --line: #272d38;
+    --text: #e6e9ef;
+    --dim: #9aa4b2;
+    --accent: #7aa2f7;
+    --ok: #71d08a;
+    --warn: #e0af68;
+    --bad: #f7768e;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f6f7f9; --panel: #fff; --panel-2: #f0f2f5; --line: #dfe3e8;
+      --text: #11151c; --dim: #5a6472; --accent: #2f5fd0; --ok: #1f8f46;
+      --warn: #9a6a00; --bad: #c33050;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1115; --panel: #161a21; --panel-2: #1c2129; --line: #272d38;
+    --text: #e6e9ef; --dim: #9aa4b2; --accent: #7aa2f7; --ok: #71d08a;
+    --warn: #e0af68; --bad: #f7768e;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 var(--sans); -webkit-font-smoothing: antialiased;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 12px 16px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 20; flex-wrap: wrap;
+  }
+  .brand { font-weight: 650; letter-spacing: -0.01em; display: flex; align-items: baseline; gap: 8px; }
+  .brand small { color: var(--dim); font-weight: 400; font-family: var(--mono); font-size: 11px; }
+  nav { display: flex; gap: 4px; margin-left: 8px; }
+  nav button {
+    background: none; border: 1px solid transparent; color: var(--dim);
+    padding: 5px 11px; border-radius: 7px; cursor: pointer; font: inherit;
+  }
+  nav button:hover { color: var(--text); background: var(--panel-2); }
+  nav button[aria-current="true"] { color: var(--text); background: var(--panel-2); border-color: var(--line); }
+  .spacer { flex: 1; }
+  .sys { color: var(--dim); font-family: var(--mono); font-size: 11.5px; display: flex; gap: 14px; flex-wrap: wrap; }
+  .sys b { color: var(--text); font-weight: 500; }
+
+  main { padding: 16px; max-width: 1400px; margin: 0 auto; }
+  .row { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    overflow: hidden; flex: 1 1 100%; min-width: 0;
+  }
+  .card > h2 {
+    margin: 0; padding: 11px 14px; font-size: 12px; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--dim); border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 10px; font-weight: 600;
+  }
+  .card > h2 .spacer { flex: 1; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    text-align: left; font-weight: 500; color: var(--dim); font-size: 11px;
+    letter-spacing: 0.04em; text-transform: uppercase; padding: 8px 14px;
+    border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  td { padding: 9px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--panel-2); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .dim { color: var(--dim); }
+  .nowrap { white-space: nowrap; }
+  .truncate { max-width: 1px; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px;
+    border-radius: 999px; font-size: 11.5px; font-weight: 500;
+    background: var(--panel-2); border: 1px solid var(--line);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
+  .s-running .dot { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+  .s-exited .dot { background: var(--dim); }
+  .s-created .dot { background: var(--warn); }
+  .s-unknown .dot { background: var(--bad); }
+
+  button.act {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 4px 9px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  button.act:hover { border-color: var(--accent); color: var(--accent); }
+  button.act.danger:hover { border-color: var(--bad); color: var(--bad); }
+  button.act:disabled { opacity: 0.45; cursor: default; }
+  .actions { display: flex; gap: 5px; justify-content: flex-end; }
+
+  input, select, textarea {
+    background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 9px; font: inherit; font-size: 13px; width: 100%;
+  }
+  input:focus, select:focus, textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: -1px; }
+  label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 4px; letter-spacing: 0.03em; text-transform: uppercase; }
+  .field { margin-bottom: 10px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .pad { padding: 14px; }
+
+  pre.log {
+    margin: 0; padding: 12px 14px; font-family: var(--mono); font-size: 12px;
+    line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+    max-height: 46vh; overflow: auto; background: var(--bg);
+  }
+  pre.log.err { color: var(--bad); }
+
+  .empty { padding: 28px 14px; text-align: center; color: var(--dim); }
+  .summary { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 14px; min-width: 112px;
+  }
+  .stat b { display: block; font-size: 20px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.2; }
+  .stat span { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat.alert b { color: var(--bad); }
+  /* The reason a container is not running, in the row rather than hidden
+     behind a click. A status with no explanation is where a GUI stops
+     being useful and starts being an obstacle. */
+  .why {
+    font-size: 11.5px; color: var(--bad); margin-top: 3px; max-width: 460px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .bar { height: 5px; background: var(--panel-2); border-radius: 999px; overflow: hidden; min-width: 54px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+  .bar > i.hot { background: var(--warn); }
+  .bar > i.full { background: var(--bad); }
+
+  /* The command strip: every action says what it ran. */
+  #cmdlog {
+    position: fixed; right: 14px; bottom: 14px; width: min(560px, calc(100vw - 28px));
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    font-family: var(--mono); font-size: 11.5px; z-index: 40;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.28); overflow: hidden;
+  }
+  #cmdlog h3 {
+    margin: 0; padding: 7px 10px; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--dim); border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center;
+    font-family: var(--sans); font-weight: 600;
+  }
+  #cmdlog ol { margin: 0; padding: 6px 10px 9px; list-style: none; max-height: 150px; overflow: auto; }
+  #cmdlog li { padding: 2px 0; color: var(--dim); }
+  #cmdlog li b { color: var(--text); font-weight: 500; }
+  #cmdlog li.bad b { color: var(--bad); }
+
+  dialog {
+    border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
+    color: var(--text); padding: 0; width: min(680px, calc(100vw - 32px)); max-height: 86vh;
+  }
+  dialog::backdrop { background: rgba(0,0,0,0.55); }
+  dialog h2 { margin: 0; padding: 13px 16px; font-size: 14px; border-bottom: 1px solid var(--line); }
+  dialog .body { padding: 16px; overflow: auto; max-height: 64vh; }
+  dialog .foot { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; gap: 8px; justify-content: flex-end; }
+  .hint { color: var(--dim); font-size: 11.5px; margin-top: 4px; }
+  .err { color: var(--bad); }
+  .warnbox {
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+    color: var(--text); padding: 9px 12px; border-radius: 8px; font-size: 12.5px; margin-bottom: 12px;
+  }
+  @media (max-width: 760px) {
+    .grid2 { grid-template-columns: 1fr; }
+    .hide-s { display: none; }
+    main { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">rustainer <small id="ver"></small></div>
+  <nav>
+    <button data-view="containers" aria-current="true">Containers</button>
+    <button data-view="stacks">Stacks</button>
+    <button data-view="images">Images</button>
+    <button data-view="volumes">Volumes</button>
+  </nav>
+  <div class="spacer"></div>
+  <div class="sys" id="sys"></div>
+</header>
+
+<main>
+  <section id="view-containers">
+    <div class="summary" id="summary"></div>
+    <div class="card">
+      <h2>
+        Containers
+        <span class="spacer"></span>
+        <input id="filter" placeholder="filter  ( / )" style="width: 180px; padding: 3px 8px; font-size: 12px;">
+        <button class="act" id="new-container">Run a container</button>
+      </h2>
+      <div id="containers"></div>
+    </div>
+    <!-- Outside the table on purpose. Rebuilding this every two seconds
+         along with the rows destroyed whatever was in it: the output of a
+         command you had just run, a log you had scrolled back through,
+         text you were still typing. A panel you have to race is worse than
+         no panel. -->
+    <div class="card" id="detail" hidden style="margin-top:14px"></div>
+  </section>
+
+  <section id="view-stacks" hidden>
+    <div class="card">
+      <h2>Stacks</h2>
+      <div id="stacks"></div>
+    </div>
+  </section>
+
+  <section id="view-images" hidden>
+    <div class="card">
+      <h2>
+        Images
+        <span class="spacer"></span>
+        <input id="pullref" placeholder="alpine:3.21" style="width: 220px; padding: 3px 8px; font-size: 12px;">
+        <button class="act" id="pull">Pull</button>
+      </h2>
+      <div id="images"></div>
+    </div>
+  </section>
+
+  <section id="view-volumes" hidden>
+    <div class="card">
+      <h2>Volumes</h2>
+      <div id="volumes"></div>
+    </div>
+  </section>
+</main>
+
+<div id="cmdlog" hidden>
+  <h3>Commands this page ran <span class="spacer" style="flex:1"></span>
+    <button class="act" style="padding:1px 7px" id="cmdclear">clear</button></h3>
+  <ol id="cmdlist"></ol>
+</div>
+
+<dialog id="dlg">
+  <h2 id="dlg-title"></h2>
+  <div class="body" id="dlg-body"></div>
+  <div class="foot" id="dlg-foot"></div>
+</dialog>
+
+<script>
+"use strict";
+
+const $ = (s, r = document) => r.querySelector(s);
+const el = (tag, props = {}, kids = []) => {
+  const n = Object.assign(document.createElement(tag), props);
+  for (const k of [].concat(kids)) n.append(k);
+  return n;
+};
+const esc = (s) => String(s ?? "");
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const text = await r.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+  if (!r.ok && !data.error && !data.stderr) data.error = `HTTP ${r.status}`;
+  return data;
+}
+
+// --- the command strip --------------------------------------------------
+// Every mutation the page performs is shown as the command that performed
+// it. This is the one thing here that no other container GUI does, and it
+// is deliberate: the page should leave you more able to work without it.
+function logCommand(argv, result) {
+  const box = $("#cmdlog"), list = $("#cmdlist");
+  box.hidden = false;
+  const bad = result && result.ok === false;
+  const li = el("li", { className: bad ? "bad" : "" });
+  li.append(el("b", {}, "$ rustainer " + argv.join(" ")));
+  if (bad && (result.stderr || result.error)) {
+    li.append(el("div", { className: "err" }, (result.stderr || result.error).split("\n")[0]));
+  }
+  list.prepend(li);
+  while (list.children.length > 40) list.lastChild.remove();
+}
+$("#cmdclear").onclick = () => { $("#cmdlist").replaceChildren(); $("#cmdlog").hidden = true; };
+
+// --- formatting ---------------------------------------------------------
+const bytes = (n) => {
+  if (n == null) return "—";
+  const u = ["B", "K", "M", "G", "T"];
+  let i = 0, v = Number(n);
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)) + u[i];
+};
+const ago = (secs) => {
+  if (!secs) return "—";
+  let d = Math.max(0, Math.floor(Date.now() / 1000 - secs));
+  if (d < 60) return d + "s";
+  if (d < 3600) return Math.floor(d / 60) + "m";
+  if (d < 86400) return Math.floor(d / 3600) + "h";
+  return Math.floor(d / 86400) + "d";
+};
+
+// --- state --------------------------------------------------------------
+let view = "containers";
+let filter = "";
+let openRow = null;           // container id whose detail panel is open
+let detailTab = "logs";
+const cpuSamples = new Map(); // id -> {usec, at} for turning a counter into a rate
+const cpuPercent = new Map();
+const execOutput = new Map();  // id -> last output, so a refresh cannot eat it
+let execCommand = "ps -o pid,comm";
+
+for (const b of document.querySelectorAll("nav button")) {
+  b.onclick = () => {
+    view = b.dataset.view;
+    for (const o of document.querySelectorAll("nav button")) o.setAttribute("aria-current", String(o === b));
+    for (const s of ["containers", "stacks", "images", "volumes"]) $("#view-" + s).hidden = s !== view;
+    refresh();
+  };
+}
+$("#filter").oninput = (e) => { filter = e.target.value.toLowerCase(); renderContainers(lastContainers); };
+document.addEventListener("keydown", (e) => {
+  if (e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "TEXTAREA") {
+    e.preventDefault(); $("#filter").focus();
+  }
+  if (e.key === "Escape" && $("#dlg").open) $("#dlg").close();
+});
+
+// --- system -------------------------------------------------------------
+async function loadSystem() {
+  const s = await api("/api/system");
+  $("#ver").textContent = "v" + (s.version || "?");
+  $("#sys").replaceChildren(
+    el("span", {}, [document.createTextNode("kernel "), el("b", {}, esc(s.kernel) + " " + esc(s.arch))]),
+    el("span", {}, [document.createTextNode("cgroup "), el("b", {}, esc(s.cgroup))]),
+    el("span", {}, [document.createTextNode(s.rootless ? "rootless uid " : "root uid "), el("b", {}, String(s.uid))]),
+  );
+}
+
+// --- containers ---------------------------------------------------------
+let lastContainers = [];
+
+function statusPill(c) {
+  const s = (c.status || "unknown").toLowerCase();
+  let label = s;
+  if (s === "exited") {
+    if (c.oom_killed) label = "oom-killed";
+    else if (c.exit_code != null) label = "exited " + c.exit_code;
+    else if (c.signal != null) label = "signal " + c.signal;
+  }
+  return el("span", { className: "pill s-" + s }, [el("span", { className: "dot" }), label]);
+}
+
+function renderSummary(list) {
+  const running = list.filter((c) => c.status === "running");
+  const broken = list.filter((c) => c.status === "unknown" || c.error);
+  const mem = running.reduce((a, c) => a + ((c._stats && c._stats.memory_current) || 0), 0);
+  const cpu = running.reduce((a, c) => a + (cpuPercent.get(c.id) || 0), 0);
+  const stat = (label, value, alert) =>
+    el("div", { className: "stat" + (alert ? " alert" : "") },
+      [el("b", {}, String(value)), el("span", {}, label)]);
+  $("#summary").replaceChildren(
+    stat("running", running.length),
+    stat("total", list.length),
+    stat("cpu", cpu.toFixed(0) + "%"),
+    stat("memory", bytes(mem)),
+    ...(broken.length ? [stat("need attention", broken.length, true)] : []),
+  );
+}
+
+function renderContainers(list) {
+  lastContainers = list;
+  renderSummary(list);
+  const box = $("#containers");
+  const rows = list.filter((c) =>
+    !filter || (c.id + " " + (c.command || "") + " " + (c.hostname || "")).toLowerCase().includes(filter));
+
+  if (!rows.length) {
+    box.replaceChildren(el("div", { className: "empty" },
+      list.length ? "Nothing matches that filter." : "No containers yet. Run one."));
+    return;
+  }
+
+  const t = el("table");
+  t.append(el("thead", {}, el("tr", {}, [
+    el("th", {}, "ID"), el("th", { className: "hide-s" }, "Stack"),
+    el("th", {}, "Status"), el("th", { className: "hide-s" }, "Command"),
+    el("th", { className: "hide-s" }, "Address"), el("th", {}, "CPU"), el("th", {}, "Memory"),
+    el("th", { className: "hide-s" }, "Age"), el("th", {}, ""),
+  ])));
+  const body = el("tbody");
+
+  for (const c of rows) {
+    const running = c.status === "running";
+    const pct = cpuPercent.get(c.id);
+    const st = c._stats || {};
+    const memMax = st.memory_max && st.memory_max !== "max" ? Number(st.memory_max) : null;
+    const memFrac = memMax && st.memory_current ? st.memory_current / memMax : null;
+
+    const tr = el("tr");
+    tr.append(
+      el("td", { className: "mono nowrap" }, c.id),
+      el("td", { className: "dim nowrap hide-s" }, c.stack || "—"),
+      el("td", { className: "nowrap" }, [
+        statusPill(c),
+        c.error ? el("div", { className: "why", title: esc(c.error) }, esc(c.error)) : "",
+      ]),
+      el("td", { className: "mono dim truncate hide-s", title: esc(c.command) }, esc(c.command)),
+      el("td", { className: "mono dim nowrap hide-s" },
+        (c.ip || "—") + (c.ports && c.ports.length ? "  " + c.ports.map((p) => p.host + "→" + p.container).join(" ") : "")),
+      el("td", { className: "mono nowrap" }, running && pct != null ? pct.toFixed(1) + "%" : "—"),
+      el("td", { className: "nowrap" }, running && st.memory_current != null
+        ? el("span", { className: "mono" }, [
+            bytes(st.memory_current) + (memMax ? " / " + bytes(memMax) : ""),
+            memFrac != null ? el("div", { className: "bar" },
+              el("i", { className: memFrac > 0.9 ? "full" : memFrac > 0.7 ? "hot" : "",
+                        style: `width:${Math.min(100, memFrac * 100).toFixed(1)}%` })) : "",
+          ])
+        : el("span", {
+            className: "dim mono",
+            title: running && st.cgroup === false
+              ? "no cgroup for this container, so nothing is accounted"
+              : "the memory controller is not enabled in this subtree",
+          }, "—")),
+      el("td", { className: "dim nowrap mono hide-s" }, ago(c.started_at || c.created_at)),
+    );
+
+    const acts = el("div", { className: "actions" });
+    acts.append(el("button", {
+      className: "act", textContent: openRow === c.id ? "hide" : "details",
+      onclick: () => {
+        openRow = openRow === c.id ? null : c.id;
+        buildDetail();
+        renderContainers(lastContainers);
+      },
+    }));
+    if (running) {
+      acts.append(el("button", {
+        className: "act", textContent: "stop",
+        onclick: (e) => act(e.target, ["stop", "-t", "5", c.id], "/api/containers/" + c.id + "/stop"),
+      }));
+    }
+    acts.append(el("button", {
+      className: "act danger", textContent: "remove",
+      onclick: (e) => act(e.target, ["rm", "--force", c.id], "/api/containers/" + c.id, "DELETE"),
+    }));
+    tr.append(el("td", {}, acts));
+    body.append(tr);
+
+  }
+  t.append(body);
+  box.replaceChildren(t);
+}
+
+// The panel is built when you open it or change its tab, and NOT on the
+// refresh interval. Only the log text is updated in place, and only while
+// the logs tab is showing — which is also what keeps your scroll position
+// if you have scrolled back.
+function buildDetail() {
+  const box = $("#detail");
+  if (!openRow) { box.hidden = true; box.replaceChildren(); return; }
+  const c = lastContainers.find((x) => x.id === openRow);
+  if (!c) { box.hidden = true; return; }
+  box.hidden = false;
+
+  const head = el("h2", {}, [
+    el("span", { className: "mono", style: "text-transform:none;letter-spacing:0;color:var(--text)" }, c.id),
+    el("span", { className: "spacer" }),
+  ]);
+  for (const name of ["logs", "exec", "inspect"]) {
+    head.append(el("button", {
+      className: "act", textContent: name,
+      style: detailTab === name ? "border-color:var(--accent);color:var(--accent)" : "",
+      onclick: () => { detailTab = name; buildDetail(); },
+    }));
+  }
+  head.append(el("button", { className: "act", textContent: "close",
+    onclick: () => { openRow = null; buildDetail(); renderContainers(lastContainers); } }));
+
+  const body = el("div");
+  if (detailTab === "logs") {
+    body.append(el("pre", { className: "log", id: "logtext", textContent: "loading…" }));
+    refreshLogs(true);
+  } else if (detailTab === "exec") {
+    const pad = el("div", { className: "pad" });
+    const inp = el("input", { placeholder: "ps -o pid,comm", value: execCommand });
+    const out = el("pre", { className: "log", textContent: execOutput.get(c.id) || "",
+                            style: "margin-top:10px;max-height:30vh" });
+    const go = el("button", { className: "act", textContent: "run in container", style: "margin-top:8px" });
+    const send = async () => {
+      execCommand = inp.value;
+      out.textContent = "…";
+      const r = await api("/api/containers/" + c.id + "/exec", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: inp.value }),
+      });
+      logCommand(["exec", c.id, ...inp.value.trim().split(/\s+/)], r);
+      const text = [r.stdout, r.stderr].filter(Boolean).join("\n") || "(no output)";
+      execOutput.set(c.id, text);
+      out.textContent = text;
+    };
+    go.onclick = send;
+    inp.oninput = () => { execCommand = inp.value; };
+    inp.onkeydown = (e) => { if (e.key === "Enter") send(); };
+    pad.append(el("label", {}, "command"), inp, go, out,
+      el("div", { className: "hint" },
+        "One shot, output collected. Not a terminal — a pty needs a second protocol, " +
+        "and `rustainer exec -it` already is one."));
+    body.append(pad);
+  } else {
+    body.append(inspectTable(c));
+  }
+  box.replaceChildren(head, body);
+}
+
+function inspectTable(c) {
+  const st = c._stats || {};
+  const facts = [
+    ["id", c.id], ["status", c.status], ["pid", c.pid], ["command", c.command],
+    ["hostname", c.hostname], ["address", c.ip],
+    ["ports", (c.ports || []).map((p) => p.host + "→" + p.container).join(", ")],
+    ["volumes", (c.volumes || []).map((v) => v.source + ":" + v.target + (v.read_only ? ":ro" : "")).join(", ")],
+    ["memory limit", c.memory ? bytes(c.memory) : null], ["cpus", c.cpus],
+    ["memory now", st.memory_current != null ? bytes(st.memory_current) : null],
+    ["memory peak", st.memory_peak != null ? bytes(st.memory_peak) : null],
+    ["pids", st.pids_current], ["exit code", c.exit_code], ["signal", c.signal],
+    ["oom killed", c.oom_killed ? "yes" : null], ["error", c.error],
+  ].filter(([, v]) => v != null && v !== "");
+  const tb = el("table");
+  const body = el("tbody");
+  for (const [k, v] of facts) {
+    body.append(el("tr", {}, [
+      el("td", { className: "dim nowrap", style: "width:150px" }, k),
+      el("td", { className: "mono", style: "white-space:pre-wrap" }, String(v)),
+    ]));
+  }
+  tb.append(body);
+  return tb;
+}
+
+async function refreshLogs(force) {
+  if (!openRow || detailTab !== "logs") return;
+  const out = $("#logtext");
+  if (!out) return;
+  const d = await api("/api/containers/" + openRow + "/logs?tail=400");
+  const text = [d.stdout, d.stderr].filter(Boolean).join("\n") || "(no output)";
+  if (text === out.textContent) return;
+  // Only follow the tail if you were already at it. Scrolling back to read
+  // something and being yanked to the bottom two seconds later is the
+  // single most annoying thing a log view can do.
+  const atBottom = force || out.scrollTop + out.clientHeight >= out.scrollHeight - 24;
+  out.textContent = text;
+  if (atBottom) out.scrollTop = out.scrollHeight;
+}
+
+// Rebuild the panel only when the container it shows has gone, or its
+// status changed - not on every tick.
+let detailStatus = null;
+function buildDetailIfStale() {
+  if (!openRow) return;
+  const c = lastContainers.find((x) => x.id === openRow);
+  if (!c) { openRow = null; buildDetail(); return; }
+  if (detailTab === "inspect" && c.status !== detailStatus) {
+    detailStatus = c.status;
+    buildDetail();
+  } else {
+    detailStatus = c.status;
+  }
+}
+
+async function act(button, argv, url, method = "POST") {
+  button.disabled = true;
+  const r = await api(url, { method });
+  logCommand(argv, r);
+  await refresh();
+}
+
+// --- images and volumes -------------------------------------------------
+function renderStacks(list) {
+  const box = $("#stacks");
+  // Grouped by the label the engine RECORDED, never by guessing at the
+  // container name: `web-1` may be a service of the `web` stack or a
+  // container somebody named `web-1`, and a UI that guesses will
+  // eventually group two unrelated things and call it a stack.
+  const groups = new Map();
+  for (const c of list) {
+    if (!c.stack) continue;
+    if (!groups.has(c.stack)) groups.set(c.stack, []);
+    groups.get(c.stack).push(c);
+  }
+  if (!groups.size) {
+    box.replaceChildren(el("div", { className: "empty" }, [
+      el("div", {}, "No stacks running."),
+      el("div", { className: "hint", style: "margin-top:6px" },
+        "rustainer stack up -f rustainer.toml"),
+    ]));
+    return;
+  }
+  const wrap = el("div");
+  for (const [name, members] of [...groups].sort()) {
+    const running = members.filter((m) => m.status === "running").length;
+    const head = el("div", {
+      style: "display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line)",
+    }, [
+      el("b", { className: "mono" }, name),
+      el("span", { className: "pill" }, running + " / " + members.length + " running"),
+    ]);
+    const t = el("table");
+    t.append(el("thead", {}, el("tr", {}, [
+      el("th", {}, "Service"), el("th", {}, "Status"),
+      el("th", { className: "hide-s" }, "Address"), el("th", {}, "CPU"),
+      el("th", { className: "hide-s" }, "Container"), el("th", {}, ""),
+    ])));
+    const tb = el("tbody");
+    for (const m of members.sort((a, b) => (a.service || "").localeCompare(b.service || ""))) {
+      const acts = el("div", { className: "actions" }, el("button", {
+        className: "act", textContent: "details",
+        onclick: () => {
+          openRow = m.id; view = "containers";
+          for (const o of document.querySelectorAll("nav button"))
+            o.setAttribute("aria-current", String(o.dataset.view === "containers"));
+          for (const v of ["containers", "stacks", "images", "volumes"])
+            $("#view-" + v).hidden = v !== "containers";
+          renderContainers(lastContainers); buildDetail();
+        },
+      }));
+      tb.append(el("tr", {}, [
+        el("td", { className: "mono" }, m.service || "—"),
+        el("td", {}, statusPill(m)),
+        el("td", { className: "mono dim hide-s" }, m.ip || "—"),
+        el("td", { className: "mono" },
+          m.status === "running" && cpuPercent.get(m.id) != null
+            ? cpuPercent.get(m.id).toFixed(1) + "%" : "—"),
+        el("td", { className: "mono dim hide-s" }, m.id),
+        el("td", {}, acts),
+      ]));
+    }
+    t.append(tb);
+    wrap.append(head, t);
+  }
+  box.replaceChildren(wrap);
+}
+
+function renderImages(list) {
+  const box = $("#images");
+  if (!list.length) {
+    box.replaceChildren(el("div", { className: "empty" }, "No images in the store. Pull one."));
+    return;
+  }
+  const t = el("table");
+  t.append(el("thead", {}, el("tr", {}, [
+    el("th", {}, "Reference"), el("th", { className: "hide-s" }, "Config digest"), el("th", {}, ""),
+  ])));
+  const body = el("tbody");
+  for (const i of list) {
+    body.append(el("tr", {}, [
+      el("td", { className: "mono truncate" }, i.reference),
+      el("td", { className: "mono dim truncate hide-s" }, i.digest),
+      el("td", {}, el("div", { className: "actions" }, el("button", {
+        className: "act danger", textContent: "remove",
+        onclick: (e) => act(e.target, ["rmi", i.reference],
+          "/api/images/" + encodeURIComponent(i.reference), "DELETE"),
+      }))),
+    ]));
+  }
+  t.append(body);
+  box.replaceChildren(t);
+}
+
+function renderVolumes(list) {
+  const box = $("#volumes");
+  if (!list.length) {
+    box.replaceChildren(el("div", { className: "empty" },
+      "No named volumes. One appears the first time you use -v name:/path."));
+    return;
+  }
+  const t = el("table");
+  t.append(el("thead", {}, el("tr", {}, [
+    el("th", {}, "Name"), el("th", {}, "Entries"), el("th", { className: "hide-s" }, "Path"), el("th", {}, ""),
+  ])));
+  const body = el("tbody");
+  for (const v of list) {
+    body.append(el("tr", {}, [
+      el("td", { className: "mono" }, v.name),
+      el("td", { className: "mono dim" }, String(v.entries)),
+      el("td", { className: "mono dim truncate hide-s" }, v.path),
+      el("td", {}, el("div", { className: "actions" }, el("button", {
+        className: "act danger", textContent: "remove",
+        onclick: (e) => act(e.target, ["volume", "rm", v.name],
+          "/api/volumes/" + encodeURIComponent(v.name), "DELETE"),
+      }))),
+    ]));
+  }
+  t.append(body);
+  box.replaceChildren(t);
+}
+
+$("#pull").onclick = async (e) => {
+  const ref = $("#pullref").value.trim();
+  if (!ref) return;
+  e.target.disabled = true;
+  e.target.textContent = "pulling…";
+  const r = await api("/api/images/pull", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reference: ref }),
+  });
+  logCommand(["pull", ref], r);
+  e.target.disabled = false;
+  e.target.textContent = "Pull";
+  if (r.ok) $("#pullref").value = "";
+  refresh();
+};
+$("#pullref").onkeydown = (e) => { if (e.key === "Enter") $("#pull").click(); };
+
+// --- run a container ----------------------------------------------------
+$("#new-container").onclick = () => {
+  const dlg = $("#dlg");
+  $("#dlg-title").textContent = "Run a container";
+  const f = {};
+  const field = (key, label, placeholder, hint) => {
+    const i = el("input", { placeholder: placeholder || "" });
+    f[key] = i;
+    return el("div", { className: "field" },
+      [el("label", {}, label), i, hint ? el("div", { className: "hint" }, hint) : ""]);
+  };
+  const net = el("select");
+  for (const o of ["bridge", "none", "host"]) net.append(el("option", { value: o, textContent: o }));
+  f.network = net;
+
+  $("#dlg-body").replaceChildren(
+    field("image", "image", "alpine:3.21"),
+    field("command", "command", "(the image's own, if empty)"),
+    el("div", { className: "grid2" }, [
+      field("name", "name", "(generated)"),
+      el("div", { className: "field" }, [el("label", {}, "network"), net]),
+    ]),
+    el("div", { className: "grid2" }, [
+      field("ports", "publish", "8080:80, 127.0.0.1:5432:5432", "comma separated"),
+      field("volumes", "volumes", "data:/var/lib/app, /srv:/srv:ro", "comma separated"),
+    ]),
+    el("div", { className: "grid2" }, [
+      field("env", "environment", "KEY=value, OTHER=2", "comma separated"),
+      field("memory", "memory", "512m"),
+    ]),
+    el("div", { className: "grid2" }, [field("cpus", "cpus", "1.5"), field("pids", "pids limit", "128")]),
+    el("div", { className: "hint", id: "run-err" }),
+  );
+  const list = (s) => s.value.split(",").map((x) => x.trim()).filter(Boolean);
+  const go = el("button", { className: "act", textContent: "Run" });
+  go.onclick = async () => {
+    const spec = {
+      image: f.image.value.trim(), command: f.command.value.trim(), name: f.name.value.trim(),
+      network: net.value, ports: list(f.ports), volumes: list(f.volumes), env: list(f.env),
+      memory: f.memory.value.trim(), cpus: f.cpus.value.trim(), pids: f.pids.value.trim(),
+    };
+    if (!spec.image) { $("#run-err").textContent = "An image is required."; return; }
+    go.disabled = true; go.textContent = "starting…";
+    const r = await api("/api/containers", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(spec),
+    });
+    const argv = ["run", "-d"];
+    if (spec.name) argv.push("--name", spec.name);
+    argv.push("--network", spec.network);
+    for (const p of spec.ports) argv.push("-p", p);
+    for (const v of spec.volumes) argv.push("-v", v);
+    for (const e of spec.env) argv.push("-e", e);
+    if (spec.memory) argv.push("-m", spec.memory);
+    if (spec.cpus) argv.push("--cpus", spec.cpus);
+    if (spec.pids) argv.push("--pids-limit", spec.pids);
+    argv.push(spec.image);
+    if (spec.command) argv.push(...spec.command.split(/\s+/));
+    logCommand(argv, r);
+    go.disabled = false; go.textContent = "Run";
+    if (r.ok) { dlg.close(); refresh(); }
+    else $("#run-err").textContent = (r.stderr || r.error || "failed").split("\n").slice(0, 3).join(" ");
+  };
+  $("#dlg-foot").replaceChildren(
+    el("button", { className: "act", textContent: "Cancel", onclick: () => dlg.close() }), go);
+  dlg.showModal();
+  f.image.focus();
+};
+
+// --- refresh loop -------------------------------------------------------
+async function refresh() {
+  if (view === "containers") {
+    const list = await api("/api/containers");
+    if (!Array.isArray(list)) return;
+    // Stats only for what is running, and only for what is on screen.
+    await Promise.all(list.filter((c) => c.status === "running").map(async (c) => {
+      const s = await api("/api/containers/" + c.id + "/stats");
+      c._stats = s;
+      // A cumulative counter is useless on its own; two samples are a rate.
+      if (s.cpu_usec != null && s.sampled_at_usec) {
+        const prev = cpuSamples.get(c.id);
+        if (prev && s.sampled_at_usec > prev.at) {
+          const pct = ((s.cpu_usec - prev.usec) / (s.sampled_at_usec - prev.at)) * 100;
+          if (pct >= 0 && pct < 10000) cpuPercent.set(c.id, pct);
+        }
+        cpuSamples.set(c.id, { usec: s.cpu_usec, at: s.sampled_at_usec });
+      }
+    }));
+    renderContainers(list);
+    buildDetailIfStale();
+    refreshLogs(false);
+  } else if (view === "stacks") {
+    const list = await api("/api/containers");
+    if (Array.isArray(list)) { lastContainers = list; renderStacks(list); }
+  } else if (view === "images") {
+    renderImages(await api("/api/images") || []);
+  } else {
+    renderVolumes(await api("/api/volumes") || []);
+  }
+}
+
+loadSystem();
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

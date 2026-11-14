@@ -116,6 +116,26 @@ pub struct Config {
     /// Host paths made visible inside the container, in the order given.
     #[serde(default)]
     pub volumes: Vec<mount::VolumeMount>,
+    /// The stack this container belongs to, and its service name in it.
+    ///
+    /// Recorded rather than inferred from the container name. `web-1` may
+    /// be a service of the `web` stack or a container somebody named
+    /// `web-1`, and a UI that guesses will eventually group two unrelated
+    /// things together and call it a stack.
+    #[serde(default)]
+    pub stack: Option<String>,
+    #[serde(default)]
+    pub service: Option<String>,
+    /// Extra `/etc/hosts` entries: `(name, address)`.
+    ///
+    /// How a stack's services find each other. Not DNS - a resolver in
+    /// each namespace would be a second service to run, to supervise and
+    /// to get wrong, and the set of names in a stack is known before any
+    /// of it starts. Writing them into a file the container already has
+    /// is the whole feature, and `cat /etc/hosts` is the whole debugging
+    /// story.
+    #[serde(default)]
+    pub peers: Vec<(String, String)>,
     /// Run in a user namespace of our own, mapping our effective ids to
     /// root inside it (stage 11).
     ///
@@ -258,6 +278,9 @@ impl Config {
             String::from("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
         if let Some(ip) = &self.ip {
             body.push_str(&format!("{ip}\t{}\n", self.hostname));
+        }
+        for (name, ip) in &self.peers {
+            body.push_str(&format!("{ip}\t{name}\n"));
         }
         let path = dir.join("hosts");
         std::fs::write(&path, body)?;
@@ -1030,6 +1053,9 @@ mod tests {
             envp: vec!["PATH=/bin".into()],
             hostname: "box".into(),
             volumes: Vec::new(),
+            peers: Vec::new(),
+            stack: None,
+            service: None,
             rootfs: None,
             memory: None,
             cpus: None,

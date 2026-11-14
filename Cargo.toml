@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/image", "crates/cli"]
+members = ["crates/core", "crates/image", "crates/api", "crates/cli"]
 
 [workspace.package]
 edition = "2024"
@@ -29,6 +29,10 @@ libc = { version = "=0.2.191", default-features = false }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# The stack file format. TOML and not YAML: a configuration language
+# should not be able to surprise you, and `ports: - 8080:80` is a
+# sexagesimal number in YAML 1.1.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 seccompiler = { version = "0.5", features = ["json"] }
 # The image subsystem. Synchronous on purpose: `ureq` rather than
 # `reqwest` + `tokio`, so nothing here can put an executor in the process

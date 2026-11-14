@@ -16,9 +16,12 @@ path = "src/main.rs"
 [dependencies]
 rustainer-core = { path = "../core" }
 rustainer-image = { path = "../image" }
+rustainer-api = { path = "../api" }
 clap.workspace = true
 anyhow.workspace = true
 pentacle.workspace = true
 libc.workspace = true
 rustix.workspace = true
 serde_json.workspace = true
+serde = { workspace = true }
+toml.workspace = true
