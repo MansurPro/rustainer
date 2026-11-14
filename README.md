@@ -57,6 +57,7 @@ is easier to reason about once the process model is not also in question.
 | 12 | `exec` — a second process in a live container | **Done** |
 | 13 | Docker image compatibility, measured against real registries | **Done** |
 | 14 | Measured against Docker, and what measuring found | **Done** |
+| 15 | A layer's deletions are honoured | **Done** |
 
 The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete, and
 stage 12 begins the additive work §19 held back until the mechanisms were
@@ -400,6 +401,57 @@ and embedded DNS, an HTTP API, `events`, restart policies, healthchecks, log
 drivers, Compose, swarm, plugins, checkpoint/restore, Windows, cgroup v1.
 The timings measure starting and supervising a container. They are not a
 claim that one tool replaces the other.
+
+### A layer's deletions are honoured
+
+The most serious defect found in this project, and it was invisible to
+every test that came before it.
+
+Each layer is extracted into a directory of its own so that layers can be
+shared between images, and those directories are composed at run time by
+OverlayFS. A **whiteout** — the OCI way of saying "this layer deletes that
+file" — was handled by *deleting the name from the layer being extracted*.
+That looks right and does nothing: the victim lives in a different layer's
+directory, so the unlink is a no-op and the file stays visible through the
+lower layer at run time.
+
+`RUN ... && rm -rf /secret` is one of the most common lines in any
+Dockerfile. It is how build secrets, private keys, credentials and package
+caches are removed. **Every one of them was readable inside the container.**
+
+A whiteout has to be left behind in a form OverlayFS understands: a
+character device with major 0 and minor 0, which the kernel recognises by
+that exact number and which never appears in the merged view. An opaque
+directory is an xattr — `trusted.overlay.opaque`, or `user.overlay.opaque`
+when the overlay will be mounted `userxattr`, which it is whenever we are
+outside the initial user namespace. Setting the wrong one of those is
+silent in exactly the same way: the mount succeeds, the xattr is ignored,
+and deleted files reappear.
+
+This is the one place the extractor creates a device node, and the contrast
+with the rest of it is the point: a device *from layer content* is refused
+outright, because a layer shipping `dev/mem` as char 1:1 would be a direct
+path to host memory. `0:0` is not a device at all — there is no driver
+behind it — and it is synthesised from a `.wh.` marker, never copied from
+the archive.
+
+Where the environment forbids creating one — an unprivileged container's
+device filter denies it even with `CAP_MKNOD` in the effective set — the
+engine says so, in those terms:
+
+```
+rustainer: WARNING: 2 deletion(s) recorded by this image could not be
+  applied, so files its later layers deleted REMAIN VISIBLE in containers
+  made from it. ...
+```
+
+The stage 15 test builds its image byte by byte and serves it over
+loopback rather than pulling one, because the properties worth testing
+hardest are about what a layer *removes*, and you cannot see what a public
+image's layers contain without reimplementing the thing under test. It
+then reads the store back: the marker must be a character device, the
+number must be exactly 0:0, the lower layer must be untouched, and no
+`.wh.` entry may be visible inside the container.
 
 ### The engine does not lie about what it does not know
 
