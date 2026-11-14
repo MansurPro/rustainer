@@ -61,6 +61,10 @@ is easier to reason about once the process model is not also in question.
 | 16 | Volumes and bind mounts | **Done** |
 | 17 | A local API, and a page that uses it | **Done** |
 | 18 | Stacks — several containers from one file | **Done** |
+| 19 | Pseudo-terminals — `run -it`, `exec -it` | **Done** |
+| 20 | Restart policies and an event log | **Done** |
+| 21 | `build` — images from a Dockerfile | **Done** |
+| 22 | `push` — upload an image to a registry | **Done** |
 
 The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete.
 Stages 12 onwards are the additive work §19 held back until the mechanisms
@@ -130,6 +134,7 @@ rustainer logs <id>
 rustainer exec -e TZ=UTC <id> /bin/sh -c 'ps -o pid,comm'
 rustainer serve                       # a local page at 127.0.0.1:8750
 rustainer stack up -f examples/rustainer.toml
+rustainer build -t myapp:1 .
 rustainer stop -t 5 <id>
 rustainer rm <id>
 ```
@@ -628,6 +633,165 @@ same merge rule `exec` does, so `--env PATH=…` replaces the image's entry
 rather than shadowing it — prepending also "works", but only by accident
 of glibc's `getenv`, and `env` inside the container would print the
 variable twice.
+
+### Pseudo-terminals
+
+```sh
+rustainer run  -it alpine:3.21 /bin/sh
+rustainer exec -it <id> /bin/sh
+```
+
+`-t` is not cosmetic. `isatty(1)` decides whether a shell prints a prompt
+at all, whether `ls` colours its output, whether `apt` draws a progress
+bar — and, through the controlling terminal, whether `^C` arrives as
+`SIGINT` or as the byte `0x03`.
+
+Two syscalls in the child do the work, both required and neither obvious:
+`setsid()` leaves the caller's session, without which a Ctrl-C typed at
+the outer shell reaches both; `TIOCSCTTY` attaches the pty, without which
+it has no foreground process group and the kernel never generates the
+signal at all.
+
+**Where the pty is allocated is a trade, and it is written down rather
+than discovered.** `runc` opens `/dev/ptmx` inside the container and
+passes the master back over a unix socket, which is more correct and needs
+the child to build an `SCM_RIGHTS` message in the window where it may not
+allocate. This allocates on the host instead: the descriptors work exactly
+as they should — a descriptor has no namespace — but the slave's
+*pathname* belongs to the host's `devpts`, so `ttyname(0)` inside names a
+different terminal and `ps` shows `?`. Programs that ask *am I a terminal*
+are unaffected; programs that ask *which terminal am I* are.
+
+The **supervisor** allocates it, not the CLI, because `run -dt` has to
+work and a master held by a process that has exited is a container whose
+output goes nowhere. The CLI's job is raw mode on its own terminal, in a
+`Drop` guard — every path out has to restore it, and a shell left in raw
+mode is one the user has to `reset` blind.
+
+Asserting any of this needs a terminal to observe from, since a pipeline
+is exactly what `-t` is distinguishable from. `scripts/pty-drive.py`
+provides one, and the test checks what a pipeline cannot show: `stty size`
+inside reports the window outside, and `^C` fires the container's own
+`INT` trap.
+
+### Restart policies, and a record of what happened
+
+```sh
+rustainer run -d --restart on-failure:3 alpine:3.21 ./flaky
+rustainer events --follow
+```
+
+`no`, `always`, `unless-stopped`, `on-failure[:attempts]` — Docker's set
+with Docker's meanings, including the one that surprises people:
+**`always` does not restart a container the operator stopped.** A policy
+that undid `stop` would make `stop` meaningless.
+
+That flag is written by `stop` **before** it signals, and it lives in a
+file of its own rather than in `state.json`. The two writers are different
+processes, and the supervisor rewrites the whole state file several times
+per restart from its own in-memory copy — so a flag set there is
+overwritten within milliseconds. Two writers, two files, no lock needed:
+existence is the whole value. (This was a real bug, caught by the test
+that asserts a stopped container stays stopped.)
+
+The backoff is exponential from 100 ms, capped at 10 s. Without one, a
+container whose command does not exist is an unbounded fork loop that
+takes the machine with it — and "the image is wrong" is by far the most
+common reason a container exits immediately.
+
+A restart keeps the container's **identity**: same id, same cgroup, same
+address, same published ports, same accumulating log. Tearing all of that
+down and back up between attempts would make a crash-looping container
+flap the host's firewall several times a second.
+
+**`events` is a file, not a socket**, because there is no daemon. It has
+to work when the only thing running is a supervisor started an hour ago by
+a CLI that has long exited. Every writer opens `O_APPEND` and writes one
+line in one `write`, which Linux does not interleave below `PIPE_BUF` — so
+no lock is needed, and that is why the line length is capped rather than
+the file being locked. The test runs four crash-looping containers at once
+and asserts that not one row was spliced.
+
+### Building from a Dockerfile
+
+```sh
+rustainer build -t myapp:1 .
+rustainer build -t myapp:1 --build-arg VERSION=3.21 -f ./Dockerfile .
+```
+
+**A build step that changes the filesystem is a container run on the
+layers so far, and the container's own overlay upper directory is the new
+layer.** Nothing has to diff anything: OverlayFS already wrote down
+exactly what changed, including the deletions, which it records as the
+same `0:0` character devices the layer store has used since stage 15.
+
+So the build inherits the engine's isolation, cgroups, networking and
+security posture for free, because it is not a second implementation of
+any of them. A `RUN` step is a real container; if it cannot start, the
+build fails with the same message `run` would give.
+
+The layer is identified by the hash of its uncompressed tar, written in
+OCI's whiteout spelling rather than OverlayFS's — a `0:0` device becomes
+`.wh.<name>`, an opaque directory becomes `.wh..wh..opq`. The two mean the
+same thing and no registry has heard of the second one. The archive is
+built in deterministic mode with entries sorted, because an unstable
+`readdir` order would give the same filesystem two identities and defeat
+layer sharing entirely.
+
+**TOML-grade strictness about the file**, for the same reason as stacks:
+
+- An **unknown instruction is refused**, not skipped. An image built from
+  a file containing `HEALTHCHECK` does not do what the file says, and
+  ignoring the line quietly is how that reaches production.
+- **A bracketed line that is not valid JSON is an error.** Docker falls
+  back to the shell form there, which turns a misplaced quote into an
+  instruction that runs something else entirely and still succeeds.
+- **`COPY` cannot leave the build context**, checked on the *canonical*
+  path, because `a/../../etc` is only visibly an escape after resolution.
+- Variable expansion uses `ARG` and `ENV` and **never the caller's
+  environment** — a build that picked up `$HOME` from whoever ran it would
+  produce a different image on every machine, which is the one thing a
+  Dockerfile exists to prevent.
+
+What is deliberately absent: no parallelism, no instruction-keyed build
+cache, and no multi-stage `--from`. BuildKit is those three things and
+they are each a project; a cache that is wrong is worse than no cache, and
+`--from` needs a graph where this has a list.
+
+### Pushing
+
+```sh
+rustainer push myapp:1 --to registry.example.com/team/myapp:1
+RUSTAINER_REGISTRY_AUTH=user:token rustainer push myapp:1
+```
+
+`research/pass-2/RND.md` §19 predicted this would be *"strictly additive;
+shares the auth and transport code that pull already needs"*, and it was:
+three requests and a credential header on the token exchange.
+
+**Blobs first, manifest last.** A manifest naming blobs the registry does
+not have is a tag that resolves to a broken image, and not every registry
+checks. `scripts/fake-registry.py` does check, so getting it backwards
+fails in the test rather than six months later against somebody's Harbor.
+
+Every blob is `HEAD`ed before it is sent, because for anything built
+`FROM` something, every layer but one is already there — a push that
+re-uploads them takes minutes instead of seconds. The progress line says
+which happened, since *"pushing"* printed for a blob that was then
+skipped is a report that lies about where the time went.
+
+Credentials come from `RUSTAINER_REGISTRY_AUTH` in preference to
+`--creds`, because a password on a command line is in `ps` for everyone on
+the machine and in the shell history forever.
+
+**The test is a round trip**: build, push, pull into a *clean* store, run.
+Anything less proves the request succeeded, not that the right bytes
+arrived — and the first version of this code pushed an image whose
+manifest omitted the base layers. Every status code was 201. It failed
+only on the way back, as a `diff_id` mismatch on layer 0.
+
+Pull now keeps the manifest it fetched, which is what lets a pulled image
+be pushed on at all, and `build` writes one for the image it made.
 
 ### The engine does not lie about what it does not know
 

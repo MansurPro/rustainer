@@ -119,6 +119,26 @@ impl Server {
             ("GET", "/api/images") => return http::json(stream, 200, &self.images()),
             ("POST", "/api/images/pull") => return self.pull(stream, req),
             ("GET", "/api/volumes") => return http::json(stream, 200, &self.volumes()),
+            ("GET", "/api/events") => {
+                let since = req
+                    .param("since")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let limit = req
+                    .param("limit")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(200)
+                    .min(2000);
+                return http::json(
+                    stream,
+                    200,
+                    &serde_json::Value::Array(rustainer_core::events::read(
+                        &self.paths,
+                        since,
+                        limit,
+                    )),
+                );
+            }
             _ => {}
         }
 
@@ -202,6 +222,8 @@ impl Server {
                 (Status::Running | Status::Created, Some(p)) => Value::from(p),
                 _ => Value::Null,
             },
+            "restarts": st.restarts,
+            "restart_policy": cfg.as_ref().map(|c| format!("{:?}", c.restart).to_lowercase()),
             "stack": cfg.as_ref().and_then(|c| c.stack.clone()),
             "service": cfg.as_ref().and_then(|c| c.service.clone()),
             "command": st.command.join(" "),
