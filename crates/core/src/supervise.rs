@@ -834,7 +834,14 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
         // it was set after we last wrote the file. A policy that restarted a
         // container the operator had just stopped would make `stop`
         // meaningless.
-        let stopped = stop_was_requested(paths, id);
+        //
+        // A directory that is GONE counts as a stop too. `remove` skips
+        // the stop path for a container it finds already exited - which
+        // is exactly what a container in restart backoff looks like -
+        // and without this the supervisor wakes from the backoff, starts
+        // a container whose record has just been deleted, and then waits
+        // on it forever: a process nothing lists and nothing can stop.
+        let stopped = stop_was_requested(paths, id) || !paths.dir(id).exists();
         if !config
             .restart
             .should_restart(exit, stopped, restarts, config.restart_max)
@@ -857,6 +864,24 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
         // does not exist is an unbounded fork loop, and "the image is wrong"
         // is by far the most common reason one exits immediately.
         std::thread::sleep(delay);
+        // Again, because the sleep is where the window is - up to ten
+        // seconds of it, and `stop` or `rm` landing inside it is the
+        // normal case, not the rare one. A container that exits at once
+        // spends nearly all of its life in here, so `stop` almost never
+        // arrives anywhere else.
+        if !paths.dir(id).exists() {
+            // Nothing left to write to: the record this process exists
+            // to maintain has been deleted underneath it.
+            break exit;
+        }
+        if stop_was_requested(paths, id) {
+            // Recorded before leaving. Breaking out quietly would make
+            // `ps` report a container that stopped on its own, and the
+            // entire point of the flag is that somebody asked it to.
+            st.stop_requested = true;
+            st.store(paths)?;
+            break exit;
+        }
     };
 
     if let Some(c) = &cg {
@@ -1378,6 +1403,13 @@ fn wait_for_supervisor(st: &State) -> Result<(), Error> {
 /// Refuses a running container rather than orphaning its supervisor.
 pub fn remove(paths: &Paths, id: &str, force: bool) -> Result<(), Error> {
     crate::events::record(paths, "remove", id, serde_json::json!({ "force": force }));
+    // Before the lock, before the status check, before anything is
+    // deleted. A container in restart backoff is NOT running, so the
+    // `force` path below never calls `stop` for it and never records
+    // one - and its supervisor, waking up to a directory we are about
+    // to delete, would restart it. The sentinel goes with the
+    // directory, so the loop also checks that the directory is there.
+    let _ = std::fs::write(stop_sentinel(paths, id), b"");
     let _lock = Lock::acquire(&paths.lock_file(id))?;
     if let Ok(st) = State::load(paths, id) {
         let observed = st.observed_status();

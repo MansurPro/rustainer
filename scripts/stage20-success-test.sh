@@ -214,5 +214,32 @@ timeout 60 "$B" stop -t 1 "$ID" >/dev/null 2>&1
 "$B" rm --force "$ID" >/dev/null 2>&1
 
 echo
+echo "10. rm --force during a backoff leaves no supervisor behind"
+# The bug this caught, and it escaped into CI: a container in restart
+# backoff is NOT running, so `remove` took the "already exited" path,
+# never recorded a stop, and deleted the directory - and the supervisor
+# woke up from its sleep, restarted the container, and waited on it
+# forever. A process with no record, that `ps` cannot list and `stop`
+# cannot reach, surviving the test that made it.
+#
+# Caught three minutes later and two stages away, by stage 14's "nothing
+# of ours is resident" scan, which is the entire reason that assertion
+# is worth having.
+ID=$(timeout 120 "$B" run -d --restart always --network none "$IMG" \
+    /bin/sh -c 'exit 7' 2>/dev/null)
+# Four restarts in: the fifth backoff is 3.2 s, which is a wide enough
+# window to land the rm inside rather than racing it.
+sleep 5
+SUP=$(field "$ID" supervisor_pid)
+"$B" rm --force "$ID" >/dev/null 2>&1
+check "the record is gone" "$([ -d "$RUSTAINER_ROOT/containers/$ID" ] && echo present || echo gone)" "gone"
+GONE=no
+for _ in $(seq 60); do
+    [ -d "/proc/$SUP" ] || { GONE=yes; break; }
+    sleep 0.2
+done
+check "and its supervisor noticed and exited" "$GONE" "yes"
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
