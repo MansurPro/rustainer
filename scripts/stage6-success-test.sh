@@ -65,14 +65,27 @@ echo "image store: $RUSTAINER_IMAGE_ROOT"
 R() { "$B" run --network host "$@"; }
 nohang() { timeout 300 "$@"; }
 
+# shellcheck source=scripts/registry-fallback.sh
+. "$(dirname "$0")/registry-fallback.sh"
+
+# Which reference will this machine's address actually be served? Probed
+# once, then removed again, because the headline below has to do the pull
+# itself - "run an image you do not have" is the whole stage.
+try_pull alpine
+case $? in
+    0) IMG=$PULLED; nohang "$B" rmi "$IMG" >/dev/null 2>&1 ;;
+    2) echo "every registry rate-limited this address; nothing here can be tested" >&2; exit 2 ;;
+    *) echo "cannot pull an image: $PULL_ERR" >&2; exit 2 ;;
+esac
+
 echo
 echo "1. The headline: run alpine echo hello"
-OUT=$(nohang "$B" run --network host alpine /bin/echo hello 2>&1 | tail -1)
+OUT=$(nohang "$B" run --network host "$IMG" /bin/echo hello 2>&1 | tail -1)
 check "the image was pulled, extracted and run" "$OUT" "hello"
 
 echo
 echo "2. Every digest is recomputed, never taken from a header"
-DIGEST=$(nohang "$B" pull alpine 2>/dev/null | tail -1)
+DIGEST=$(nohang "$B" pull "$IMG" 2>/dev/null | tail -1)
 echo "  manifest digest: $DIGEST"
 case "$DIGEST" in
     sha256:*) ok "pull reports a sha256 manifest digest" ;;
@@ -94,19 +107,19 @@ fi
 echo
 echo "3. The image's own config is honoured"
 check "the image's PATH reaches the container" \
-    "$(nohang "$B" run --network host alpine /bin/sh -c 'echo $PATH' 2>/dev/null | tail -1)" \
+    "$(nohang "$B" run --network host "$IMG" /bin/sh -c 'echo $PATH' 2>/dev/null | tail -1)" \
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # No absolute path given: resolved against the image's PATH directories, in
 # the parent, because a PATH search in the child would mean reading
 # directories in the window that forbids allocation.
 check "a bare command name is resolved inside the image" \
-    "$(nohang "$B" run --network host alpine echo resolved 2>/dev/null | tail -1)" "resolved"
+    "$(nohang "$B" run --network host "$IMG" echo resolved 2>/dev/null | tail -1)" "resolved"
 
 echo
 echo "4. images and rmi"
 nohang "$B" images 2>/dev/null | grep -q alpine && ok "images lists the pulled image" \
     || bad "images did not list it"
-nohang "$B" rmi alpine >/dev/null 2>&1 && ok "rmi removes it" || bad "rmi failed"
+nohang "$B" rmi "$IMG" >/dev/null 2>&1 && ok "rmi removes it" || bad "rmi failed"
 nohang "$B" images 2>/dev/null | grep -q alpine && bad "it is still listed after rmi" \
     || ok "it is gone from images"
 
@@ -151,11 +164,12 @@ nohang "$B" pull definitely-not-a-real-image-xyzzy 2>&1 | grep -qiE 'not found|4
     && ok "a missing image reports the registry's answer" || bad "a missing image was not reported clearly"
 # alpine's Cmd is ["/bin/sh"], which with no terminal reads EOF and exits 0.
 # The assertion is the exit status, not the output: there is none.
-nohang "$B" run --network host alpine >/dev/null 2>&1
+nohang "$B" run --network host "$IMG" >/dev/null 2>&1
 check "an image with a Cmd runs it when no command is given" "$?" "0"
 "$B" run --network host --rootfs /nonexistent /bin/true 2>&1 | grep -q 'not a directory' \
     && ok "--rootfs with a bad path still refuses" || bad "--rootfs did not refuse"
 
 echo
+mirror_note
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -156,17 +156,21 @@ check "and writable when not" \
 
 echo
 echo "7. Layers are extracted once and shared"
-nohang "$B" pull alpine >/dev/null 2>&1
+# shellcheck source=scripts/registry-fallback.sh
+. "$(dirname "$0")/registry-fallback.sh"
+try_pull alpine
+IMG=$PULLED
 BEFORE=$(find "$RUSTAINER_IMAGE_ROOT" -maxdepth 2 -name 'layers*' -prune -o -type d -print 2>/dev/null | wc -l)
-nohang "$B" run --network host alpine /bin/true >/dev/null 2>&1
+nohang "$B" run --network host "$IMG" /bin/true >/dev/null 2>&1
 LAYERS=$(find "$RUSTAINER_IMAGE_ROOT"/layers* -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
 [ "${LAYERS:-0}" -ge 1 ] && ok "the image's layers are in the store as separate directories" \
     || bad "no extracted layers found"
-nohang "$B" run --network host alpine /bin/sh -c 'echo a > /tmp/x' >/dev/null 2>&1
+nohang "$B" run --network host "$IMG" /bin/sh -c 'echo a > /tmp/x' >/dev/null 2>&1
 AFTER=$(find "$RUSTAINER_IMAGE_ROOT"/layers* -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
 check "a second run re-extracts nothing" "$AFTER" "$LAYERS"
 echo "  (before: $BEFORE)"
 
 echo
+mirror_note
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

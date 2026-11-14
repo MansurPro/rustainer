@@ -92,6 +92,9 @@ pub struct Report {
     pub opaque_dirs: u64,
     /// Directories whose mode was widened so extraction could continue.
     pub modes_relaxed: u64,
+    /// Entries naming the archive's own root (`./`), which carry a mode for
+    /// a directory that already exists and nothing to extract.
+    pub root_entries: u64,
 }
 
 /// A pinned root. Every path in this module resolves through it.
@@ -305,6 +308,27 @@ fn cpath(p: &Path) -> Result<CString, Error> {
 /// This is **not** the containment guarantee — `SafeRoot` is. It exists so
 /// a hostile path produces a good error message instead of a confusing one,
 /// and because doing both costs nothing.
+/// Does this entry name the archive's own root rather than something inside
+/// it?
+///
+/// `tar -C dir .` writes `./` as the archive's first member, and that is how
+/// a great many image layers are built, so this is not an exotic case: on
+/// Docker Hub today it is what `debian`, `python`, `busybox` and Google's
+/// distroless images all have, and rejecting it rejects a third of the
+/// base images in common use.
+///
+/// It is not an error and there is nothing to extract — the destination
+/// directory already exists, and we own its mode. Kept separate from
+/// [`sanitise`] on purpose: an empty path is still a real error for a
+/// **symlink target**, where it would mean a link to the root of a
+/// filesystem the layer does not own.
+fn names_archive_root(raw: &Path) -> bool {
+    !raw.as_os_str().is_empty()
+        && raw
+            .components()
+            .all(|c| matches!(c, Component::RootDir | Component::CurDir))
+}
+
 fn sanitise(raw: &Path) -> Result<PathBuf, Error> {
     let mut out = PathBuf::new();
     for comp in raw.components() {
@@ -353,6 +377,10 @@ pub fn apply_layer<R: Read>(
         }
 
         let raw = entry.path().map_err(Error::Archive)?.into_owned();
+        if names_archive_root(&raw) {
+            report.root_entries += 1;
+            continue;
+        }
         let rel = sanitise(&raw)?;
         let header = entry.header().clone();
         let mode = header.mode().unwrap_or(0o644) & 0o7777;
@@ -926,6 +954,25 @@ mod tests {
         );
         assert_eq!(sanitise(Path::new("./a")).unwrap(), PathBuf::from("a"));
         assert!(sanitise(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn the_archives_own_root_is_recognised_and_is_not_a_path() {
+        // `tar -C dir .` writes this, and it is the first member of the
+        // layers of debian, python, busybox and distroless. Treating it as
+        // a path to extract rejects a third of Docker Hub's base images.
+        for r in ["./", ".", "/", "//", "/."] {
+            assert!(names_archive_root(Path::new(r)), "{r:?}");
+            assert!(sanitise(Path::new(r)).is_err(), "{r:?} is not a path");
+        }
+        // Everything that names something *inside* the archive is not this.
+        for r in ["", "./a", "a", "/etc/passwd", ".wh.x"] {
+            assert!(!names_archive_root(Path::new(r)), "{r:?}");
+        }
+        // And it never becomes an escape: `..` is refused by sanitise and
+        // is not a root name either.
+        assert!(!names_archive_root(Path::new("./..")));
+        assert!(sanitise(Path::new("./..")).is_err());
     }
 
     #[test]

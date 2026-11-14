@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 HOST=${1:-}
 [ -n "$HOST" ] || { sed -n '2,16p' "$0" >&2; exit 2; }
 shift
-STAGES=${*:-1 2 3 4 5 6 7 8 9 10 11 12}
+STAGES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13}
 
 ARCH=$(ssh -o BatchMode=yes "$HOST" 'uname -m')
 case "$ARCH" in
@@ -55,7 +55,8 @@ docker run --rm --platform "$PLATFORM" -v "$PWD":/w -v "$OUT":/out -w /w \
 DIR=/tmp/rustainer-test
 ssh -o BatchMode=yes "$HOST" "rm -rf $DIR && mkdir -p $DIR/scripts"
 scp -q "$OUT/rustainer" "$OUT/unit-tests" "$HOST:$DIR/"
-scp -q scripts/stage*-success-test.sh scripts/remote-stage-runner.sh "$HOST:$DIR/scripts/"
+scp -q scripts/stage*-success-test.sh scripts/remote-stage-runner.sh \
+    scripts/registry-fallback.sh "$HOST:$DIR/scripts/"
 
 # A delegated cgroup scope when the host has a user systemd, so the resource
 # stages exercise real limits instead of only the refusal path. Without it

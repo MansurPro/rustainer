@@ -48,26 +48,23 @@ pub struct Request {
     pub env: Vec<String>,
     /// Defaults to the container's working directory, then to `/`.
     pub workdir: Option<String>,
-    /// Defaults to the user the container itself runs as.
-    pub user: Option<UserSpec>,
+    /// `user[:group]`, either side a name or a number. Defaults to the
+    /// user the container itself runs as.
+    ///
+    /// Unparsed on purpose: a name can only be resolved against the
+    /// container's own `/etc/passwd`, and the CLI does not know which
+    /// container this is for until we do.
+    pub user: Option<String>,
 }
 
-/// The directories searched when the command is not an absolute path.
+/// The PATH searched when the container declares none.
 ///
-/// The same list the `run` path uses, searched in the same order — but
-/// through `/proc/<init>/root`, which is the one view that is correct here.
-/// A container's root is an overlay mounted *inside its own mount
-/// namespace*, so the merged directory has no pathname on the host and
-/// searching the image's layers on disk would miss everything the container
-/// has written since it started.
-const PATH_DIRS: [&str; 6] = [
-    "/usr/local/sbin",
-    "/usr/local/bin",
-    "/usr/sbin",
-    "/usr/bin",
-    "/sbin",
-    "/bin",
-];
+/// Searched through `/proc/<init>/root`, which is the one view that is
+/// correct here. A container's root is an overlay mounted *inside its own
+/// mount namespace*, so the merged directory has no pathname on the host,
+/// and searching the image's layers on disk would miss everything the
+/// container has written since it started.
+const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Run `req` inside container `id` and wait for it.
 pub fn exec(paths: &Paths, id: &str, req: &Request) -> Result<Exit, Error> {
@@ -88,8 +85,16 @@ pub fn exec(paths: &Paths, id: &str, req: &Request) -> Result<Exit, Error> {
     };
 
     let mut config = Config::load(paths, id)?;
-    if req.user.is_some() {
-        config.user = req.user.clone();
+    if let Some(u) = &req.user {
+        // Resolved against the container's LIVE /etc/passwd, not the
+        // image's: a container that has added a user since it started has
+        // one, and the file is right there behind /proc/<init>/root.
+        let root = format!("/proc/{init}/root");
+        let read = |rel: &str| std::fs::read_to_string(format!("{root}/{rel}")).unwrap_or_default();
+        config.user = Some(
+            UserSpec::parse_with_passwd(u, &read("etc/passwd"), &read("etc/group"))
+                .map_err(|e| Error::Io(std::io::Error::other(format!("--user: {e}"))))?,
+        );
     }
     // Asked and answered here, where the answer is a sentence. Deeper in,
     // it is `setresuid` returning EINVAL from a process that can no longer
@@ -103,7 +108,7 @@ pub fn exec(paths: &Paths, id: &str, req: &Request) -> Result<Exit, Error> {
     // Everything that needs the host's filesystem view happens here, above
     // the first `setns`. After the joins this process can still read its own
     // `/proc`, but `/sys/fs/cgroup` and the state directory are gone.
-    let exe = resolve(init, &req.argv[0])?;
+    let exe = resolve(init, &req.argv[0], &config.envp)?;
     let security = config.security()?;
     let cgroup_fd = cgroup::open_existing(init);
 
@@ -217,7 +222,7 @@ fn open_namespaces<const N: usize>(
 }
 
 /// Find the command inside the running container.
-fn resolve(init: i32, cmd: &str) -> Result<String, Error> {
+fn resolve(init: i32, cmd: &str, envp: &[String]) -> Result<String, Error> {
     if cmd.starts_with('/') {
         return Ok(cmd.to_owned());
     }
@@ -226,13 +231,20 @@ fn resolve(init: i32, cmd: &str) -> Result<String, Error> {
             cmd: cmd.to_owned(),
         });
     }
-    for dir in PATH_DIRS {
+    // The container's own PATH. An image that puts its toolchain somewhere
+    // unusual - `golang` uses /usr/local/go/bin - says so in its config,
+    // and `exec` has to read the same answer `run` does.
+    let path = envp
+        .iter()
+        .find_map(|e| e.strip_prefix("PATH="))
+        .unwrap_or(DEFAULT_PATH);
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
         // `symlink_metadata`, not `is_file`: in a real image `/bin/sh` is a
         // symlink to `/bin/busybox`, whose absolute target only resolves
         // inside the container. Following it from here looks for the host's
         // busybox and concludes the command does not exist.
         if std::fs::symlink_metadata(format!("/proc/{init}/root{dir}/{cmd}")).is_ok() {
-            return Ok(format!("{dir}/{cmd}"));
+            return Ok(format!("{}/{cmd}", dir.trim_end_matches('/')));
         }
     }
     Err(Error::NotFoundInContainer {
@@ -266,14 +278,14 @@ mod tests {
         // No /proc read: the early return happens before any lookup, which
         // is what lets `exec <id> /bin/sh` work in a container whose
         // /proc is not mounted.
-        assert_eq!(resolve(1, "/bin/sh").unwrap(), "/bin/sh");
+        assert_eq!(resolve(1, "/bin/sh", &[]).unwrap(), "/bin/sh");
     }
 
     #[test]
     fn a_relative_path_is_refused_rather_than_searched() {
         // `exec <id> ./configure` must not silently become /bin/./configure.
         assert!(matches!(
-            resolve(1, "./configure"),
+            resolve(1, "./configure", &[]),
             Err(Error::NotFoundInContainer { .. })
         ));
     }

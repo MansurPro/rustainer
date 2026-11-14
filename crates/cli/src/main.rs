@@ -390,15 +390,25 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
     // With layers, the rootfs is a mount point inside the container's own
     // state directory, created by the supervisor.
     let mut rootfs = rootfs;
-    let mut layer_search: Option<String> = None;
-    if !layers.is_empty() {
-        // The topmost layer is where a command is most likely to be found,
-        // and resolving a bare name needs a tree to look in before the
-        // overlay exists.
-        layer_search = layers.last().cloned();
-    }
+    // EVERY layer, topmost first - the order the overlay itself would
+    // resolve in. Searching only the top layer is a guess that is wrong for
+    // most real images: `golang:1.24-alpine` is four layers and `/bin/pwd`
+    // is in the alpine base at the bottom, so a top-layer-only search
+    // reports that the image does not contain a program it plainly does.
+    let search: Vec<String> = if layers.is_empty() {
+        rootfs.clone().into_iter().collect()
+    } else {
+        layers.iter().rev().cloned().collect()
+    };
 
-    let exe = resolve_exe(&command[0], layer_search.as_deref().or(rootfs.as_deref()))?;
+    // The image's own PATH, not ours. `golang` puts the Go toolchain in
+    // /usr/local/go/bin and says so in its config; an engine that searches
+    // a hardcoded list cannot find `go` in the Go image.
+    let image_path = image_env
+        .iter()
+        .find_map(|e| e.strip_prefix("PATH="))
+        .map(|p| p.to_owned());
+    let exe = resolve_exe(&command[0], &search, image_path.as_deref())?;
 
     // Stage 11. Without CAP_SYS_ADMIN here, the only way to get it is to
     // make a user namespace and be root inside that. We do it ourselves
@@ -564,7 +574,12 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         user: match args.user.as_ref().or(image_user.as_ref()) {
             None => None,
             Some(u) => {
-                let spec = UserSpec::parse(u).map_err(|e| anyhow::anyhow!("--user: {e}"))?;
+                let spec = UserSpec::parse_with_passwd(
+                    u,
+                    &read_from_layers(&search, "etc/passwd"),
+                    &read_from_layers(&search, "etc/group"),
+                )
+                .map_err(|e| anyhow::anyhow!("--user: {e}"))?;
                 if let Some(why) = spec.unmapped_reason(userns) {
                     bail!("--user {u}: {why}");
                 }
@@ -821,15 +836,13 @@ fn cmd_ps(paths: &Paths, args: PsArgs) -> Result<ExitCode> {
 }
 
 fn cmd_exec(paths: &Paths, args: ExecArgs) -> Result<ExitCode> {
-    let user = match &args.user {
-        None => None,
-        Some(u) => Some(UserSpec::parse(u).map_err(|e| anyhow::anyhow!("--user: {e}"))?),
-    };
     let req = exec::Request {
         argv: args.command,
         env: args.env,
         workdir: args.workdir,
-        user,
+        // Passed through unparsed: a name is only meaningful against this
+        // container's /etc/passwd, which exec can read and we cannot.
+        user: args.user,
     };
     let exit = exec::exec(paths, &args.id, &req).with_context(|| format!("exec in {}", args.id))?;
     // The exec'd command's status, not ours: `rustainer exec sh -c 'exit 7'`
@@ -919,42 +932,68 @@ fn require_absolute(exe: &OsString) -> Result<()> {
     Ok(())
 }
 
+/// The PATH searched when the image does not declare one.
+const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 /// Find the command inside the container's filesystem.
 ///
-/// Resolved HERE, in the parent, against the rootfs on disk - never in the
+/// Resolved HERE, in the parent, against the layers on disk - never in the
 /// child, where a PATH search would mean reading directories and allocating
 /// in the one window that forbids both.
-fn resolve_exe(cmd: &OsString, rootfs: Option<&str>) -> Result<OsString> {
+///
+/// `roots` is every layer, topmost first, which is the order the overlay
+/// will resolve in once it exists. One caveat, stated rather than hidden: a
+/// binary deleted by an upper layer leaves an overlay whiteout that this
+/// search does not interpret, so it can still be found here. An image whose
+/// own command is whited out is pathological, and the alternative - building
+/// the overlay before we know what to run - is a worse trade.
+fn resolve_exe(cmd: &OsString, roots: &[String], path_env: Option<&str>) -> Result<OsString> {
     let p = Path::new(cmd);
     if p.is_absolute() {
         return Ok(cmd.clone());
     }
-    let Some(root) = rootfs else {
+    if roots.is_empty() {
         return Err(anyhow::anyhow!(
             "{cmd:?} must be an absolute path when there is no image to search"
         ));
-    };
-    for dir in [
-        "/usr/local/sbin",
-        "/usr/local/bin",
-        "/usr/sbin",
-        "/usr/bin",
-        "/sbin",
-        "/bin",
-    ] {
-        let candidate = Path::new(root).join(dir.trim_start_matches('/')).join(p);
-        // `symlink_metadata`, not `is_file`: in a real image `/bin/echo` is
-        // a symlink to `/bin/busybox`, and that absolute target only
-        // resolves *inside* the container. Following it from out here looks
-        // for the host's busybox and concludes the command does not exist.
-        if candidate.symlink_metadata().is_ok() {
-            return Ok(OsString::from(format!("{dir}/{}", p.display())));
+    }
+    let path = path_env.unwrap_or(DEFAULT_PATH);
+    // PATH order outermost: the first directory on PATH that has the
+    // command wins, and within that directory the topmost layer wins. That
+    // is `execvp` composed with overlayfs, in that order, and swapping them
+    // would pick a shadowed binary from a lower layer.
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        for root in roots {
+            let candidate = Path::new(root).join(dir.trim_start_matches('/')).join(p);
+            // `symlink_metadata`, not `is_file`: in a real image `/bin/echo`
+            // is a symlink to `/bin/busybox`, and that absolute target only
+            // resolves *inside* the container. Following it from out here
+            // looks for the host's busybox and concludes the command does
+            // not exist.
+            if candidate.symlink_metadata().is_ok() {
+                return Ok(OsString::from(format!(
+                    "{}/{}",
+                    dir.trim_end_matches('/'),
+                    p.display()
+                )));
+            }
         }
     }
     bail!(
-        "{cmd:?} was not found in the image's PATH directories. Give an absolute path, \
-         or check the image actually contains it."
+        "{cmd:?} was not found in {path}, which is the PATH this image declares. Give an \
+         absolute path, or check the image actually contains it."
     )
+}
+
+/// Read a file out of the container's filesystem, topmost layer first.
+///
+/// The same resolution order as [`resolve_exe`], for the same reason, and
+/// used for the two files that decide who the container runs as.
+fn read_from_layers(roots: &[String], rel: &str) -> String {
+    roots
+        .iter()
+        .find_map(|r| std::fs::read_to_string(Path::new(r).join(rel)).ok())
+        .unwrap_or_default()
 }
 
 /// The bounding set to keep, as names, or `None` for the default.

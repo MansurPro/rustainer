@@ -203,8 +203,12 @@ echo
 echo "9. Refusals stay explicit"
 R --cap-add ALL /bin/true 2>&1 | grep -q 'CAP_SYS_ADMIN' \
     && ok "--cap-add ALL refuses and says why" || bad "--cap-add ALL did not refuse"
-R --user nobody /bin/true 2>&1 | grep -q 'etc/passwd' \
-    && ok "a user name refuses and says what is missing" || bad "a user name did not refuse"
+# A name the rootfs DOES define now resolves against its /etc/passwd
+# (stage 13). A name it does not define still refuses, and still names the
+# file it looked in - which is the assertion that was always the point.
+R --user definitely-not-a-user /bin/true 2>&1 | grep -q 'etc/passwd' \
+    && ok "an undefined user name refuses and says what it looked in" \
+    || bad "an undefined user name did not refuse"
 R --security-opt apparmor=unconfined /bin/true 2>&1 | grep -q 'not implemented' \
     && ok "an unimplemented security-opt refuses" || bad "apparmor= was silently accepted"
 

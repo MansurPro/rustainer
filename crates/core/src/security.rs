@@ -56,6 +56,42 @@ pub struct UserSpec {
     pub groups: Vec<u32>,
 }
 
+/// `name:x:uid:gid:...` - the uid and gid of one `/etc/passwd` entry.
+///
+/// Hand-parsed rather than handed to a crate: the format is five colons,
+/// the files are small, and every crate that reads passwd reads the
+/// **host's** copy by default, which is the one answer that is always
+/// wrong here.
+fn passwd_lookup(passwd: &str, name: &str) -> Option<(u32, u32)> {
+    passwd.lines().find_map(|l| {
+        let mut f = l.split(':');
+        (f.next()? == name).then_some(())?;
+        let _pw = f.next()?;
+        Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+    })
+}
+
+/// The primary gid recorded for a uid, if the file mentions it at all.
+fn passwd_gid_of_uid(passwd: &str, uid: u32) -> Option<u32> {
+    passwd.lines().find_map(|l| {
+        let mut f = l.split(':');
+        let _name = f.next()?;
+        let _pw = f.next()?;
+        (f.next()?.parse::<u32>().ok()? == uid).then_some(())?;
+        f.next()?.parse().ok()
+    })
+}
+
+/// `name:x:gid:members` - the gid of one `/etc/group` entry.
+fn group_lookup(group: &str, name: &str) -> Option<u32> {
+    group.lines().find_map(|l| {
+        let mut f = l.split(':');
+        (f.next()? == name).then_some(())?;
+        let _pw = f.next()?;
+        f.next()?.parse().ok()
+    })
+}
+
 /// Is `id` reachable from this user namespace?
 ///
 /// In a single-ID namespace - `unshare --user --map-root-user`, and the
@@ -143,23 +179,69 @@ impl UserSpec {
     /// the container's own `/etc/passwd`, which does not exist until after
     /// the pivot, and resolving the host's would be a different user.
     pub fn parse(s: &str) -> Result<Self, String> {
+        Self::parse_with_passwd(s, "", "")
+    }
+
+    /// `user[:group]`, where either side may be a **name**.
+    ///
+    /// `passwd` and `group` are the contents of the **container's own**
+    /// `/etc/passwd` and `/etc/group`. Never the host's: `nobody` is 65534
+    /// on Debian and 99 on Fedora, `nginx` is whatever that image decided,
+    /// and resolving a name against the host would silently run the
+    /// container as a different person than it asked for.
+    ///
+    /// This is compatibility, not convenience. Images that set `USER` by
+    /// name are ordinary - `prometheus`, `grafana`, `nginx-unprivileged`,
+    /// `elasticsearch` - and an engine that refuses names cannot run any of
+    /// them until the operator has gone and read the image's `/etc/passwd`
+    /// themselves.
+    pub fn parse_with_passwd(s: &str, passwd: &str, group: &str) -> Result<Self, String> {
         let (u, g) = match s.split_once(':') {
             Some((u, g)) => (u, Some(g)),
             None => (s, None),
         };
-        let uid: u32 = u.parse().map_err(|_| {
-            format!(
-                "{u:?} is not a numeric uid. Names are not resolved yet: that \
-                                  needs the container's own /etc/passwd, and the host's would \
-                                  be a different user."
-            )
-        })?;
-        let gid: u32 = match g {
-            Some(g) => g
-                .parse()
-                .map_err(|_| format!("{g:?} is not a numeric gid"))?,
-            None => uid,
+
+        // A numeric id is taken as given and never looked up. That is what
+        // every runtime does, and it is what keeps `--user 1000:1000`
+        // working in an image with no `/etc/passwd` at all.
+        let (uid, entry_gid) = match u.parse::<u32>() {
+            Ok(n) => (n, passwd_gid_of_uid(passwd, n)),
+            Err(_) => {
+                let (uid, gid) = passwd_lookup(passwd, u).ok_or_else(|| {
+                    if passwd.is_empty() {
+                        format!(
+                            "{u:?} is not a numeric uid, and this container has no \
+                             /etc/passwd to resolve it against. Give a numeric uid."
+                        )
+                    } else {
+                        format!(
+                            "{u:?} is not a numeric uid and the container's /etc/passwd \
+                             has no such user. Give a numeric uid, or a name the image \
+                             actually defines."
+                        )
+                    }
+                })?;
+                (uid, Some(gid))
+            }
         };
+
+        let gid = match g {
+            Some(g) => match g.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => group_lookup(group, g).ok_or_else(|| {
+                    format!(
+                        "{g:?} is not a numeric gid and the container's /etc/group has \
+                         no such group"
+                    )
+                })?,
+            },
+            // The passwd entry's primary group when there is one, which is
+            // what the image meant by naming a user at all. Without an
+            // entry, gid follows uid - this engine's documented choice, and
+            // what every stage before this one asserted.
+            None => entry_gid.unwrap_or(uid),
+        };
+
         Ok(Self {
             uid,
             gid,
@@ -823,6 +905,91 @@ mod tests {
 
     /// The stage 11 trap: our own map says every id is reachable, because
     /// we are in the initial namespace. The container's will not.
+    #[test]
+    fn a_user_name_resolves_against_the_images_own_passwd() {
+        // nginx:1.27-alpine, abridged. The point of the test is the 101:
+        // the host's /etc/passwd has no `nginx` at all on most machines,
+        // and where it does it is a different number.
+        let passwd =
+            "root:x:0:0:root:/root:/bin/sh\nnginx:x:101:101:nginx:/var/lib/nginx:/sbin/nologin\n";
+        let group = "root:x:0:root\nnginx:x:101:\ntape:x:100:\n";
+        assert_eq!(
+            UserSpec::parse_with_passwd("nginx", passwd, group).unwrap(),
+            UserSpec {
+                uid: 101,
+                gid: 101,
+                groups: vec![]
+            }
+        );
+        // A name on each side, independently.
+        assert_eq!(
+            UserSpec::parse_with_passwd("nginx:tape", passwd, group)
+                .unwrap()
+                .gid,
+            100
+        );
+        assert_eq!(
+            UserSpec::parse_with_passwd("101:tape", passwd, group).unwrap(),
+            UserSpec {
+                uid: 101,
+                gid: 100,
+                groups: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn a_numeric_id_is_never_looked_up() {
+        // It must keep working in an image with no /etc/passwd at all,
+        // which is most of what `scratch`-based images are.
+        assert_eq!(
+            UserSpec::parse_with_passwd("1000:1000", "", "").unwrap(),
+            UserSpec {
+                uid: 1000,
+                gid: 1000,
+                groups: vec![]
+            }
+        );
+        // A bare numeric uid with no passwd entry keeps gid = uid, which is
+        // what every stage before this one asserted.
+        assert_eq!(
+            UserSpec::parse_with_passwd("1000", "", "").unwrap().gid,
+            1000
+        );
+        // But a bare uid the file DOES describe takes that entry's group,
+        // because that is what the image meant.
+        let passwd = "nginx:x:101:55:nginx:/:/sbin/nologin\n";
+        assert_eq!(
+            UserSpec::parse_with_passwd("101", passwd, "").unwrap().gid,
+            55
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_says_which_file_it_looked_in() {
+        let e = UserSpec::parse_with_passwd("ghost", "root:x:0:0::/:/bin/sh\n", "").unwrap_err();
+        assert!(e.contains("/etc/passwd"), "{e}");
+        // And the empty case is distinguished, because "this image has no
+        // /etc/passwd" and "this image has one without you in it" send the
+        // reader to different places.
+        let e = UserSpec::parse_with_passwd("ghost", "", "").unwrap_err();
+        assert!(e.contains("no"), "{e}");
+    }
+
+    #[test]
+    fn a_malformed_passwd_line_is_skipped_not_trusted() {
+        // Short lines, comments and blank lines are all real, and none of
+        // them may panic or produce a wrong id.
+        let passwd = "\n# comment\nbroken:x\nnginx:x:101:101::/:/bin/sh\n";
+        assert_eq!(
+            UserSpec::parse_with_passwd("nginx", passwd, "")
+                .unwrap()
+                .uid,
+            101
+        );
+        assert!(UserSpec::parse_with_passwd("broken", passwd, "").is_err());
+    }
+
     #[test]
     fn a_new_single_id_namespace_maps_only_root() {
         let root = UserSpec {
