@@ -56,7 +56,8 @@ DIR=/tmp/rustainer-test
 ssh -o BatchMode=yes "$HOST" "rm -rf $DIR && mkdir -p $DIR/scripts"
 scp -q "$OUT/rustainer" "$OUT/unit-tests" "$HOST:$DIR/"
 scp -q scripts/stage*-success-test.sh scripts/remote-stage-runner.sh \
-    scripts/registry-fallback.sh scripts/fake-registry.py "$HOST:$DIR/scripts/"
+    scripts/registry-fallback.sh scripts/fake-registry.py \
+    scripts/bench.sh "$HOST:$DIR/scripts/"
 
 # A delegated cgroup scope when the host has a user systemd, so the resource
 # stages exercise real limits instead of only the refusal path. Without it

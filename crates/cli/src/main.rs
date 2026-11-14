@@ -1294,7 +1294,10 @@ fn stack_up(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
             command,
             ..Default::default()
         };
-        cmd_run(paths, args).with_context(|| format!("starting {id}"))?;
+        // The exit code is the CLI's, and for a detached run it is always
+        // success - the interesting failure comes back as an Err and is
+        // propagated. Discarded explicitly so it is clear that is why.
+        let _ = cmd_run(paths, args).with_context(|| format!("starting {id}"))?;
         started += 1;
     }
     println!(
