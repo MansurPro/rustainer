@@ -58,6 +58,7 @@ is easier to reason about once the process model is not also in question.
 | 13 | Docker image compatibility, measured against real registries | **Done** |
 | 14 | Measured against Docker, and what measuring found | **Done** |
 | 15 | A layer's deletions are honoured | **Done** |
+| 16 | Volumes and bind mounts | **Done** |
 
 The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete, and
 stage 12 begins the additive work §19 held back until the mechanisms were
@@ -452,6 +453,46 @@ image's layers contain without reimplementing the thing under test. It
 then reads the store back: the marker must be a character device, the
 number must be exactly 0:0, the lower layer must be untouched, and no
 `.wh.` entry may be visible inside the container.
+
+### Volumes and bind mounts
+
+```sh
+rustainer run -v /host/path:/in/container        alpine ...
+rustainer run -v /host/path:/in/container:ro     alpine ...
+rustainer run -v name:/in/container              alpine ...
+rustainer volume ls
+rustainer volume rm name
+```
+
+Docker's syntax, including Docker's rule for telling a host path from a
+volume name: a first field beginning with `/` or `.` is a path, anything
+else is a name. It looks arbitrary and it is the only rule that can work,
+because `data` is a perfectly good directory name and a perfectly good
+volume name and the engine has to choose without asking.
+
+A volume is a deliberate hole in the container's filesystem isolation —
+that is what it is for — so the two things that make it safe are explicit:
+
+- **The source is resolved by the parent, before the pivot.** The container
+  never influences it, so no symlink inside the image can redirect the
+  mount. Resolving a mount source through the container's own tree is the
+  vector CVE-2025-31133 used.
+- **The target, and every directory above it, is created by the child,
+  above the overlay.** Created parent-side they land *underneath* the
+  overlay, which then hides them, and the mount fails with `ENOENT`
+  pointing at a path that plainly exists. `-v v:/var/lib/app/data` works on
+  an image with no `/var/lib/app` because the child walks the components
+  one at a time, each tolerating `EEXIST`.
+
+The bind is **recursive**, as `docker run -v` is: a filesystem mounted
+under the source is visible inside the container rather than appearing as
+an empty directory. That is also why `:ro` is `mount_setattr(AT_RECURSIVE)`
+— a plain read-only remount would leave every one of those submounts
+writable, which is the trap `/sys` hit back at stage 2.
+
+Named volumes live beside the image store, because both must outlive a
+reboot and the runtime state directory is usually a tmpfs. Removing a
+container never removes them.
 
 ### The engine does not lie about what it does not know
 

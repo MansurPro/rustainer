@@ -74,6 +74,9 @@ enum Command {
     Images,
     /// Remove an image from the local store.
     Rmi(RmiArgs),
+    /// List or remove named volumes.
+    #[command(subcommand)]
+    Volume(VolumeCmd),
     /// Internal: become the supervisor for an already-prepared container.
     #[command(hide = true)]
     Supervise { id: String },
@@ -116,6 +119,12 @@ struct RunArgs {
     /// `WorkingDir`.
     #[arg(short = 'w', long)]
     workdir: Option<String>,
+
+    /// Make a host directory or a named volume visible in the container:
+    /// `-v /host/path:/in/container[:ro]` or `-v name:/in/container[:ro]`.
+    /// Repeatable.
+    #[arg(short = 'v', long = "volume")]
+    volumes: Vec<String>,
 
     /// Memory limit, e.g. 512m, 2g. Enforced by cgroup v2 memory.max.
     #[arg(short = 'm', long)]
@@ -211,6 +220,14 @@ struct LogsArgs {
     id: String,
 }
 
+#[derive(Subcommand)]
+enum VolumeCmd {
+    /// List named volumes.
+    Ls,
+    /// Remove a named volume and everything in it.
+    Rm { name: String },
+}
+
 #[derive(Args)]
 struct ExecArgs {
     /// Working directory inside the container. Defaults to the container's.
@@ -269,6 +286,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Pull(a) => cmd_pull(a),
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
+        Command::Volume(a) => cmd_volume(a),
         Command::Supervise { id } => cmd_supervise(&paths, &id),
     }
 }
@@ -508,6 +526,12 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .with_context(|| format!("container {id} already exists"))?;
 
     let (seccomp_profile, seccomp_unconfined) = resolve_seccomp(&args.security_opt)?;
+    let volumes = args
+        .volumes
+        .iter()
+        .map(|v| parse_volume(v))
+        .collect::<Result<Vec<_>>>()?;
+
     let config = Config {
         id: id.clone(),
         exe: exe.to_string_lossy().into_owned(),
@@ -550,6 +574,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         private_net,
         bridge,
         userns,
+        volumes,
         ip: lease.map(|l| l.ip.to_string()),
         ports: {
             if !args.publish.is_empty() && !bridge {
@@ -930,6 +955,154 @@ fn warn_about_whiteouts(report: &rustainer_image::extract::Report) {
     if let Some(why) = &report.whiteout_failure {
         eprintln!("rustainer: the first such failure was: {why}");
     }
+}
+
+/// Where named volumes live: beside the image store, because both must
+/// outlive a reboot and the runtime state directory is usually a tmpfs.
+fn volumes_root() -> PathBuf {
+    Store::default_root().join("volumes")
+}
+
+/// `src:dst[:ro]` — Docker's own syntax, with Docker's own rule for
+/// telling a host path from a volume name.
+///
+/// The rule is positional, not semantic: a first field beginning with `/`
+/// or `.` is a path, anything else is a name. It looks arbitrary and it is
+/// the only rule that can work, because `data` is a perfectly good
+/// directory name and a perfectly good volume name, and the engine has to
+/// pick one without asking.
+fn parse_volume(spec: &str) -> Result<rustainer_core::mount::VolumeMount> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (src, dst, opts) = match parts.as_slice() {
+        [s, d] => (*s, *d, ""),
+        [s, d, o] => (*s, *d, *o),
+        _ => bail!(
+            "-v {spec:?} is not `src:dst` or `src:dst:ro`. A single path means \
+             an anonymous volume, which is not implemented: name it, or give a \
+             host path."
+        ),
+    };
+    if src.is_empty() || dst.is_empty() {
+        bail!("-v {spec:?} has an empty source or destination");
+    }
+    let read_only = match opts {
+        "" | "rw" => false,
+        "ro" => true,
+        other => bail!(
+            "-v {spec:?}: {other:?} is not a mount option. Only `ro` and `rw` are \
+             supported; label and propagation options are not implemented."
+        ),
+    };
+    if !dst.starts_with('/') {
+        bail!("-v {spec:?}: the destination must be an absolute path inside the container");
+    }
+    if dst.trim_end_matches('/').is_empty() {
+        bail!(
+            "-v {spec:?}: mounting over `/` would replace the container's whole \
+             root filesystem, including the one the image provides"
+        );
+    }
+    if dst.split('/').any(|c| c == "..") {
+        bail!("-v {spec:?}: the destination may not contain `..`");
+    }
+
+    let source = if src.starts_with('/') || src.starts_with('.') || src.starts_with('~') {
+        let p = PathBuf::from(shellexpand_home(src));
+        // Docker creates a missing host directory rather than refusing,
+        // and scripts depend on it. A missing FILE is still an error: it
+        // is far more likely to be a typo than an intention.
+        if !p.exists() {
+            std::fs::create_dir_all(&p)
+                .with_context(|| format!("creating the host directory {}", p.display()))?;
+        }
+        p.canonicalize()
+            .with_context(|| format!("resolving the host path {}", p.display()))?
+    } else {
+        if !src
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+            || !src
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+        {
+            bail!(
+                "-v {spec:?}: {src:?} is neither an absolute host path nor a usable \
+                 volume name. A name must start with a letter or digit and contain \
+                 only letters, digits, `_`, `.` and `-`."
+            );
+        }
+        let p = volumes_root().join(src);
+        std::fs::create_dir_all(&p).with_context(|| format!("creating the volume {src:?}"))?;
+        p
+    };
+
+    // Stat'd here because the child cannot: a bind over a file needs a
+    // file as its mount point, and mkdir'ing one produces EISDIR from the
+    // mount with nothing to say which `-v` caused it.
+    let is_file = source.is_file();
+
+    Ok(rustainer_core::mount::VolumeMount {
+        source,
+        target: dst.trim_end_matches('/').to_owned(),
+        read_only,
+        is_file,
+    })
+}
+
+/// `~` and `~/...` only. Not a shell: `~user` is deliberately not resolved,
+/// because guessing another user's home directory for a mount is worse
+/// than refusing.
+fn shellexpand_home(s: &str) -> String {
+    match s.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => match std::env::var_os("HOME") {
+            Some(h) => format!("{}{rest}", h.to_string_lossy()),
+            None => s.to_owned(),
+        },
+        _ => s.to_owned(),
+    }
+}
+
+fn cmd_volume(cmd: VolumeCmd) -> Result<ExitCode> {
+    let root = volumes_root();
+    match cmd {
+        VolumeCmd::Ls => {
+            println!("{:<32} {:>10}  PATH", "VOLUME", "ENTRIES");
+            let Ok(rd) = std::fs::read_dir(&root) else {
+                return Ok(ExitCode::SUCCESS);
+            };
+            let mut rows: Vec<(String, usize, String)> = Vec::new();
+            for e in rd.flatten() {
+                if !e.path().is_dir() {
+                    continue;
+                }
+                let n = std::fs::read_dir(e.path()).map(|d| d.count()).unwrap_or(0);
+                rows.push((
+                    e.file_name().to_string_lossy().into_owned(),
+                    n,
+                    e.path().display().to_string(),
+                ));
+            }
+            rows.sort();
+            for (name, n, path) in rows {
+                println!("{name:<32} {n:>10}  {path}");
+            }
+        }
+        VolumeCmd::Rm { name } => {
+            // Resolved through the volumes root rather than joined blindly:
+            // `volume rm ../../etc` must not delete anything.
+            if name.contains('/') || name.contains("..") || name.is_empty() {
+                bail!("{name:?} is not a volume name");
+            }
+            let p = root.join(&name);
+            if !p.is_dir() {
+                bail!("no such volume: {name}");
+            }
+            std::fs::remove_dir_all(&p).with_context(|| format!("removing the volume {name}"))?;
+            println!("{name}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_images() -> Result<ExitCode> {

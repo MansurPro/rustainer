@@ -113,6 +113,9 @@ pub struct Config {
     /// Ports published to the host.
     #[serde(default)]
     pub ports: Vec<Publish>,
+    /// Host paths made visible inside the container, in the order given.
+    #[serde(default)]
+    pub volumes: Vec<mount::VolumeMount>,
     /// Run in a user namespace of our own, mapping our effective ids to
     /// root inside it (stage 11).
     ///
@@ -324,6 +327,7 @@ impl Config {
             cgroup_dir,
             overlay.as_ref(),
             &binds,
+            &self.volumes,
         )?))
     }
 }
@@ -1025,6 +1029,7 @@ mod tests {
             argv: vec!["sh".into()],
             envp: vec!["PATH=/bin".into()],
             hostname: "box".into(),
+            volumes: Vec::new(),
             rootfs: None,
             memory: None,
             cpus: None,

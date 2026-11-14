@@ -650,7 +650,7 @@ mod tests {
     fn a_mount_plan_without_a_mount_namespace_is_refused() {
         let dir = std::env::temp_dir().join("rustainer-guard-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let plan = mount::plan(&dir, Privileges::probe(), None, None, &[]).unwrap();
+        let plan = mount::plan(&dir, Privileges::probe(), None, None, &[], &[]).unwrap();
 
         let mut spec = Spec::new("/bin/true", vec![]);
         spec.namespaces = Namespaces::STAGE1; // mount: false
