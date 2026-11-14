@@ -467,9 +467,25 @@ pub fn plan(
         }
     }
 
-    let mkdir = |rel: &str| -> Result<(), PlanError> {
-        let d = join(&rootfs, rel);
-        std::fs::create_dir_all(&d).map_err(|e| PlanError::Mkdir(d.into_os_string(), e))
+    // A mount point the image may not contain, created BY THE CHILD, after
+    // the overlay is mounted.
+    //
+    // It is the same trap /dev/pts and /dev/shm have below, one level up:
+    // creating these parent-side writes them into the directory the overlay
+    // is about to be mounted *on*, and the overlay then hides them. For an
+    // image whose layers happen to contain /proc - alpine, debian, nearly
+    // everything with a package manager - it works anyway and the bug is
+    // invisible. For an image built from scratch it is a container that
+    // cannot start: on Docker Hub today, `busybox` and `hello-world` both
+    // ship no /proc, and the failure reads "mounting /proc failed with
+    // ENOENT", which sends you looking at /proc rather than at the image.
+    //
+    // `sys::mkdir` tolerates EEXIST, so the common case costs one syscall.
+    let mountpoint = |rel: &str| -> Result<Op, PlanError> {
+        Ok(Op::Mkdir {
+            target: cstr(&join(&rootfs, rel))?,
+            mode: 0o755,
+        })
     };
 
     // --- 20. /proc, mounted by the child, after the PID namespace. ------
@@ -477,7 +493,7 @@ pub fn plan(
     // If the supervisor mounted this instead, the container would see host
     // PIDs: procfs binds its pid namespace at mount time, from the mounting
     // process (RND.md §4.3).
-    mkdir("proc")?;
+    push(mountpoint("proc")?, false, "creating a mount point");
     push(
         Op::Mount {
             source: CString::new("proc").unwrap(),
@@ -494,7 +510,7 @@ pub fn plan(
     //
     // Not tidiness: it is what stops the image shipping a prepared /dev, and
     // it is the surface masked paths are applied to (RND.md §4.10).
-    mkdir("dev")?;
+    push(mountpoint("dev")?, false, "creating a mount point");
     push(
         Op::Mount {
             source: CString::new("tmpfs").unwrap(),
@@ -617,7 +633,7 @@ pub fn plan(
     // NETWORK namespace. Sharing the host's netns from inside a user
     // namespace therefore cannot mount it at all, and the only option is a
     // read-only bind of the host's.
-    mkdir("sys")?;
+    push(mountpoint("sys")?, false, "creating a mount point");
     let sys_target = cstr(&join(&rootfs, "sys"))?;
     if privs.initial_user_ns {
         push(

@@ -78,6 +78,14 @@ jobs:
       # This asserts namespace identity by inode, not by behaviour.
       - name: Stage 12 success test
         run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage12-success-test.sh
+      # The only test here that checks a CLAIM rather than a mechanism:
+      # that images built for Docker, by other people, run unchanged. It
+      # needs real registries, so it falls back to Hub's pull-through
+      # mirror when a shared runner address has spent Hub's anonymous quota
+      # - and says when it did, rather than reporting a quota as an
+      # incompatibility.
+      - name: Stage 13 success test (image compatibility)
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage13-success-test.sh
       # In a delegated scope, so the resource stage exercises real limits
       # rather than only the refusal path, and so it never touches the
       # runner's own cgroup.

@@ -55,6 +55,7 @@ is easier to reason about once the process model is not also in question.
 | 10 | Published ports | **Done** |
 | 11 | Single-ID rootless | **Done** |
 | 12 | `exec` — a second process in a live container | **Done** |
+| 13 | Docker image compatibility, measured against real registries | **Done** |
 
 The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete, and
 stage 12 begins the additive work §19 held back until the mechanisms were
@@ -302,6 +303,51 @@ everything the container has written since it started.
 The stage 12 test asserts namespace *identity*, by inode, not behaviour — a
 freshly created namespace of the same kind passes every behavioural check
 and fails that one.
+
+### Images built for Docker run here unchanged
+
+This is a claim, not a mechanism, so it is tested the only way a claim can
+be: against real images from real registries — Docker Hub, GitHub, Quay and
+Google — pulled and run, with the assertion being that each image's own
+entrypoint produces its own output.
+
+Running that test for the first time found four defects, and every one of
+them looked like something else:
+
+- **`./` as a tar entry was rejected as "an empty path".** It is what
+  `tar -C dir .` writes, so it is the first member of a great many layers:
+  `debian`, `python`, `busybox` and Google's distroless images all have one.
+  A third of the base images in common use could not be pulled at all.
+- **An image whose layers contain no `/proc` could not start**, reporting
+  `mounting /proc failed with ENOENT`. The mount point was created
+  parent-side, in the directory the overlay is then mounted *on top of*,
+  which hides it. For any image with a package manager the layers contain
+  `/proc` already and the bug is invisible; `busybox` and `hello-world` ship
+  without one. The mount points are now created by the child, above the
+  overlay — the same trap `/dev/pts` and `/dev/shm` had already been fixed
+  for, one level up.
+- **A command was searched for in the topmost layer only, and in a hardcoded
+  PATH.** `golang:1.24-alpine` is four layers with `/bin/pwd` in the Alpine
+  base at the bottom, and puts its own toolchain in `/usr/local/go/bin` —
+  which it declares in its config and which appears on no default list. The
+  Go image could run neither `pwd` nor `go`. The search is now every layer,
+  topmost first, across the image's own `PATH`.
+- **`USER nginx` was refused**, because names were not resolved. That rules
+  out every image that sets `USER` by name — `prometheus`, `grafana`,
+  `nginx-unprivileged`, `elasticsearch`. Names now resolve against the
+  **container's own** `/etc/passwd`, never the host's: `nobody` is 65534 on
+  Debian and 99 on Fedora, and resolving against the host would silently run
+  the container as a different person than the image asked for. A numeric id
+  is still taken as given and never looked up, so `--user 1000:1000` keeps
+  working in an image with no `/etc/passwd` at all.
+
+The test itself has one honest accommodation. Docker Hub allows 100
+anonymous pulls per six hours per address, and a shared CI address has
+usually spent that quota on someone else's behalf. A rate limit is not an
+incompatibility, so the test falls back to `mirror.gcr.io` — a pull-through
+cache of Hub serving the same manifests, blobs and digests — and **says in
+its output how many images came from the mirror**. That also tests the
+pull-through mirror most corporate networks put in front of Hub.
 
 ### The engine does not lie about what it does not know
 

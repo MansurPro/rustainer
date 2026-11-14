@@ -305,8 +305,13 @@ impl Store {
             env: c.env.unwrap_or_default(),
             entrypoint: c.entrypoint.unwrap_or_default(),
             cmd: c.cmd.unwrap_or_default(),
-            working_dir: c.working_dir,
-            user: c.user,
+            // An absent field and a present-but-empty one mean the same
+            // thing — "not set" — and a surprising number of real images
+            // write the empty string. `quay.io/podman/hello` is one, and
+            // taking it literally produces `--user: "" is not a numeric
+            // uid`, which blames the user for a field they never typed.
+            working_dir: c.working_dir.filter(|s| !s.is_empty()),
+            user: c.user.filter(|s| !s.is_empty()),
             report,
         })
     }
