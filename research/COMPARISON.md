@@ -165,26 +165,50 @@ A benchmark that omits this is an advertisement. None of the following is
 implemented here, and several are deliberate permanent omissions rather than
 work not yet done — `research/pass-2/RND.md` §19 says which are which.
 
-- **Image build** — no `Dockerfile`, no BuildKit, no layer caching for builds.
-- **Registry push.**
-- **User-defined networks** — one bridge, no network creation, and no embedded DNS. A *stack* writes its members into each container's `/etc/hosts`, which resolves names within a stack and nothing else; two containers started separately cannot find each other by name.
-- **`events`, restart policies, healthchecks, log drivers.**
+- **BuildKit** — `build` exists (stage 21), but it is a sequential interpreter
+  for a Dockerfile, not a DAG solver: no parallel stages, no cache mounts, no
+  `--mount=type=secret`, no remote cache import/export. Layer reuse across
+  builds is not implemented either; every build runs every step.
+- **A real in-namespace resolver.** User-defined networks exist (stage 23) and
+  containers on one find each other by name, but the mechanism is `/etc/hosts`,
+  rewritten as containers come and go. Docker runs a resolver at 127.0.0.11
+  inside each container's network namespace; that needs a process living in
+  that namespace, and this engine has no daemon to be one. The consequence is
+  visible: a name is resolvable only to containers that were running when the
+  file was last written, and nothing resolves a *service* to several addresses.
+- **Healthchecks and log drivers.** Logs are files; there is no `json-file`
+  rotation, no syslog, no fluentd, and nothing restarts a container because an
+  application-level probe failed.
+- **IPv6, overlay networks, `macvlan`, and port publishing on anything but a
+  userspace forwarder.** Docker programs DNAT; this publishes a port with a
+  process that copies bytes, which costs a hop and cannot preserve the client
+  address.
 - **Swarm, plugins, checkpoint/restore, Windows containers, cgroup v1 hosts.**
-- **Interactive terminals** — `exec` has no `-it` and the page's exec box is one shot, because a pty needs a second protocol.
-- **Multi-extent rootless** — `/etc/subuid` ranges and the setuid helpers are explicitly not implemented; rootless here maps exactly one id.
+- **`commit`, `save`/`load`, `cp`, `diff`, `top`, `stats`.**
+- **Multi-extent rootless** — `/etc/subuid` ranges and the setuid helpers are
+  explicitly not implemented; rootless here maps exactly one id, so an image
+  that wants two different non-root uids cannot run unprivileged.
+- **A stable API.** `rustainer serve` speaks its own small JSON, not Docker's
+  Engine API, so nothing built against `/v1.4x/containers/json` works.
 
 And what has arrived since this was first written, which changes the shape of
 the comparison rather than the numbers:
 
 - **Volumes and bind mounts** (`-v`, `volume ls/rm`), recursive and with
   recursive `:ro`.
-- **A local HTTP API and a page** (`rustainer serve`). It is not a daemon:
+- **A local HTTP API and a page** (`rustainer serve`), now with a terminal,
+  an event stream, a network view and a build dialog. It is not a daemon:
   containers outlive it, it owns nothing, and it cannot start a container
   itself — it executes the CLI, because a container is created by a process
   that has never had a second thread. The "0 MiB resident" row above is still
   true of the engine; the server is opt-in and runs only while you are
   looking at it.
 - **Stacks** (`stack up/down/ps`), Compose-shaped and TOML-based.
+- **Interactive terminals** — `run -it`, `exec -it`, and a pty in the page.
+- **Restart policies and an event log** (`--restart`, `events --follow`).
+- **`build` and `push`**, so an image can be made here and consumed by Docker.
+- **User-defined networks** (`network create/ls/rm`) with isolation enforced
+  by address, not merely by name.
 
 The timings above are a fair measure of **starting and supervising a
 container**. They are not a claim that one tool replaces the other, and this
