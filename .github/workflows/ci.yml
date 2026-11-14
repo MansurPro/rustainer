@@ -125,6 +125,12 @@ jobs:
       # moment its child dies.
       - name: Stage 20 success test (restart policies and events)
         run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage20-success-test.sh
+      # A build step is a container run on the layers so far, and its
+      # overlay upper directory IS the new layer - including the
+      # deletions, which overlayfs already records in the format the
+      # layer store uses.
+      - name: Stage 21 success test (building from a Dockerfile)
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage21-success-test.sh
       # In a delegated scope, so the resource stage exercises real limits
       # rather than only the refusal path, and so it never touches the
       # runner's own cgroup.
@@ -164,7 +170,7 @@ jobs:
             echo "::error::unprivileged user namespaces are unavailable on this runner"
             exit 1
           }
-          for s in 1 2 3 4 5 6 7 8 9 10 12 13 14 15 16 17 18 19 20; do
+          for s in 1 2 3 4 5 6 7 8 9 10 12 13 14 15 16 17 18 19 20 21; do
             systemd-run --user --scope -p Delegate=yes -q \
               unshare --user --map-root-user \
               env RUSTAINER_BIN="$PWD/target/release/rustainer" \

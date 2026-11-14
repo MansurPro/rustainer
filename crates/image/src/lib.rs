@@ -277,6 +277,77 @@ impl Store {
             .ok()
     }
 
+    /// Take ownership of layers built locally, and tag them as an image.
+    ///
+    /// The counterpart of `pull` for an image nobody fetched. Each layer
+    /// directory is MOVED into the store under its `diff_id`, which is
+    /// what makes a build's layers shareable with a pulled image's: both
+    /// are keyed by the hash of their uncompressed tar, so a `FROM
+    /// alpine` build adds only the layers it actually created.
+    ///
+    /// A rename, not a copy: the directories are already on the same
+    /// filesystem (the caller made them in the store's own tree), the
+    /// trees are large, and a copy would double the disk for no gain.
+    /// If one is already there, it is the same content by definition and
+    /// the new copy is simply dropped.
+    ///
+    /// The blobs are written too, so the image can later be pushed
+    /// without rebuilding it.
+    pub fn adopt(
+        &self,
+        layers: &[(String, PathBuf, Vec<u8>)],
+        config_bytes: &[u8],
+        reference: &str,
+    ) -> Result<String, Error> {
+        self.prepare()?;
+        let userxattr = Self::userxattr();
+        for (diff_id, dir, tar_bytes) in layers {
+            let dest = self.layer_dir(diff_id, userxattr);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(io("creating the layer store", parent))?;
+            }
+            if dest.exists() {
+                // Identical content under an identical name. Dropping the
+                // duplicate is the whole benefit of content addressing.
+                let _ = std::fs::remove_dir_all(dir);
+            } else {
+                std::fs::rename(dir, &dest).map_err(io("committing a built layer", &dest))?;
+            }
+            // Gzipped, because that is what a registry accepts and the
+            // digest in the manifest is of the compressed bytes.
+            let gz = {
+                use std::io::Write;
+                let mut e =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                e.write_all(tar_bytes)
+                    .map_err(io("compressing a layer", &dest))?;
+                e.finish().map_err(io("compressing a layer", &dest))?
+            };
+            // `sha256_hex` already returns a prefixed digest, and the
+            // blob store is keyed by the hex alone.
+            let d = registry::sha256_hex(&gz);
+            let blob = self
+                .root
+                .join("blobs/sha256")
+                .join(d.trim_start_matches("sha256:"));
+            if !blob.exists() {
+                std::fs::write(&blob, &gz).map_err(io("writing a layer blob", &blob))?;
+            }
+        }
+
+        let digest = registry::sha256_hex(config_bytes);
+        let dir = self.image_dir(&digest);
+        std::fs::create_dir_all(&dir).map_err(io("creating the image directory", &dir))?;
+        let config_path = dir.join("config.json");
+        std::fs::write(&config_path, config_bytes)
+            .map_err(io("writing the config", &config_path))?;
+
+        let r = Reference::parse(reference).map_err(Error::Reference)?;
+        let tag = self.tag_path(&r.store_key());
+        std::fs::write(&tag, &digest).map_err(io("recording the tag", &tag))?;
+        Ok(digest)
+    }
+
     /// Pull if needed, then return what the runtime needs.
     pub fn pull(&self, reference: &str, force: bool) -> Result<Materialised, Error> {
         let r = Reference::parse(reference).map_err(Error::Reference)?;

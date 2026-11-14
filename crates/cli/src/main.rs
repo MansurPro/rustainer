@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod build;
+mod dockerfile;
 mod stack;
 
 use anyhow::{Context, Result, bail};
@@ -70,6 +72,8 @@ enum Command {
     Logs(LogsArgs),
     /// Run a command inside a running container.
     Exec(ExecArgs),
+    /// Build an image from a Dockerfile.
+    Build(BuildArgs),
     /// Download an image and extract it into the local store.
     Pull(PullArgs),
     /// List images in the local store.
@@ -291,6 +295,25 @@ struct StackArgs {
 }
 
 #[derive(Args)]
+struct BuildArgs {
+    /// Name for the built image, e.g. `-t myapp:1`.
+    #[arg(short = 't', long = "tag")]
+    tag: String,
+
+    /// The Dockerfile. `<context>/Dockerfile` by default.
+    #[arg(short = 'f', long)]
+    file: Option<PathBuf>,
+
+    /// Set a build argument, `KEY=value`. Repeatable.
+    #[arg(long = "build-arg")]
+    build_args: Vec<String>,
+
+    /// The build context: the directory COPY may read from.
+    #[arg(default_value = ".")]
+    context: PathBuf,
+}
+
+#[derive(Args)]
 struct EventsArgs {
     /// Only events from the last N seconds.
     #[arg(long, default_value_t = 3600)]
@@ -391,6 +414,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Rm(a) => cmd_rm(&paths, a),
         Command::Logs(a) => cmd_logs(&paths, a),
         Command::Exec(a) => cmd_exec(&paths, a),
+        Command::Build(a) => cmd_build(&paths, a),
         Command::Pull(a) => cmd_pull(a),
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
@@ -1847,4 +1871,273 @@ fn new_id() -> Result<String> {
         .context("opening /dev/urandom")?
         .read_exact(&mut b)?;
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+// ---------------------------------------------------------------------------
+// build
+// ---------------------------------------------------------------------------
+
+/// Build an image, running each filesystem step as a real container.
+///
+/// The step's own overlay **upper directory is the new layer**: overlayfs
+/// has already written down exactly what changed, including the
+/// deletions, which it records as the same `0:0` character devices this
+/// engine's layer store uses. Nothing has to diff anything.
+///
+/// Which means the build inherits the engine's isolation, cgroups,
+/// networking and security posture for free, because it is not a second
+/// implementation of any of them.
+fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
+    use crate::dockerfile::Instruction;
+    use std::collections::BTreeMap;
+
+    let context = args.context.canonicalize().with_context(|| {
+        format!(
+            "the build context {} does not exist",
+            args.context.display()
+        )
+    })?;
+    let file = args
+        .file
+        .clone()
+        .unwrap_or_else(|| context.join("Dockerfile"));
+    let text =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    let instructions = crate::dockerfile::parse(&text)?;
+
+    let mut vars: BTreeMap<String, String> = BTreeMap::new();
+    for a in &args.build_args {
+        let (k, v) = a
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--build-arg {a:?} is not KEY=value"))?;
+        vars.insert(k.to_owned(), v.to_owned());
+    }
+
+    let store = Store::new(Store::default_root());
+    let mut built = build::Built {
+        layers: Vec::new(),
+        diff_ids: Vec::new(),
+        env: Vec::new(),
+        workdir: None,
+        user: None,
+        cmd: Vec::new(),
+        entrypoint: Vec::new(),
+        labels: BTreeMap::new(),
+        exposed: Vec::new(),
+    };
+    // Layers are sealed as they are produced, and their tars kept, so the
+    // image can be pushed later without rebuilding it.
+    let mut sealed: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
+    let staging = Store::default_root().join("build").join(new_id()?);
+    std::fs::create_dir_all(&staging)?;
+    let cleanup_staging = || {
+        let _ = std::fs::remove_dir_all(&staging);
+    };
+
+    let total = instructions.len();
+    for (n, ins) in instructions.iter().enumerate() {
+        println!("[{}/{}] {}", n + 1, total, build::describe(ins));
+        match ins {
+            Instruction::Arg(k, default) => {
+                // A --build-arg wins over the file's default, which is the
+                // point of having a default.
+                if !vars.contains_key(k)
+                    && let Some(d) = default
+                {
+                    vars.insert(k.clone(), d.clone());
+                }
+            }
+            Instruction::From { image, .. } => {
+                if !built.layers.is_empty() {
+                    cleanup_staging();
+                    bail!(
+                        "a second FROM starts a new build stage, which is not \
+                         implemented. Multi-stage builds need a graph where this \
+                         has a list; build the stages separately and COPY between \
+                         images instead."
+                    );
+                }
+                let reference = build::expand(image, &vars);
+                let base = match store.local(&reference) {
+                    Some(i) => i,
+                    None => store
+                        .pull(&reference, false)
+                        .with_context(|| format!("pulling the base image {reference}"))?,
+                };
+                built.layers = base.layers.clone();
+                built.diff_ids = Vec::new();
+                built.env = base.env.clone();
+                built.workdir = base.working_dir.clone();
+                built.user = base.user.clone();
+                built.cmd = base.cmd.clone();
+                built.entrypoint = base.entrypoint.clone();
+            }
+            Instruction::Env(k, v) => {
+                let v = build::expand(v, &vars);
+                built
+                    .env
+                    .retain(|e| e.split('=').next() != Some(k.as_str()));
+                built.env.push(format!("{k}={v}"));
+                // ENV also feeds later expansions, as Docker's does.
+                vars.insert(k.clone(), v);
+            }
+            Instruction::Label(k, v) => {
+                built.labels.insert(k.clone(), build::expand(v, &vars));
+            }
+            Instruction::Workdir(w) => built.workdir = Some(build::expand(w, &vars)),
+            Instruction::User(u) => built.user = Some(build::expand(u, &vars)),
+            Instruction::Expose(p) => built.exposed.push(build::expand(p, &vars)),
+            Instruction::Cmd(c) => {
+                built.cmd = c.iter().map(|x| build::expand(x, &vars)).collect();
+            }
+            Instruction::Entrypoint(c) => {
+                built.entrypoint = c.iter().map(|x| build::expand(x, &vars)).collect();
+            }
+            Instruction::Copy {
+                sources,
+                dest,
+                from,
+            } => {
+                if from.is_some() {
+                    cleanup_staging();
+                    bail!("COPY --from needs multi-stage builds, which are not implemented");
+                }
+                let dest = build::expand(dest, &vars);
+                let layer_dir = staging.join(format!("layer{n}"));
+                std::fs::create_dir_all(&layer_dir)?;
+                // A trailing slash means "into this directory", exactly as
+                // `cp` reads it, and several sources always do.
+                let into_dir = dest.ends_with('/') || sources.len() > 1;
+                for src in sources {
+                    let src = build::expand(src, &vars);
+                    let from_path = build::resolve_source(&context, &src)?;
+                    let rel = dest.trim_start_matches('/');
+                    let target = if into_dir {
+                        layer_dir.join(rel).join(
+                            from_path
+                                .file_name()
+                                .ok_or_else(|| anyhow::anyhow!("{src:?} has no name"))?,
+                        )
+                    } else {
+                        layer_dir.join(rel)
+                    };
+                    build::copy_into(&from_path, &target)
+                        .with_context(|| format!("copying {src} into the image"))?;
+                }
+                let (diff_id, tar) = build::seal_layer(&layer_dir)?;
+                built.layers.push(layer_dir.clone());
+                built.diff_ids.push(diff_id.clone());
+                sealed.push((diff_id, layer_dir, tar));
+            }
+            Instruction::Run(argv) => {
+                let step_id = format!("build-{}", new_id()?);
+                let mut command: Vec<OsString> =
+                    vec![built.layers.first().cloned().unwrap_or_default().into()];
+                command.clear();
+                command.push(OsString::from("/"));
+                // The step is an ordinary container over the layers so
+                // far. Run in the foreground so the build waits, and with
+                // the engine's normal isolation - a build step is not
+                // entitled to more than a container is.
+                let run = RunArgs {
+                    name: Some(step_id.clone()),
+                    layer: built.layers.clone(),
+                    network: "bridge".into(),
+                    hostname: "build".into(),
+                    workdir: built.workdir.clone(),
+                    user: built.user.clone(),
+                    env: built.env.clone(),
+                    command: argv
+                        .iter()
+                        .map(|a| OsString::from(build::expand(a, &vars)))
+                        .collect(),
+                    ..Default::default()
+                };
+                let _ = cmd_run(paths, run).with_context(|| format!("running step {}", n + 1))?;
+
+                let st = State::load(paths, &step_id)
+                    .with_context(|| format!("reading the result of step {}", n + 1))?;
+                let code = st.exit_code.unwrap_or(-1);
+                let upper = Store::default_root()
+                    .join("containers")
+                    .join(&step_id)
+                    .join("upper");
+                if code != 0 {
+                    let _ = supervise::remove(paths, &step_id, true);
+                    cleanup_staging();
+                    bail!(
+                        "step {} failed with exit status {code}: {}",
+                        n + 1,
+                        build::describe(ins)
+                    );
+                }
+                // The upper IS the layer. Moved out before the container
+                // is removed, because `rm` takes its overlay directory
+                // with it.
+                let layer_dir = staging.join(format!("layer{n}"));
+                std::fs::rename(&upper, &layer_dir)
+                    .with_context(|| format!("harvesting the layer of step {}", n + 1))?;
+                let _ = supervise::remove(paths, &step_id, true);
+
+                let (diff_id, tar) = build::seal_layer(&layer_dir)?;
+                built.layers.push(layer_dir.clone());
+                built.diff_ids.push(diff_id.clone());
+                sealed.push((diff_id, layer_dir, tar));
+            }
+        }
+    }
+
+    if built.layers.is_empty() {
+        cleanup_staging();
+        bail!("the build produced no layers, so there is no image to tag");
+    }
+
+    // The base image's diff_ids come first: `adopt` only moves the ones
+    // this build created, and the rest are already in the store.
+    let base_count = built.layers.len() - built.diff_ids.len();
+    let mut diff_ids: Vec<String> = Vec::new();
+    for dir in built.layers.iter().take(base_count) {
+        diff_ids.push(
+            dir.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| anyhow::anyhow!("a base layer has no name"))?,
+        );
+    }
+    diff_ids.extend(built.diff_ids.iter().cloned());
+
+    let config = serde_json::json!({
+        "architecture": match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        },
+        "os": "linux",
+        "config": {
+            "Env": built.env,
+            "Cmd": built.cmd,
+            "Entrypoint": built.entrypoint,
+            "WorkingDir": built.workdir,
+            "User": built.user,
+            "Labels": built.labels,
+            "ExposedPorts": built.exposed.iter()
+                .map(|p| (format!("{p}/tcp"), serde_json::json!({})))
+                .collect::<serde_json::Map<_, _>>(),
+        },
+        "rootfs": { "type": "layers", "diff_ids": diff_ids },
+    });
+    let config_bytes = serde_json::to_vec_pretty(&config)?;
+    let digest = store
+        .adopt(&sealed, &config_bytes, &args.tag)
+        .context("storing the built image")?;
+    cleanup_staging();
+
+    rustainer_core::events::record(
+        paths,
+        "build",
+        &args.tag,
+        serde_json::json!({ "digest": digest, "steps": total }),
+    );
+    println!("{digest}");
+    println!("tagged {}", args.tag);
+    Ok(ExitCode::SUCCESS)
 }

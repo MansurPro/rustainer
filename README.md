@@ -63,6 +63,7 @@ is easier to reason about once the process model is not also in question.
 | 18 | Stacks — several containers from one file | **Done** |
 | 19 | Pseudo-terminals — `run -it`, `exec -it` | **Done** |
 | 20 | Restart policies and an event log | **Done** |
+| 21 | `build` — images from a Dockerfile | **Done** |
 
 The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete.
 Stages 12 onwards are the additive work §19 held back until the mechanisms
@@ -132,6 +133,7 @@ rustainer logs <id>
 rustainer exec -e TZ=UTC <id> /bin/sh -c 'ps -o pid,comm'
 rustainer serve                       # a local page at 127.0.0.1:8750
 rustainer stack up -f examples/rustainer.toml
+rustainer build -t myapp:1 .
 rustainer stop -t 5 <id>
 rustainer rm <id>
 ```
@@ -708,6 +710,52 @@ line in one `write`, which Linux does not interleave below `PIPE_BUF` — so
 no lock is needed, and that is why the line length is capped rather than
 the file being locked. The test runs four crash-looping containers at once
 and asserts that not one row was spliced.
+
+### Building from a Dockerfile
+
+```sh
+rustainer build -t myapp:1 .
+rustainer build -t myapp:1 --build-arg VERSION=3.21 -f ./Dockerfile .
+```
+
+**A build step that changes the filesystem is a container run on the
+layers so far, and the container's own overlay upper directory is the new
+layer.** Nothing has to diff anything: OverlayFS already wrote down
+exactly what changed, including the deletions, which it records as the
+same `0:0` character devices the layer store has used since stage 15.
+
+So the build inherits the engine's isolation, cgroups, networking and
+security posture for free, because it is not a second implementation of
+any of them. A `RUN` step is a real container; if it cannot start, the
+build fails with the same message `run` would give.
+
+The layer is identified by the hash of its uncompressed tar, written in
+OCI's whiteout spelling rather than OverlayFS's — a `0:0` device becomes
+`.wh.<name>`, an opaque directory becomes `.wh..wh..opq`. The two mean the
+same thing and no registry has heard of the second one. The archive is
+built in deterministic mode with entries sorted, because an unstable
+`readdir` order would give the same filesystem two identities and defeat
+layer sharing entirely.
+
+**TOML-grade strictness about the file**, for the same reason as stacks:
+
+- An **unknown instruction is refused**, not skipped. An image built from
+  a file containing `HEALTHCHECK` does not do what the file says, and
+  ignoring the line quietly is how that reaches production.
+- **A bracketed line that is not valid JSON is an error.** Docker falls
+  back to the shell form there, which turns a misplaced quote into an
+  instruction that runs something else entirely and still succeeds.
+- **`COPY` cannot leave the build context**, checked on the *canonical*
+  path, because `a/../../etc` is only visibly an escape after resolution.
+- Variable expansion uses `ARG` and `ENV` and **never the caller's
+  environment** — a build that picked up `$HOME` from whoever ran it would
+  produce a different image on every machine, which is the one thing a
+  Dockerfile exists to prevent.
+
+What is deliberately absent: no parallelism, no instruction-keyed build
+cache, and no multi-stage `--from`. BuildKit is those three things and
+they are each a project; a cache that is wrong is worse than no cache, and
+`--from` needs a graph where this has a list.
 
 ### The engine does not lie about what it does not know
 

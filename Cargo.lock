@@ -320,6 +320,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "libc",
  "pentacle",
  "rustainer-api",
@@ -328,6 +329,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "tar",
  "toml",
 ]
 
