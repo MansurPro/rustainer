@@ -126,6 +126,12 @@ pub struct Config {
     pub stack: Option<String>,
     #[serde(default)]
     pub service: Option<String>,
+    /// Give the container a pseudo-terminal rather than pipes.
+    ///
+    /// Not cosmetic: `isatty(1)` decides whether a shell prints a prompt
+    /// at all, and whether `^C` arrives as a signal or as the byte 0x03.
+    #[serde(default)]
+    pub tty: bool,
     /// Extra `/etc/hosts` entries: `(name, address)`.
     ///
     /// How a stack's services find each other. Not DNS - a resolver in
@@ -502,13 +508,38 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     let fifo_opath = sys::open_path_file(&cpath(&fifo_path)?)?;
 
     // --- stdio ----------------------------------------------------------
+    //
+    // Pipes normally; a pty when `--tty` was asked for, in which case
+    // there is only ONE stream. A terminal merges stdout and stderr by
+    // construction - they are the same device - so a tty container's log
+    // is one file, exactly as Docker's is.
+    //
+    // The supervisor allocates it rather than the CLI, because the
+    // supervisor is what outlives the CLI: `run -dt` has to work, and a
+    // master held by a process that has exited is a container whose
+    // output goes nowhere.
+    let (pty_master, mut pty_slave) = if config.tty {
+        let p = crate::pty::open().map_err(Error::Sys)?;
+        (Some(p.master), Some(p.slave))
+    } else {
+        (None, None)
+    };
     let (out_r, out_w) = sys::pipe_with(sys::PipeFlags::CLOEXEC)?;
     let (err_r, err_w) = sys::pipe_with(sys::PipeFlags::CLOEXEC)?;
-    let devnull = sys::open_devnull()?;
-    let stdio = crate::child::Stdio {
-        stdin: devnull,
-        stdout: out_w.try_clone()?,
-        stderr: err_w.try_clone()?,
+    let stdio = match &pty_slave {
+        Some(slave) => crate::child::Stdio {
+            stdin: slave.try_clone()?,
+            stdout: slave.try_clone()?,
+            stderr: slave.try_clone()?,
+        },
+        None => {
+            let devnull = sys::open_devnull()?;
+            crate::child::Stdio {
+                stdin: devnull,
+                stdout: out_w.try_clone()?,
+                stderr: err_w.try_clone()?,
+            }
+        }
     };
 
     // Resource limits, before the child exists. A requested limit that
@@ -527,6 +558,7 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
         crate::Attach {
             security: Some(config.security()?),
             stdio: Some(stdio),
+            tty: config.tty,
             exec_fifo: Some(fifo_opath),
             cgroup_fd: cg.as_ref().map(|c| c.fd()),
             ..Default::default()
@@ -606,7 +638,22 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     // --- the steady state ------------------------------------------------
     let mut out_log = log_file(&paths.stdout_log(id))?;
     let mut err_log = log_file(&paths.stderr_log(id))?;
-    pump(&out_r, &err_r, &spawned.pidfd, &mut out_log, &mut err_log)?;
+    match &pty_master {
+        Some(master) => {
+            // Our own copy of the slave goes first, and deliberately:
+            // while ANY descriptor on the slave is open the master never
+            // reports EOF, so a relay waiting for one would hang forever
+            // after the command exited. The child plan's copies were
+            // already dropped in the parent after the clone, for the same
+            // reason applied to the error pipe.
+            pty_slave.take();
+            crate::pty::relay(master, 0, 1, |bytes| {
+                use std::io::Write;
+                let _ = out_log.write_all(bytes);
+            });
+        }
+        None => pump(&out_r, &err_r, &spawned.pidfd, &mut out_log, &mut err_log)?,
+    }
 
     // Drain and flush the logs BEFORE writing the terminal status. Writing
     // `exited` first and then failing to flush produces a container
@@ -1052,6 +1099,7 @@ mod tests {
             argv: vec!["sh".into()],
             envp: vec!["PATH=/bin".into()],
             hostname: "box".into(),
+            tty: false,
             volumes: Vec::new(),
             peers: Vec::new(),
             stack: None,

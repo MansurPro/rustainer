@@ -40,7 +40,7 @@ use crate::supervise::{Config, Error};
 use crate::{Attach, Exit, Namespaces, Spec, cgroup, security::UserSpec, sys};
 
 /// What to run inside the container, and as whom.
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub struct Request {
     /// `argv[0]` is the program, resolved inside the container.
     pub argv: Vec<String>,
@@ -55,6 +55,16 @@ pub struct Request {
     /// container's own `/etc/passwd`, and the CLI does not know which
     /// container this is for until we do.
     pub user: Option<String>,
+    /// Descriptors for 0, 1 and 2. `None` inherits the caller's, which is
+    /// what a plain `exec` wants; a pty slave goes here for `exec -t`.
+    pub stdio: Option<crate::child::Stdio>,
+    /// `stdio` is a pty slave and the command should take it as its
+    /// controlling terminal.
+    pub tty: bool,
+    /// The other end of that pty. Held here rather than by the caller so
+    /// that the relay and the wait happen in the one place that knows
+    /// when the child has been released.
+    pub master: Option<sys::OwnedFd>,
 }
 
 /// The PATH searched when the container declares none.
@@ -67,7 +77,7 @@ pub struct Request {
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Run `req` inside container `id` and wait for it.
-pub fn exec(paths: &Paths, id: &str, req: &Request) -> Result<Exit, Error> {
+pub fn exec(paths: &Paths, id: &str, req: &mut Request) -> Result<Exit, Error> {
     if req.argv.is_empty() {
         return Err(Error::Io(std::io::Error::other("no command given")));
     }
@@ -162,8 +172,10 @@ pub fn exec(paths: &Paths, id: &str, req: &Request) -> Result<Exit, Error> {
         None,
         Attach {
             security: Some(security),
-            // `None`, so the command inherits the terminal the CLI was given.
-            stdio: None,
+            // `None`, so the command inherits the terminal the CLI was
+            // given, unless the caller asked for a pty of its own.
+            stdio: req.stdio.take(),
+            tty: req.tty,
             exec_fifo: None,
             cgroup_fd: cgroup_fd.as_ref(),
             join: child_fds.into_iter().map(|(_, fd)| fd).collect(),
@@ -176,6 +188,14 @@ pub fn exec(paths: &Paths, id: &str, req: &Request) -> Result<Exit, Error> {
     // happens, because the child waits on it unconditionally.
     spawned.release();
     let failure = spawned.start_failure();
+    // With a pty, the caller's terminal and the container's are two ends
+    // of one device and somebody has to carry bytes between them. The
+    // loop ends when the master reports EOF, which is when the last
+    // descriptor on the slave closes - which is why every copy of the
+    // slave this process held is already gone by now.
+    if let Some(master) = &req.master {
+        crate::pty::relay(master, 0, 1, |_| {});
+    }
     let status = crate::reap_pid(spawned.pid);
     if let Some(e) = failure {
         return Err(e.into());

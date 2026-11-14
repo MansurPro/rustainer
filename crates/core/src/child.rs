@@ -171,6 +171,9 @@ pub struct ChildPlan {
     security: Option<Security>,
     /// Descriptors to put on 0, 1 and 2 immediately before `execve`.
     stdio: Option<Stdio>,
+    /// Those descriptors are a pty slave, and must become this process's
+    /// controlling terminal.
+    tty: bool,
     /// The start rendezvous.
     ///
     /// The `OwnedFd` is an `O_PATH` reference held only to keep its number
@@ -214,6 +217,7 @@ pub struct ChildSpec<'a> {
     pub net_messages: &'a [crate::net::Message],
     pub security: Option<Security>,
     pub stdio: Option<Stdio>,
+    pub tty: bool,
     pub exec_fifo: Option<OwnedFd>,
 }
 
@@ -245,6 +249,7 @@ impl ChildPlan {
             net_messages,
             security,
             stdio,
+            tty,
             exec_fifo,
         } = spec;
         fn cstr(s: &OsStr, what: &'static str) -> Result<CString, PlanError> {
@@ -315,6 +320,7 @@ impl ChildPlan {
             mount_ops,
             rootfs,
             stdio,
+            tty,
             exec_fifo,
             proceed_rx,
             err_tx,
@@ -457,6 +463,19 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
                 fail(plan, Step::Stdio, target as u8, e);
             }
         }
+    }
+
+    // 11a. Take the pty as our controlling terminal.
+    //
+    // Two syscalls, both required, neither obvious. `setsid` leaves the
+    // caller's session - without it a Ctrl-C typed at the outer shell
+    // reaches both - and `TIOCSCTTY` attaches this terminal, without which
+    // the pty has no foreground process group and the kernel never turns
+    // `^C` into SIGINT at all.
+    if plan.tty
+        && let Err(e) = unsafe { crate::pty::make_controlling() }
+    {
+        fail(plan, Step::Stdio, 3, e);
     }
 
     // 7. Enter the image's working directory, while we can still see it.

@@ -31,6 +31,7 @@ pub mod firewall;
 pub mod mount;
 pub mod net;
 pub mod proxy;
+pub mod pty;
 pub mod security;
 pub mod state;
 pub mod supervise;
@@ -346,6 +347,9 @@ pub struct Attach<'a> {
     pub stdio: Option<child::Stdio>,
     /// The `create`/`start` rendezvous. `None` runs straight through.
     pub exec_fifo: Option<sys::OwnedFd>,
+    /// `stdio` is a pty slave, which the child must take as its
+    /// controlling terminal.
+    pub tty: bool,
     /// Directory fd for `CLONE_INTO_CGROUP`.
     pub cgroup_fd: Option<&'a sys::OwnedFd>,
     /// Existing namespaces the **child** joins before anything else, in
@@ -361,6 +365,7 @@ pub fn spawn(spec: &Spec, mounts: Option<MountPlan>, attach: Attach<'_>) -> Resu
     let Attach {
         security,
         stdio,
+        tty,
         exec_fifo,
         cgroup_fd,
         join,
@@ -404,6 +409,7 @@ pub fn spawn(spec: &Spec, mounts: Option<MountPlan>, attach: Attach<'_>) -> Resu
             net_messages: &spec.net_messages,
             security,
             stdio,
+            tty,
             exec_fifo,
         },
         proceed_rx,

@@ -61,6 +61,7 @@ is easier to reason about once the process model is not also in question.
 | 16 | Volumes and bind mounts | **Done** |
 | 17 | A local API, and a page that uses it | **Done** |
 | 18 | Stacks — several containers from one file | **Done** |
+| 19 | Pseudo-terminals — `run -it`, `exec -it` | **Done** |
 
 The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete.
 Stages 12 onwards are the additive work §19 held back until the mechanisms
@@ -628,6 +629,46 @@ same merge rule `exec` does, so `--env PATH=…` replaces the image's entry
 rather than shadowing it — prepending also "works", but only by accident
 of glibc's `getenv`, and `env` inside the container would print the
 variable twice.
+
+### Pseudo-terminals
+
+```sh
+rustainer run  -it alpine:3.21 /bin/sh
+rustainer exec -it <id> /bin/sh
+```
+
+`-t` is not cosmetic. `isatty(1)` decides whether a shell prints a prompt
+at all, whether `ls` colours its output, whether `apt` draws a progress
+bar — and, through the controlling terminal, whether `^C` arrives as
+`SIGINT` or as the byte `0x03`.
+
+Two syscalls in the child do the work, both required and neither obvious:
+`setsid()` leaves the caller's session, without which a Ctrl-C typed at
+the outer shell reaches both; `TIOCSCTTY` attaches the pty, without which
+it has no foreground process group and the kernel never generates the
+signal at all.
+
+**Where the pty is allocated is a trade, and it is written down rather
+than discovered.** `runc` opens `/dev/ptmx` inside the container and
+passes the master back over a unix socket, which is more correct and needs
+the child to build an `SCM_RIGHTS` message in the window where it may not
+allocate. This allocates on the host instead: the descriptors work exactly
+as they should — a descriptor has no namespace — but the slave's
+*pathname* belongs to the host's `devpts`, so `ttyname(0)` inside names a
+different terminal and `ps` shows `?`. Programs that ask *am I a terminal*
+are unaffected; programs that ask *which terminal am I* are.
+
+The **supervisor** allocates it, not the CLI, because `run -dt` has to
+work and a master held by a process that has exited is a container whose
+output goes nowhere. The CLI's job is raw mode on its own terminal, in a
+`Drop` guard — every path out has to restore it, and a shell left in raw
+mode is one the user has to `reset` blind.
+
+Asserting any of this needs a terminal to observe from, since a pipeline
+is exactly what `-t` is distinguishable from. `scripts/pty-drive.py`
+provides one, and the test checks what a pipeline cannot show: `stty size`
+inside reports the window outside, and `^C` fires the container's own
+`INT` trap.
 
 ### The engine does not lie about what it does not know
 

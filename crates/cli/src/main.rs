@@ -137,6 +137,17 @@ struct RunArgs {
     #[arg(short = 'v', long = "volume")]
     volumes: Vec<String>,
 
+    /// Give the container a pseudo-terminal. Programs ask `isatty(1)` and
+    /// behave differently: a shell prints a prompt, `^C` arrives as a
+    /// signal rather than as the byte 0x03, and `ls` colours its output.
+    #[arg(short = 't', long)]
+    tty: bool,
+
+    /// Keep stdin open and connected. With `-t` this is an interactive
+    /// session; `-it` together is the usual spelling.
+    #[arg(short = 'i', long)]
+    interactive: bool,
+
     /// Set an environment entry, `KEY=VALUE`. Replaces the image's own
     /// entry for that key rather than shadowing it. Repeatable.
     #[arg(short = 'e', long = "env")]
@@ -306,6 +317,14 @@ struct ExecArgs {
     /// Run as `uid[:gid]`. Defaults to the user the container runs as.
     #[arg(short = 'u', long)]
     user: Option<String>,
+
+    /// Give the command a pseudo-terminal.
+    #[arg(short = 't', long)]
+    tty: bool,
+
+    /// Keep stdin open. `-it` together is the usual spelling.
+    #[arg(short = 'i', long)]
+    interactive: bool,
 
     id: String,
 
@@ -663,6 +682,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         private_net,
         bridge,
         userns,
+        tty: args.tty,
         volumes,
         stack: args.stack_name.clone(),
         service: args.service_name.clone(),
@@ -738,7 +758,8 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .context("locking the container directory")?;
 
     let (handshake_rx, handshake_tx) = sys::pipe()?;
-    let mut child = spawn_supervisor(paths, &id, handshake_tx, args.detach)?;
+    let interactive = !args.detach && (args.tty || args.interactive);
+    let mut child = spawn_supervisor(paths, &id, handshake_tx, args.detach, interactive)?;
     let init_pid = read_handshake(paths, &handshake_rx, &mut child, &id)?;
 
     // Release before doing anything slow: `stop` and `rm` on this container
@@ -753,6 +774,19 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Raw mode here, in the CLI, because the CLI owns the terminal: no
+    // line buffering so a keystroke arrives at once, no echo so the
+    // container's is the only one, and no signal generation so `^C`
+    // reaches the container as a byte and becomes SIGINT *there*.
+    //
+    // The guard restores it on every path out, including a panic, which
+    // is the whole reason it is a guard: a shell left in raw mode is a
+    // shell the user has to `reset` blind.
+    let _raw = if interactive && args.tty {
+        rustainer_core::pty::RawMode::enter(0)
+    } else {
+        None
+    };
     let status = wait_foreground(paths, &id, &mut child, init_pid)?;
     Ok(ExitCode::from(status.min(255) as u8))
 }
@@ -767,6 +801,7 @@ fn spawn_supervisor(
     id: &str,
     handshake_tx: OwnedFd,
     detach: bool,
+    interactive: bool,
 ) -> Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -783,7 +818,15 @@ fn spawn_supervisor(
         .arg("supervise")
         .arg(id);
 
-    cmd.stdin(Stdio::null());
+    // The supervisor relays the pty, so for an interactive run it needs
+    // our terminal - all three descriptors, not just the two it normally
+    // tees onto. Everything else gets /dev/null, because a container is
+    // not entitled to read the operator's keyboard unless asked.
+    cmd.stdin(if interactive {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    });
     if detach {
         // Detached: the container's output goes to the log files only -
         // but the SUPERVISOR's own stderr is kept, in a file of its own.
@@ -1000,15 +1043,42 @@ fn cmd_ps(paths: &Paths, args: PsArgs) -> Result<ExitCode> {
 }
 
 fn cmd_exec(paths: &Paths, args: ExecArgs) -> Result<ExitCode> {
-    let req = exec::Request {
+    let mut req = exec::Request {
         argv: args.command,
         env: args.env,
         workdir: args.workdir,
         // Passed through unparsed: a name is only meaningful against this
         // container's /etc/passwd, which exec can read and we cannot.
         user: args.user,
+        stdio: None,
+        tty: args.tty,
+        master: None,
     };
-    let exit = exec::exec(paths, &args.id, &req).with_context(|| format!("exec in {}", args.id))?;
+
+    // The pty is allocated HERE rather than in `exec`, because the
+    // terminal being attached to is this process's, and the raw-mode
+    // guard below has to outlive the call.
+    let _raw = if args.tty {
+        let pty = rustainer_core::pty::open().context("allocating a pseudo-terminal")?;
+        if let Some((rows, cols)) = rustainer_core::pty::size_of(0) {
+            let _ = rustainer_core::pty::set_size(&pty.master, rows, cols);
+        }
+        req.stdio = Some(rustainer_core::child::Stdio {
+            stdin: pty.slave.try_clone()?,
+            stdout: pty.slave.try_clone()?,
+            stderr: pty.slave.try_clone()?,
+        });
+        req.master = Some(pty.master);
+        // Our own copy of the slave goes now. While any descriptor on it
+        // is open the master never reports EOF, and the relay would wait
+        // for an end that cannot come.
+        drop(pty.slave);
+        rustainer_core::pty::RawMode::enter(0)
+    } else {
+        None
+    };
+    let exit =
+        exec::exec(paths, &args.id, &mut req).with_context(|| format!("exec in {}", args.id))?;
     // The exec'd command's status, not ours: `rustainer exec sh -c 'exit 7'`
     // has to be usable in a shell conditional the same way `docker exec` is.
     Ok(ExitCode::from(exit.to_shell_status().min(255) as u8))
