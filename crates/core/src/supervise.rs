@@ -1203,7 +1203,7 @@ fn plumb(pid: i32, n: &net::Network) -> Result<(), Error> {
             "rustainer: this host has a FORWARD policy of DROP that something else set. \
              Accept rules for {} have been added to our own chain; if another ruleset \
              drops the packet first, containers will have no egress.",
-            &n.bridge
+            n.bridge
         );
     }
     fw.ensure_forward(&n.bridge)?;

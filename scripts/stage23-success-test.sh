@@ -159,11 +159,13 @@ check "the name does not resolve" "$(R gamma 'grep -c alpha /etc/hosts || echo 0
 check "and the ADDRESS does not answer" \
     "$(R gamma "ping -c1 -W2 $A_IP >/dev/null 2>&1 && echo REACHABLE || echo blocked")" "blocked"
 # Isolation must not cost egress: the whole point of a bridge is a route
-# off the machine.
-check "but the outside world is still reachable from both" \
-    "$(R gamma 'ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 && echo ok || echo no-egress')" "ok"
-check "and from the other network too" \
-    "$(R alpha 'ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 && echo ok || echo no-egress')" "ok"
+# off the machine. Over TCP rather than ICMP, for the same reason stage 9
+# does: plenty of networks drop ICMP while forwarding TCP perfectly well -
+# GitHub's runners among them - and a ping here fails for a reason that
+# has nothing to do with the isolation rules this stage adds.
+EGRESS='nc -z -w5 1.1.1.1 443 >/dev/null 2>&1 && echo ok || echo no-egress'
+check "but the outside world is still reachable from both" "$(R gamma "$EGRESS")" "ok"
+check "and from the other network too" "$(R alpha "$EGRESS")" "ok"
 
 echo
 echo "6. Isolation survives the container that is started afterwards"
