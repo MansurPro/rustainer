@@ -62,12 +62,16 @@ is easier to reason about once the process model is not also in question.
 | 17 | A local API, and a page that uses it | **Done** |
 | 18 | Stacks — several containers from one file | **Done** |
 
-The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete, and
-stage 12 begins the additive work §19 held back until the mechanisms were
-understood. What is still deliberately absent — `attach`, restart policies,
-`events`, volumes, `commit` and `build`, push, checkpoint/restore, drop-in
-OCI runtime compatibility — is listed there with why each is additive given
-the eleven.
+The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete.
+Stages 12 onwards are the additive work §19 held back until the mechanisms
+were understood, taken in the order that each one's absence started to
+cost something real.
+
+What is still deliberately absent: `attach` and interactive terminals,
+restart policies, `events`, healthchecks, `commit` and `build`, registry
+push, user-defined networks and embedded DNS, swarm, checkpoint/restore,
+and drop-in OCI runtime compatibility. §19 lists why each is additive
+given what exists.
 
 ### Building and testing
 
