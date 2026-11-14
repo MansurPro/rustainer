@@ -76,6 +76,8 @@ enum Command {
     Build(BuildArgs),
     /// Download an image and extract it into the local store.
     Pull(PullArgs),
+    /// Upload a local image to a registry.
+    Push(PushArgs),
     /// List images in the local store.
     Images,
     /// Remove an image from the local store.
@@ -295,6 +297,22 @@ struct StackArgs {
 }
 
 #[derive(Args)]
+struct PushArgs {
+    /// The image in the local store.
+    image: String,
+
+    /// Where to push it. Defaults to the same reference.
+    #[arg(long)]
+    to: Option<String>,
+
+    /// `user:password` for the registry. Prefer the environment variable
+    /// RUSTAINER_REGISTRY_AUTH, which does not appear in `ps` output or
+    /// in your shell history.
+    #[arg(long)]
+    creds: Option<String>,
+}
+
+#[derive(Args)]
 struct BuildArgs {
     /// Name for the built image, e.g. `-t myapp:1`.
     #[arg(short = 't', long = "tag")]
@@ -416,6 +434,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Exec(a) => cmd_exec(&paths, a),
         Command::Build(a) => cmd_build(&paths, a),
         Command::Pull(a) => cmd_pull(a),
+        Command::Push(a) => cmd_push(&paths, a),
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
         Command::Volume(a) => cmd_volume(a),
@@ -1631,6 +1650,34 @@ fn cmd_volume(cmd: VolumeCmd) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn cmd_push(paths: &Paths, args: PushArgs) -> Result<ExitCode> {
+    let target = args.to.clone().unwrap_or_else(|| args.image.clone());
+    // The flag loses to the environment variable deliberately: a password
+    // on a command line is in `ps` for everyone on the machine and in the
+    // shell history forever.
+    let creds = std::env::var("RUSTAINER_REGISTRY_AUTH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(args.creds);
+    let store = Store::new(Store::default_root());
+    let digest = store
+        // Printed verbatim: the message already says whether anything
+        // was uploaded, and a wrapper that prefixes "pushing" onto
+        // "is already there" is a progress report that contradicts
+        // itself.
+        .push(&args.image, &target, creds, |what| println!("{what}"))
+        .with_context(|| format!("pushing {} to {target}", args.image))?;
+    rustainer_core::events::record(
+        paths,
+        "push",
+        &target,
+        serde_json::json!({ "digest": digest }),
+    );
+    println!("{digest}");
+    println!("pushed {target}");
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_images() -> Result<ExitCode> {
     let store = Store::new(Store::default_root());
     println!("{:<48} DIGEST", "REFERENCE");
@@ -1928,6 +1975,8 @@ fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
     // Layers are sealed as they are produced, and their tars kept, so the
     // image can be pushed later without rebuilding it.
     let mut sealed: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
+    let mut base_diff_ids: Vec<String> = Vec::new();
+    let mut base_descriptors: Vec<rustainer_image::registry::Descriptor> = Vec::new();
     let staging = Store::default_root().join("build").join(new_id()?);
     std::fs::create_dir_all(&staging)?;
     let cleanup_staging = || {
@@ -1965,6 +2014,18 @@ fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
                         .with_context(|| format!("pulling the base image {reference}"))?,
                 };
                 built.layers = base.layers.clone();
+                base_diff_ids = base.diff_ids.clone();
+                base_descriptors = store
+                    .manifest_for(&reference)
+                    .map(|m| m.layers)
+                    .unwrap_or_default();
+                if base_descriptors.len() != base.layers.len() {
+                    bail!(
+                        "the base image {reference} has no usable manifest in the \
+                         store, so a build on it could not be pushed. Pull it again \
+                         with `rustainer pull {reference} --force`."
+                    );
+                }
                 built.diff_ids = Vec::new();
                 built.env = base.env.clone();
                 built.workdir = base.working_dir.clone();
@@ -2092,17 +2153,11 @@ fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
         bail!("the build produced no layers, so there is no image to tag");
     }
 
-    // The base image's diff_ids come first: `adopt` only moves the ones
-    // this build created, and the rest are already in the store.
-    let base_count = built.layers.len() - built.diff_ids.len();
-    let mut diff_ids: Vec<String> = Vec::new();
-    for dir in built.layers.iter().take(base_count) {
-        diff_ids.push(
-            dir.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .ok_or_else(|| anyhow::anyhow!("a base layer has no name"))?,
-        );
-    }
+    // The base image's diff_ids come first, taken from the base image
+    // rather than from its directory NAMES: the store strips the
+    // `sha256:` prefix when naming a directory, so reading them back
+    // gives a string that looks like a diff_id and is not one.
+    let mut diff_ids: Vec<String> = base_diff_ids.clone();
     diff_ids.extend(built.diff_ids.iter().cloned());
 
     let config = serde_json::json!({
@@ -2127,7 +2182,7 @@ fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
     });
     let config_bytes = serde_json::to_vec_pretty(&config)?;
     let digest = store
-        .adopt(&sealed, &config_bytes, &args.tag)
+        .adopt(&base_descriptors, &sealed, &config_bytes, &args.tag)
         .context("storing the built image")?;
     cleanup_staging();
 

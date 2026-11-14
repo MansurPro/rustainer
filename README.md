@@ -64,6 +64,7 @@ is easier to reason about once the process model is not also in question.
 | 19 | Pseudo-terminals — `run -it`, `exec -it` | **Done** |
 | 20 | Restart policies and an event log | **Done** |
 | 21 | `build` — images from a Dockerfile | **Done** |
+| 22 | `push` — upload an image to a registry | **Done** |
 
 The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete.
 Stages 12 onwards are the additive work §19 held back until the mechanisms
@@ -756,6 +757,41 @@ What is deliberately absent: no parallelism, no instruction-keyed build
 cache, and no multi-stage `--from`. BuildKit is those three things and
 they are each a project; a cache that is wrong is worse than no cache, and
 `--from` needs a graph where this has a list.
+
+### Pushing
+
+```sh
+rustainer push myapp:1 --to registry.example.com/team/myapp:1
+RUSTAINER_REGISTRY_AUTH=user:token rustainer push myapp:1
+```
+
+`research/pass-2/RND.md` §19 predicted this would be *"strictly additive;
+shares the auth and transport code that pull already needs"*, and it was:
+three requests and a credential header on the token exchange.
+
+**Blobs first, manifest last.** A manifest naming blobs the registry does
+not have is a tag that resolves to a broken image, and not every registry
+checks. `scripts/fake-registry.py` does check, so getting it backwards
+fails in the test rather than six months later against somebody's Harbor.
+
+Every blob is `HEAD`ed before it is sent, because for anything built
+`FROM` something, every layer but one is already there — a push that
+re-uploads them takes minutes instead of seconds. The progress line says
+which happened, since *"pushing"* printed for a blob that was then
+skipped is a report that lies about where the time went.
+
+Credentials come from `RUSTAINER_REGISTRY_AUTH` in preference to
+`--creds`, because a password on a command line is in `ps` for everyone on
+the machine and in the shell history forever.
+
+**The test is a round trip**: build, push, pull into a *clean* store, run.
+Anything less proves the request succeeded, not that the right bytes
+arrived — and the first version of this code pushed an image whose
+manifest omitted the base layers. Every status code was 201. It failed
+only on the way back, as a `diff_id` mismatch on layer 0.
+
+Pull now keeps the manifest it fetched, which is what lets a pulled image
+be pushed on at all, and `build` writes one for the image it made.
 
 ### The engine does not lie about what it does not know
 
