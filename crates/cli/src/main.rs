@@ -359,6 +359,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             for d in &image.report.devices_skipped {
                 eprintln!("rustainer: refused a device node in the image: {d}");
             }
+            warn_about_whiteouts(&image.report);
             if image.report.xattrs_dropped > 0 {
                 eprintln!(
                     "rustainer: dropped {} security.*/system.* extended attribute(s) from the image",
@@ -905,8 +906,30 @@ fn cmd_pull(args: PullArgs) -> Result<ExitCode> {
     for d in &image.report.devices_skipped {
         eprintln!("rustainer: refused a device node in the image: {d}");
     }
+    warn_about_whiteouts(&image.report);
     println!("{}", image.digest);
     Ok(ExitCode::SUCCESS)
+}
+
+fn warn_about_whiteouts(report: &rustainer_image::extract::Report) {
+    if report.whiteouts_unrecordable == 0 {
+        return;
+    }
+    // Specific about the consequence, because "whiteout" means nothing to
+    // most people and the consequence means a great deal: files the image
+    // author deleted are readable in the container, and `RUN ... && rm -rf`
+    // is how build secrets, credentials and package caches get removed.
+    eprintln!(
+        "rustainer: WARNING: {} deletion(s) recorded by this image could not be \
+         applied, so files its later layers deleted REMAIN VISIBLE in containers \
+         made from it. This usually means an unprivileged container's device \
+         filter refused to create an overlay whiteout. Extract the image on the \
+         host, or in a user namespace of your own, to get this right.",
+        report.whiteouts_unrecordable
+    );
+    if let Some(why) = &report.whiteout_failure {
+        eprintln!("rustainer: the first such failure was: {why}");
+    }
 }
 
 fn cmd_images() -> Result<ExitCode> {

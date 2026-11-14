@@ -92,6 +92,12 @@ jobs:
       # resident once no container is running.
       - name: Stage 14 success test (local store, no daemon)
         run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage14-success-test.sh
+      # The image is built byte by byte and served over loopback, because
+      # what is being tested is what a layer REMOVES, and you cannot see
+      # what a public image's layers contain without reimplementing the
+      # thing under test.
+      - name: Stage 15 success test (layer deletions)
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage15-success-test.sh
       # In a delegated scope, so the resource stage exercises real limits
       # rather than only the refusal path, and so it never touches the
       # runner's own cgroup.
@@ -131,7 +137,7 @@ jobs:
             echo "::error::unprivileged user namespaces are unavailable on this runner"
             exit 1
           }
-          for s in 1 2 3 4 5 6 7 8 9 10 12 13 14; do
+          for s in 1 2 3 4 5 6 7 8 9 10 12 13 14 15; do
             systemd-run --user --scope -p Delegate=yes -q \
               unshare --user --map-root-user \
               env RUSTAINER_BIN="$PWD/target/release/rustainer" \

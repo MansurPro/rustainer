@@ -95,6 +95,13 @@ pub struct Report {
     /// Entries naming the archive's own root (`./`), which carry a mode for
     /// a directory that already exists and nothing to extract.
     pub root_entries: u64,
+    /// Whiteouts this environment would not let us record, and why.
+    ///
+    /// Recorded rather than fatal, and loud rather than silent. The
+    /// consequence is specific and worth saying out loud: files the image
+    /// author deleted in a later layer stay visible in the container.
+    pub whiteouts_unrecordable: u64,
+    pub whiteout_failure: Option<String>,
 }
 
 /// A pinned root. Every path in this module resolves through it.
@@ -237,6 +244,87 @@ impl SafeRoot {
     ///
     /// The spec's rule is remove-then-recreate, and the removal must never
     /// follow a symlink: that is exactly CVE-2021-32760's mechanism.
+    /// Record that a lower layer's `rel` is deleted by **this** layer.
+    ///
+    /// An overlayfs whiteout: a character device with major 0 and minor 0,
+    /// which the kernel recognises by that exact device number and which
+    /// never appears in the merged view.
+    ///
+    /// This is the one place this module creates a device node, and the
+    /// contrast with [the device branch of `apply_layer`] is the point:
+    /// a device *from layer content* is refused outright, because a layer
+    /// shipping `dev/mem` as char 1:1 would be a direct path to host
+    /// memory. `0:0` is not a device at all - there is no driver behind
+    /// it - and it is synthesised by us from a `.wh.` marker, never copied
+    /// from the archive.
+    ///
+    /// Creating it needs no privilege: `WHITEOUT_DEV` is exempt from the
+    /// `CAP_MKNOD` check, which is what lets a rootless extraction produce
+    /// a correct image at all. Verified on ext4 and tmpfs, privileged and
+    /// in a nested user namespace.
+    fn whiteout(&self, rel: &Path) -> Result<(), Error> {
+        // Whatever is there goes first: a layer may both delete and
+        // recreate a name, and `mknodat` is EEXIST otherwise.
+        self.remove(rel)?;
+        let dir = self.parent_dir(rel)?;
+        let name = file_name_c(rel)?;
+        rustix::fs::mknodat(
+            &dir,
+            name.as_c_str(),
+            rustix::fs::FileType::CharacterDevice,
+            Mode::empty(),
+            // makedev(0, 0). Not "a device we happen to not care about":
+            // the kernel tests for this exact value.
+            0,
+        )
+        .map_err(|e| Error::Io {
+            op: "recording a whiteout",
+            path: rel.display().to_string(),
+            source: e.into(),
+        })
+    }
+
+    /// Record that a directory hides everything beneath it in lower layers.
+    ///
+    /// `trusted.overlay.opaque` normally, `user.overlay.opaque` when the
+    /// overlay will be mounted `userxattr` - which it is whenever we are
+    /// outside the initial user namespace, because the kernel cannot read
+    /// `trusted.*` there. Setting the wrong one is silent: the mount
+    /// succeeds, the xattr is ignored, and deleted files reappear.
+    fn set_opaque(&self, rel: &Path, userxattr: bool) -> Result<(), Error> {
+        // The marker can arrive before the directory entry it refers to;
+        // tar does not promise an order and real layers rely on it.
+        if !rel.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(self.path.join(rel));
+        }
+        let dir = if rel.as_os_str().is_empty() {
+            self.openat(
+                Path::new("."),
+                OFlags::DIRECTORY | OFlags::RDONLY,
+                Mode::empty(),
+            )
+        } else {
+            self.openat(rel, OFlags::DIRECTORY | OFlags::RDONLY, Mode::empty())
+        }
+        .map_err(|e| Error::Io {
+            op: "opening a directory to mark opaque",
+            path: rel.display().to_string(),
+            source: e.into(),
+        })?;
+        let name = if userxattr {
+            c"user.overlay.opaque"
+        } else {
+            c"trusted.overlay.opaque"
+        };
+        rustix::fs::fsetxattr(&dir, name, b"y", rustix::fs::XattrFlags::empty()).map_err(|e| {
+            Error::Io {
+                op: "marking a directory opaque",
+                path: rel.display().to_string(),
+                source: e.into(),
+            }
+        })
+    }
+
     fn remove(&self, rel: &Path) -> Result<(), Error> {
         let Some(name) = rel.file_name() else {
             return Ok(());
@@ -353,11 +441,30 @@ fn sanitise(raw: &Path) -> Result<PathBuf, Error> {
     Ok(out)
 }
 
-/// Extract one gzip-compressed layer into `root`, applying whiteouts.
+/// Extract one layer into `root`, **recording** its whiteouts.
+///
+/// Recording, not applying. Each layer is extracted into a directory of its
+/// own so that layers can be shared between images, and those directories
+/// are composed at run time by overlayfs. A whiteout therefore has to be
+/// left behind in a form overlayfs understands - a `0:0` character device,
+/// or an opaque xattr on a directory - because the entry it hides lives in
+/// a *different* directory that this layer must not touch.
+///
+/// Deleting the name here instead looks right and does nothing: the victim
+/// is not in this layer's directory, so the unlink is a no-op and the file
+/// stays visible through the lower layer at run time. The symptom is that
+/// `RUN ... && rm -rf /secret` - one of the most common lines in any
+/// Dockerfile - leaves the secret readable in every container. That was
+/// true here until stage 15, and no correctness test caught it, because
+/// every assertion about extraction was about the layer being extracted.
+///
+/// `userxattr` must match how the overlay will be mounted. Getting it
+/// wrong is silent in exactly the same way.
 pub fn apply_layer<R: Read>(
     root: &SafeRoot,
     reader: R,
     limits: Limits,
+    userxattr: bool,
     report: &mut Report,
 ) -> Result<(), Error> {
     let mut archive = tar::Archive::new(reader);
@@ -389,16 +496,21 @@ pub fn apply_layer<R: Read>(
         if let Some(name) = rel.file_name().and_then(OsStr::to_str) {
             if name == ".wh..wh..opq" {
                 // Everything from lower layers under this directory is
-                // hidden. With a flat extraction that means emptying it.
+                // hidden. Marked, not emptied: what has to disappear is in
+                // the other layers' directories, which are not ours.
                 report.opaque_dirs += 1;
                 let dir = rel.parent().unwrap_or(Path::new("")).to_path_buf();
-                empty_directory(root, &dir)?;
+                if let Err(e) = root.set_opaque(&dir, userxattr) {
+                    note_unrecordable(report, e);
+                }
                 continue;
             }
             if let Some(target) = name.strip_prefix(".wh.") {
                 report.whiteouts += 1;
                 let victim = rel.parent().unwrap_or(Path::new("")).join(target);
-                root.remove(&victim)?;
+                if let Err(e) = root.whiteout(&victim) {
+                    note_unrecordable(report, e);
+                }
                 continue;
             }
         }
@@ -596,43 +708,30 @@ pub fn apply_layer<R: Read>(
     Ok(())
 }
 
+/// A whiteout we could not record. Counted and explained once, not fatal.
+///
+/// Not fatal because the alternative is refusing to run anywhere the
+/// environment forbids it, and one such place is **inside an unprivileged
+/// container**: Docker's device filter denies `mknod` of a character
+/// device even with `CAP_MKNOD` in the effective set, so an engine that
+/// refused here could not be developed or tested inside Docker at all.
+///
+/// Loud because of what it means. A whiteout that was not recorded is a
+/// file the image author deleted which stays visible in the container -
+/// and `RUN ... && rm -rf /secret` is one of the most common lines in any
+/// Dockerfile. The caller prints this; it must never become a debug log.
+fn note_unrecordable(report: &mut Report, e: Error) {
+    report.whiteouts_unrecordable += 1;
+    if report.whiteout_failure.is_none() {
+        report.whiteout_failure = Some(e.to_string());
+    }
+}
+
 fn file_name_c(rel: &Path) -> Result<CString, Error> {
     let name = rel
         .file_name()
         .ok_or_else(|| rejected(rel, "no final path component"))?;
     CString::new(name.as_bytes()).map_err(|_| rejected(rel, "an interior NUL byte"))
-}
-
-fn empty_directory(root: &SafeRoot, rel: &Path) -> Result<(), Error> {
-    let dir = if rel.as_os_str().is_empty() {
-        root.openat(
-            Path::new("."),
-            OFlags::DIRECTORY | OFlags::RDONLY,
-            Mode::empty(),
-        )
-    } else {
-        root.openat(rel, OFlags::DIRECTORY | OFlags::RDONLY, Mode::empty())
-    };
-    let Ok(dir) = dir else { return Ok(()) };
-    let mut names = Vec::new();
-    {
-        let Ok(mut rd) = rustix::fs::Dir::read_from(&dir) else {
-            return Ok(());
-        };
-        while let Some(Ok(e)) = rd.read() {
-            let n = e.file_name().to_owned();
-            if n.to_bytes() == b"." || n.to_bytes() == b".." {
-                continue;
-            }
-            names.push(n);
-        }
-    }
-    for n in names {
-        if rustix::fs::unlinkat(&dir, n.as_c_str(), AtFlags::empty()).is_err() {
-            let _ = remove_dir_recursive(&dir, n.as_c_str());
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -682,10 +781,17 @@ mod tests {
         d
     }
 
+    /// Tests run as whoever runs `cargo test`, which may or may not be
+    /// root, so they use the xattr an unprivileged mount would - the one
+    /// that can actually be set without CAP_SYS_ADMIN.
+    const USERXATTR: bool = true;
+
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
     fn run(dir: &Path, data: Vec<u8>) -> Result<Report, Error> {
         let root = SafeRoot::open(dir)?;
         let mut r = Report::default();
-        apply_layer(&root, &data[..], Limits::default(), &mut r)?;
+        apply_layer(&root, &data[..], Limits::default(), USERXATTR, &mut r)?;
         Ok(r)
     }
 
@@ -844,11 +950,15 @@ mod tests {
     }
 
     #[test]
-    fn a_whiteout_removes_the_lower_entry() {
+    fn a_whiteout_becomes_a_marker_overlayfs_understands() {
+        // The entry it hides lives in ANOTHER layer's directory. Deleting
+        // the name here looks right and does nothing - the unlink is a
+        // no-op and the file stays visible through the lower layer at run
+        // time, which is how `RUN ... && rm -rf /secret` left the secret
+        // readable in every container.
         let d = staging("whiteout");
         std::fs::create_dir_all(d.join("etc")).unwrap();
         std::fs::write(d.join("etc/keep"), b"k").unwrap();
-        std::fs::write(d.join("etc/gone"), b"g").unwrap();
         let t = tar_with(vec![(
             header("etc/.wh.gone", tar::EntryType::Regular, 0),
             Vec::new(),
@@ -856,23 +966,69 @@ mod tests {
         let r = run(&d, t).expect("extracts");
         assert_eq!(r.whiteouts, 1);
         assert!(d.join("etc/keep").exists());
-        assert!(!d.join("etc/gone").exists());
+
+        // The `.wh.` entry itself must never survive into the layer.
+        assert!(!d.join("etc/.wh.gone").exists());
+
+        if r.whiteouts_unrecordable > 0 {
+            // Some environments forbid it - an unprivileged container's
+            // device filter denies mknod of a character device even with
+            // CAP_MKNOD. Then the obligation is to have said so.
+            assert!(
+                r.whiteout_failure.is_some(),
+                "a whiteout was dropped without recording why"
+            );
+        } else {
+            // A character device, major 0 minor 0, which is the exact
+            // value the kernel tests for.
+            let md = std::fs::symlink_metadata(d.join("etc/gone")).expect("the marker exists");
+            assert!(md.file_type().is_char_device(), "not a character device");
+            assert_eq!(rustix::fs::major(md.rdev()), 0);
+            assert_eq!(rustix::fs::minor(md.rdev()), 0);
+        }
         std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
-    fn an_opaque_whiteout_empties_the_directory() {
+    fn a_whiteout_replaces_whatever_this_layer_already_put_there() {
+        // A layer may legitimately delete and recreate a name, and
+        // `mknodat` is EEXIST over an existing file.
+        let d = staging("whiteout-over");
+        let t = tar_with(vec![
+            (header("f", tar::EntryType::Regular, 1), b"x".to_vec()),
+            (header(".wh.f", tar::EntryType::Regular, 0), Vec::new()),
+        ]);
+        let r = run(&d, t).expect("extracts");
+        if r.whiteouts_unrecordable == 0 {
+            let md = std::fs::symlink_metadata(d.join("f")).expect("exists");
+            assert!(md.file_type().is_char_device());
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn an_opaque_whiteout_marks_the_directory() {
+        // Marked, not emptied: what has to disappear is in the other
+        // layers' directories, and this layer's own contents under that
+        // directory are exactly what should still be visible.
         let d = staging("opaque");
-        std::fs::create_dir_all(d.join("var/lib")).unwrap();
-        std::fs::write(d.join("var/lib/old"), b"o").unwrap();
-        let t = tar_with(vec![(
-            header("var/.wh..wh..opq", tar::EntryType::Regular, 0),
-            Vec::new(),
-        )]);
+        let t = tar_with(vec![
+            (
+                header("var/.wh..wh..opq", tar::EntryType::Regular, 0),
+                Vec::new(),
+            ),
+            (header("var/new", tar::EntryType::Regular, 1), b"n".to_vec()),
+        ]);
         let r = run(&d, t).expect("extracts");
         assert_eq!(r.opaque_dirs, 1);
-        assert!(!d.join("var/lib").exists());
         assert!(d.join("var").exists());
+        assert!(
+            d.join("var/new").exists(),
+            "this layer's own entry must survive"
+        );
+        let mut buf = [0u8; 8];
+        let n = rustix::fs::getxattr(d.join("var"), c"user.overlay.opaque", &mut buf);
+        assert!(n.is_ok_and(|n| n > 0), "the opaque xattr is not set: {n:?}");
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -892,6 +1048,7 @@ mod tests {
                 max_bytes: 100,
                 max_entries: 10,
             },
+            USERXATTR,
             &mut r,
         )
         .unwrap_err();
@@ -919,6 +1076,7 @@ mod tests {
                 max_bytes: 1 << 30,
                 max_entries: 5,
             },
+            USERXATTR,
             &mut r,
         )
         .unwrap_err();

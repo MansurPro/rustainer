@@ -303,7 +303,13 @@ impl Store {
             let mut hashing = registry::HashingReader::new(gz);
             {
                 let root = extract::SafeRoot::open(&staging)?;
-                extract::apply_layer(&root, &mut hashing, extract::Limits::default(), &mut report)?;
+                extract::apply_layer(
+                    &root,
+                    &mut hashing,
+                    extract::Limits::default(),
+                    userxattr,
+                    &mut report,
+                )?;
             }
             // The tar reader stops at the end-of-archive marker and leaves
             // the trailing padding unread, so drain before hashing.
