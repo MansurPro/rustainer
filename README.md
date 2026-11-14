@@ -59,13 +59,19 @@ is easier to reason about once the process model is not also in question.
 | 14 | Measured against Docker, and what measuring found | **Done** |
 | 15 | A layer's deletions are honoured | **Done** |
 | 16 | Volumes and bind mounts | **Done** |
+| 17 | A local API, and a page that uses it | **Done** |
+| 18 | Stacks — several containers from one file | **Done** |
 
-The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete, and
-stage 12 begins the additive work §19 held back until the mechanisms were
-understood. What is still deliberately absent — `attach`, restart policies,
-`events`, volumes, `commit` and `build`, push, checkpoint/restore, drop-in
-OCI runtime compatibility — is listed there with why each is additive given
-the eleven.
+The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete.
+Stages 12 onwards are the additive work §19 held back until the mechanisms
+were understood, taken in the order that each one's absence started to
+cost something real.
+
+What is still deliberately absent: `attach` and interactive terminals,
+restart policies, `events`, healthchecks, `commit` and `build`, registry
+push, user-defined networks and embedded DNS, swarm, checkpoint/restore,
+and drop-in OCI runtime compatibility. §19 lists why each is additive
+given what exists.
 
 ### Building and testing
 
@@ -122,6 +128,8 @@ rustainer run -d --rootfs ./alpine-rootfs --hostname boxy \
 rustainer ps
 rustainer logs <id>
 rustainer exec -e TZ=UTC <id> /bin/sh -c 'ps -o pid,comm'
+rustainer serve                       # a local page at 127.0.0.1:8750
+rustainer stack up -f examples/rustainer.toml
 rustainer stop -t 5 <id>
 rustainer rm <id>
 ```
@@ -493,6 +501,133 @@ writable, which is the trap `/sys` hit back at stage 2.
 Named volumes live beside the image store, because both must outlive a
 reboot and the runtime state directory is usually a tmpfs. Removing a
 container never removes them.
+
+### A local API, and a page that uses it
+
+```sh
+rustainer serve            # http://127.0.0.1:8750/
+```
+
+One binary, one page, no build step, no CDN. The page is compiled into the
+binary and references nothing it cannot reach — which the stage 17 test
+asserts, because a dashboard that fetches a framework before it can tell
+you what is running is useless exactly when you need it, and this engine
+is specifically built to work offline.
+
+Two properties matter more than the endpoint list, and both are asserted
+rather than described:
+
+**The server does not own the containers.** Each one is owned by its own
+supervisor, so this is a *view*. Kill the server and everything keeps
+running; start another and it sees the same containers. There is no state
+in it to corrupt and no reason not to run two.
+
+**The server cannot start a container itself.** It is multi-threaded — one
+thread per connection — and a container is created by a process that has
+never had a second thread, because after a raw `clone` the child inherits
+every lock in the address space in whatever state it was in. So every
+mutation executes the CLI and lets a fresh single-threaded process do it,
+exactly as the CLI does for the supervisor. The rule that made `clone3`
+safe at stage 1 decides the architecture of the API at stage 17 — which is
+the kind of thing a "just add an HTTP server" plan does not survive
+contact with.
+
+There is **no authentication**. Anything that can reach the port can start
+a container, and a container is a path to root on the host, so it binds
+loopback and says so loudly if you give it anything else.
+
+The one thing the page does that other container GUIs do not: **every
+action shows the command that performed it.**
+
+```
+$ rustainer run -d --network bridge alpine:3.21 /bin/sleep 300
+$ rustainer exec web ps -o pid,comm
+```
+
+A tool that hides the command teaches you nothing and leaves you helpless
+when it is not installed.
+
+Building it found three things the engine was getting wrong, none of which
+a test would have caught, because each one was invisible until something
+tried to display it:
+
+- **A detached container that failed to start discarded the reason.** The
+  supervisor's stderr went to `/dev/null` with everything else, so a
+  perfectly good explanation — "cannot enable the memory controller in …,
+  it still holds …" — was thrown away, and the container showed as
+  `unknown` with no error anywhere. The supervisor's own stderr now goes to
+  a file in the state directory, the CLI prints it, and the state records
+  it, so `ps`, the API and the page all show the real reason.
+- **`rustainer images` printed a key that `rustainer rmi` would not
+  accept.** A store key has `/` and `:` replaced by `_`, so
+  `mirror.gcr.io/library/alpine:3.21` was listed as
+  `mirror.gcr.io_library_alpine_3.21` — and feeding that back produced "no
+  such file" naming a path nobody typed. A tool has to accept what it
+  prints; the page's remove button was simply the first caller with nothing
+  else to pass.
+- **`rmi` on a missing image reported a path instead of a name.** It now
+  says what the person did.
+
+### Stacks
+
+```sh
+rustainer stack up    -f examples/rustainer.toml
+rustainer stack ps    -f examples/rustainer.toml
+rustainer stack down  -f examples/rustainer.toml
+```
+
+```toml
+name = "example"
+
+[services.db]
+image = "postgres:17-alpine"
+env = ["POSTGRES_PASSWORD=dev"]
+volumes = ["exampledb:/var/lib/postgresql/data"]
+
+[services.web]
+image = "nginx:1.27-alpine"
+ports = ["8080:80"]
+depends_on = ["db"]
+```
+
+Compose-shaped, deliberately not Compose, in three ways that each exist to
+stop a specific way of losing an afternoon:
+
+- **TOML, not YAML.** A configuration language should not be able to
+  surprise you. `ports: - 8080:80` is a sexagesimal number in YAML 1.1,
+  `no` is a boolean, and whether two spaces or four are correct depends on
+  what the line above did.
+- **An unknown key is an error.** A misspelled key in a Compose file does
+  nothing at all, silently, and the service starts without the setting you
+  thought you gave it. Here, `imgae = "alpine"` is a refusal that names it.
+- **`command` is a list, never a string.** Compose accepts both, and the
+  string form is split on spaces — so the quotes in
+  `sh -c "echo hi; sleep 1"` become part of the arguments and the shell is
+  handed `"echo` as its whole script. There is no shell here to re-quote
+  it, and inventing a quoting dialect for a config file is worse than
+  requiring a list.
+
+**Services find each other through `/etc/hosts`, not DNS.** Every address
+is allocated *before anything starts*, so every container's hosts file can
+name every other one — including the services that do not exist yet. The
+test asserts the case a naive implementation misses: the service that
+starts **first** must be able to reach the one that starts **last**. A
+resolver in each namespace would be a second service to run, to supervise
+and to get wrong; this way `cat /etc/hosts` is the whole debugging story.
+
+A stack is **not an orchestrator**. No reconciliation loop, no
+rescheduling, no health-gated rollout. `up` starts what is not running in
+dependency order and leaves the rest alone; `down` stops in reverse, and
+keeps the volumes. The containers are ordinary containers — `ps`, `logs`,
+`exec` and the page all work on them without knowing a stack exists, which
+is what makes the whole thing debuggable with the tools you already have.
+
+Stage 18 also added `run -e/--env`, which the engine simply did not have:
+the image's environment could be read but never overridden. It uses the
+same merge rule `exec` does, so `--env PATH=…` replaces the image's entry
+rather than shadowing it — prepending also "works", but only by accident
+of glibc's `getenv`, and `env` inside the container would print the
+variable twice.
 
 ### The engine does not lie about what it does not know
 

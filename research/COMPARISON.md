@@ -167,13 +167,24 @@ work not yet done — `research/pass-2/RND.md` §19 says which are which.
 
 - **Image build** — no `Dockerfile`, no BuildKit, no layer caching for builds.
 - **Registry push.**
-- **Volumes and bind mounts** — containers have a writable layer and nothing else.
-- **User-defined networks** — one bridge, no network creation, no embedded DNS, so containers cannot resolve each other by name.
-- **An HTTP API and SDKs** — no daemon, so nothing to connect to.
+- **User-defined networks** — one bridge, no network creation, and no embedded DNS. A *stack* writes its members into each container's `/etc/hosts`, which resolves names within a stack and nothing else; two containers started separately cannot find each other by name.
 - **`events`, restart policies, healthchecks, log drivers.**
-- **Compose, swarm, plugins.**
-- **Checkpoint/restore, Windows containers, cgroup v1 hosts.**
+- **Swarm, plugins, checkpoint/restore, Windows containers, cgroup v1 hosts.**
+- **Interactive terminals** — `exec` has no `-it` and the page's exec box is one shot, because a pty needs a second protocol.
 - **Multi-extent rootless** — `/etc/subuid` ranges and the setuid helpers are explicitly not implemented; rootless here maps exactly one id.
+
+And what has arrived since this was first written, which changes the shape of
+the comparison rather than the numbers:
+
+- **Volumes and bind mounts** (`-v`, `volume ls/rm`), recursive and with
+  recursive `:ro`.
+- **A local HTTP API and a page** (`rustainer serve`). It is not a daemon:
+  containers outlive it, it owns nothing, and it cannot start a container
+  itself — it executes the CLI, because a container is created by a process
+  that has never had a second thread. The "0 MiB resident" row above is still
+  true of the engine; the server is opt-in and runs only while you are
+  looking at it.
+- **Stacks** (`stack up/down/ps`), Compose-shaped and TOML-based.
 
 The timings above are a fair measure of **starting and supervising a
 container**. They are not a claim that one tool replaces the other, and this

@@ -190,7 +190,7 @@ pub fn exec(paths: &Paths, id: &str, req: &Request) -> Result<Exit, Error> {
 /// the first match — but only by accident of glibc's implementation, and
 /// `env` inside the container would print the variable twice, which is how
 /// an operator debugging a container concludes the engine is broken.
-fn merge_env(container: &[String], extra: &[String]) -> Vec<String> {
+pub fn merge_env(container: &[String], extra: &[String]) -> Vec<String> {
     let key = |e: &str| e.split('=').next().unwrap_or("").to_owned();
     let overridden: Vec<String> = extra.iter().map(|e| key(e)).collect();
     let mut out: Vec<String> = container

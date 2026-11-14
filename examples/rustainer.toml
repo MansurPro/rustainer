@@ -1,0 +1,37 @@
+# An example stack. Run it with:
+#
+#     rustainer stack up -f examples/rustainer.toml
+#     rustainer stack ps -f examples/rustainer.toml
+#     rustainer stack down -f examples/rustainer.toml
+#
+# TOML and not YAML, because a configuration language should not be able
+# to surprise you: `ports: - 8080:80` is a sexagesimal number in YAML 1.1,
+# `no` is a boolean, and indentation is load-bearing.
+#
+# An unknown key here is an ERROR, not a no-op. A misspelled key in a
+# Compose file does nothing at all, silently, and the service starts
+# without the setting you thought you gave it.
+
+name = "example"
+
+[services.db]
+image = "postgres:17-alpine"
+env = ["POSTGRES_PASSWORD=dev", "POSTGRES_DB=app"]
+# A named volume. It outlives `stack down`, like Docker's.
+volumes = ["exampledb:/var/lib/postgresql/data"]
+memory = "512m"
+
+[services.cache]
+image = "redis:7-alpine"
+# `command` is a LIST, always. A string would have to be split on
+# something, and splitting on spaces turns the quotes in
+# `sh -c "a; b"` into part of the arguments.
+command = ["redis-server", "--save", ""]
+
+[services.web]
+image = "nginx:1.27-alpine"
+ports = ["8080:80"]
+# Started after both of these. Every service's address is allocated
+# before anything starts, so `db` can resolve `web` even though `web`
+# does not exist yet when `db` is created.
+depends_on = ["db", "cache"]

@@ -183,10 +183,16 @@ if [ "$WHITEOUTS_RECORDABLE" = no ]; then
         || bad "the warning did not name the consequence"
 else
     # Prove the message exists and is specific, without needing to be in an
-    # environment that triggers it.
-    grep -q 'REMAIN VISIBLE in containers' crates/cli/src/main.rs \
-        && ok "the warning text names the consequence" \
-        || bad "no warning text names the consequence"
+    # environment that triggers it. Read out of the BINARY, not the source:
+    # this test also runs on hosts that have the engine and not the repo.
+    if grep -aq 'REMAIN VISIBLE in containers' "$B"; then
+        ok "the warning text names the consequence"
+    elif [ -r crates/cli/src/main.rs ] \
+        && grep -q 'REMAIN VISIBLE in containers' crates/cli/src/main.rs; then
+        ok "the warning text names the consequence"
+    else
+        bad "no warning text names the consequence"
+    fi
 fi
 
 echo

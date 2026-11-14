@@ -1,0 +1,20 @@
+[package]
+name = "rustainer-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No async runtime here either, and for a sharper reason than in `core`:
+# this process must be able to start a container, and a container is
+# started by a process that has never had a second thread. It cannot be
+# this one - so it execs a fresh CLI instead, and the rule that made
+# `clone3` safe at stage 1 decides the architecture of the API at stage 17.
+[dependencies]
+rustainer-core = { path = "../core" }
+rustainer-image = { path = "../image" }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

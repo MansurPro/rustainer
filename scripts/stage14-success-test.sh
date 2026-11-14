@@ -171,17 +171,25 @@ echo
 echo "6. The benchmark script runs and produces a table"
 # The comparison in research/COMPARISON.md is only worth anything if the
 # thing that produced it still works.
-BOUT=$(RUSTAINER_BIN="$B" RUSTAINER_BENCH_IMAGE="$IMG" \
-    timeout 600 bash scripts/bench.sh 2 2>&1)
-case "$BOUT" in
-    *"run a container to exit"*) ok "bench.sh produces its table" ;;
-    *) bad "bench.sh produced no results: $(echo "$BOUT" | tail -1)" ;;
-esac
+if [ -r scripts/bench.sh ]; then
+    BOUT=$(RUSTAINER_BIN="$B" RUSTAINER_BENCH_IMAGE="$IMG" \
+        timeout 600 bash scripts/bench.sh 2 2>&1)
+    case "$BOUT" in
+        *"run a container to exit"*) ok "bench.sh produces its table" ;;
+        *) bad "bench.sh produced no results: $(echo "$BOUT" | tail -1)" ;;
+    esac
+else
+    skip "bench.sh is not here to run"
+fi
 # And it refuses to report a timing for a command that failed, because a
 # time-to-failure averaged with real samples is a number about nothing.
-grep -q "timing means nothing" scripts/bench.sh \
-    && ok "bench.sh refuses to time a failing command" \
-    || bad "bench.sh would happily average a failure into its median"
+if [ -r scripts/bench.sh ]; then
+    grep -q "timing means nothing" scripts/bench.sh \
+        && ok "bench.sh refuses to time a failing command" \
+        || bad "bench.sh would happily average a failure into its median"
+else
+    skip "bench.sh is not here to read"
+fi
 
 echo
 mirror_note

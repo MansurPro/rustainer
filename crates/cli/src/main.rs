@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod stack;
+
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use rustainer_core::exec;
@@ -77,12 +79,21 @@ enum Command {
     /// List or remove named volumes.
     #[command(subcommand)]
     Volume(VolumeCmd),
+    /// Serve the local web UI and HTTP API.
+    Serve(ServeArgs),
+    /// Start, stop and inspect a stack of containers described in a file.
+    #[command(subcommand)]
+    Stack(StackCmd),
     /// Internal: become the supervisor for an already-prepared container.
     #[command(hide = true)]
     Supervise { id: String },
 }
 
-#[derive(Args)]
+// `Default` so a stack can build one field by field. clap fills every
+// field from the command line in the normal path; the derived default is
+// only ever the starting point for the stack path, where the values come
+// from a file instead.
+#[derive(Args, Default)]
 struct RunArgs {
     /// Root filesystem: a directory tree you extracted yourself. `/` keeps
     /// the host's filesystem view. Omit it and the first positional
@@ -125,6 +136,30 @@ struct RunArgs {
     /// Repeatable.
     #[arg(short = 'v', long = "volume")]
     volumes: Vec<String>,
+
+    /// Set an environment entry, `KEY=VALUE`. Replaces the image's own
+    /// entry for that key rather than shadowing it. Repeatable.
+    #[arg(short = 'e', long = "env")]
+    env: Vec<String>,
+
+    /// Add an `/etc/hosts` entry: `--add-host name:address`. Repeatable.
+    /// This is how a stack's services find each other.
+    #[arg(long = "add-host")]
+    add_host: Vec<String>,
+
+    /// Use this address instead of allocating one. Only with
+    /// `--network bridge`; the caller is responsible for it being free.
+    #[arg(long)]
+    ip: Option<String>,
+
+    /// Record that this container belongs to a stack. Set by
+    /// `stack up`; there is no reason to type it.
+    #[arg(long, hide = true)]
+    stack_name: Option<String>,
+
+    /// The service name within that stack.
+    #[arg(long, hide = true)]
+    service_name: Option<String>,
 
     /// Memory limit, e.g. 512m, 2g. Enforced by cgroup v2 memory.max.
     #[arg(short = 'm', long)]
@@ -221,6 +256,36 @@ struct LogsArgs {
 }
 
 #[derive(Subcommand)]
+enum StackCmd {
+    /// Start every service that is not already running, in dependency order.
+    Up(StackArgs),
+    /// Stop and remove the stack's containers, in reverse order.
+    Down(StackArgs),
+    /// Show the stack's containers.
+    Ps(StackArgs),
+}
+
+#[derive(Args)]
+struct StackArgs {
+    /// The stack file. `rustainer.toml` in the current directory by default.
+    #[arg(short = 'f', long, default_value = "rustainer.toml")]
+    file: PathBuf,
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    /// Address to listen on. Loopback by default, and for a reason: there
+    /// is no authentication, and anything that can reach this port can
+    /// start a container, which is a path to root on the host.
+    #[arg(long, default_value = "127.0.0.1:8750")]
+    addr: String,
+
+    /// Print the URL and exit without serving. For scripts and tests.
+    #[arg(long, hide = true)]
+    check: bool,
+}
+
+#[derive(Subcommand)]
 enum VolumeCmd {
     /// List named volumes.
     Ls,
@@ -271,6 +336,8 @@ fn main() -> ExitCode {
 
 fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
+    // Kept, because `serve` has to pass it on to every CLI it executes.
+    let cli_root = cli.root.clone();
     let paths = Paths::new(cli.root.unwrap_or_else(Paths::default_root));
     paths
         .ensure_root()
@@ -287,6 +354,8 @@ fn real_main() -> Result<ExitCode> {
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
         Command::Volume(a) => cmd_volume(a),
+        Command::Serve(a) => cmd_serve(cli_root.clone(), a),
+        Command::Stack(a) => cmd_stack(&paths, a),
         Command::Supervise { id } => cmd_supervise(&paths, &id),
     }
 }
@@ -500,13 +569,26 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
 
     // An address, before the container exists: the netlink messages the
     // container sends to configure itself are built from it in the parent.
-    let lease = if bridge {
-        Some(
+    let lease = match (bridge, &args.ip) {
+        (false, Some(ip)) => bail!(
+            "--ip {ip} needs --network bridge: with `none` there is no interface to \
+             put an address on, and with `host` the address is the host's."
+        ),
+        (false, None) => None,
+        // Given rather than allocated: a stack has to know every service's
+        // address before it starts the first one, so it can write them
+        // all into every container's /etc/hosts.
+        (true, Some(ip)) => Some(rustainer_core::net::Lease {
+            ip: ip
+                .parse()
+                .with_context(|| format!("--ip {ip:?} is not an IPv4 address"))?,
+            prefix: rustainer_core::net::SUBNET_PREFIX,
+            gateway: rustainer_core::net::GATEWAY,
+        }),
+        (true, None) => Some(
             rustainer_core::net::allocate(&paths_root(paths))
                 .context("allocating an address for the container")?,
-        )
-    } else {
-        None
+        ),
     };
 
     let id = match args.name {
@@ -545,13 +627,20 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         // wrong thing: it leaks whatever the operator happened to have
         // exported into every container, and it overrides the PATH the
         // image set for its own binaries. Docker does not do it either.
-        envp: if image_env.is_empty() {
-            vec![
-                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
-                "HOME=/root".to_owned(),
-            ]
-        } else {
-            image_env
+        envp: {
+            let base = if image_env.is_empty() {
+                vec![format!("PATH={DEFAULT_PATH}"), "HOME=/root".to_owned()]
+            } else {
+                image_env
+            };
+            // `--env` REPLACES the image's entry for a key rather than
+            // being prepended to shadow it. Prepending also "works" -
+            // getenv returns the first match - but only by accident of
+            // glibc, and `env` inside the container would print the
+            // variable twice, which is how an operator concludes the
+            // engine is broken. Same function `exec` uses, so the two
+            // cannot drift apart.
+            rustainer_core::exec::merge_env(&base, &args.env)
         },
         hostname: args.hostname,
         // `None` means the host's filesystem view. An empty string means
@@ -575,6 +664,13 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         bridge,
         userns,
         volumes,
+        stack: args.stack_name.clone(),
+        service: args.service_name.clone(),
+        peers: args
+            .add_host
+            .iter()
+            .map(|h| parse_add_host(h))
+            .collect::<Result<Vec<_>>>()?,
         ip: lease.map(|l| l.ip.to_string()),
         ports: {
             if !args.publish.is_empty() && !bridge {
@@ -643,7 +739,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
 
     let (handshake_rx, handshake_tx) = sys::pipe()?;
     let mut child = spawn_supervisor(paths, &id, handshake_tx, args.detach)?;
-    let init_pid = read_handshake(&handshake_rx, &mut child, &id)?;
+    let init_pid = read_handshake(paths, &handshake_rx, &mut child, &id)?;
 
     // Release before doing anything slow: `stop` and `rm` on this container
     // must not be blocked by a foreground `run` that is merely waiting.
@@ -689,8 +785,20 @@ fn spawn_supervisor(
 
     cmd.stdin(Stdio::null());
     if detach {
-        // Detached: the container's output goes to the log files only.
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        // Detached: the container's output goes to the log files only -
+        // but the SUPERVISOR's own stderr is kept, in a file of its own.
+        //
+        // It used to go to /dev/null with everything else, and the cost
+        // only became obvious with a UI in front of it: a detached
+        // container that fails to start showed as `unknown` with no
+        // reason anywhere, while the supervisor had printed a precise
+        // explanation - "cannot enable the memory controller in ... it
+        // still holds ..." - into the void. The engine knew exactly what
+        // was wrong and threw it away because nobody was looking.
+        let log = paths.dir(id).join("supervisor.log");
+        let err =
+            std::fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
+        cmd.stdout(Stdio::null()).stderr(Stdio::from(err));
     } else {
         // Foreground: the supervisor inherits our streams and tees the
         // container's output onto them. One code path in the supervisor,
@@ -717,7 +825,12 @@ fn spawn_supervisor(
     Ok(child)
 }
 
-fn read_handshake(rx: &OwnedFd, child: &mut std::process::Child, id: &str) -> Result<i32> {
+fn read_handshake(
+    paths: &Paths,
+    rx: &OwnedFd,
+    child: &mut std::process::Child,
+    id: &str,
+) -> Result<i32> {
     let mut buf = [0u8; HANDSHAKE_LEN];
     let mut n = 0;
     while n < HANDSHAKE_LEN {
@@ -734,15 +847,29 @@ fn read_handshake(rx: &OwnedFd, child: &mut std::process::Child, id: &str) -> Re
         return Ok(pid);
     }
     // No handshake: the supervisor died before replying. Its exit status and
-    // whatever it printed are the real diagnosis.
+    // whatever it printed are the real diagnosis - so print what it said,
+    // rather than only that it said nothing.
     let status = child.wait().ok();
-    bail!(
-        "the supervisor for {id} exited without starting the container{}",
-        match status.and_then(|s| s.code()) {
-            Some(c) => format!(" (exit {c})"),
-            None => String::new(),
-        }
-    )
+    let said = std::fs::read_to_string(paths.dir(id).join("supervisor.log"))
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default();
+    let exit = match status.and_then(|s| s.code()) {
+        Some(c) => format!(" (exit {c})"),
+        None => String::new(),
+    };
+    // Recorded as well as printed: `ps`, the API and the UI all read the
+    // state file, and a failure nobody can see afterwards is a failure
+    // that gets reported as a mystery.
+    if !said.is_empty()
+        && let Ok(mut st) = State::load(paths, id)
+    {
+        st.error = Some(said.lines().last().unwrap_or(&said).to_owned());
+        let _ = st.store(paths);
+    }
+    if said.is_empty() {
+        bail!("the supervisor for {id} exited without starting the container{exit}");
+    }
+    bail!("{said}")
 }
 
 /// Foreground: forward signals to the container, wait for the supervisor.
@@ -959,6 +1086,23 @@ fn warn_about_whiteouts(report: &rustainer_image::extract::Report) {
 
 /// Where named volumes live: beside the image store, because both must
 /// outlive a reboot and the runtime state directory is usually a tmpfs.
+/// `name:address`, as Docker's `--add-host` takes it.
+fn parse_add_host(spec: &str) -> Result<(String, String)> {
+    let (name, ip) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--add-host {spec:?} is not `name:address`"))?;
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        bail!("--add-host {spec:?}: {name:?} is not a usable host name");
+    }
+    // Parsed, not trusted: these go into a file the container reads as
+    // root, and a line with a space in it is a different /etc/hosts entry
+    // than the one that was meant.
+    let addr: std::net::Ipv4Addr = ip
+        .parse()
+        .with_context(|| format!("--add-host {spec:?}: {ip:?} is not an IPv4 address"))?;
+    Ok((name.to_owned(), addr.to_string()))
+}
+
 fn volumes_root() -> PathBuf {
     Store::default_root().join("volumes")
 }
@@ -1061,6 +1205,202 @@ fn shellexpand_home(s: &str) -> String {
         },
         _ => s.to_owned(),
     }
+}
+
+fn read_stack(path: &Path) -> Result<stack::Stack> {
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading the stack file {}. Write one, or point at it with -f.",
+            path.display()
+        )
+    })?;
+    stack::Stack::parse(&text).with_context(|| format!("in {}", path.display()))
+}
+
+fn cmd_stack(paths: &Paths, cmd: StackCmd) -> Result<ExitCode> {
+    match cmd {
+        StackCmd::Up(a) => stack_up(paths, &read_stack(&a.file)?),
+        StackCmd::Down(a) => stack_down(paths, &read_stack(&a.file)?),
+        StackCmd::Ps(a) => stack_ps(paths, &read_stack(&a.file)?),
+    }
+}
+
+fn stack_up(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
+    let order = st.start_order()?;
+
+    // Every address is allocated BEFORE anything starts, because every
+    // container's /etc/hosts has to name every other one - including the
+    // services that do not exist yet. A stack whose first service cannot
+    // resolve its last is a stack that only works if you start it twice.
+    let mut peers: Vec<(String, String)> = Vec::new();
+    let mut address: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for name in &order {
+        let svc = &st.services[name];
+        if svc.network.as_deref().unwrap_or("bridge") != "bridge" {
+            continue;
+        }
+        let lease = rustainer_core::net::allocate(&paths_root(paths))
+            .with_context(|| format!("allocating an address for {name}"))?;
+        let ip = lease.ip.to_string();
+        // Both names resolve: the service's own short name, which is what
+        // a config file inside the container will say, and the container
+        // name, which is what `ps` shows.
+        peers.push((name.clone(), ip.clone()));
+        peers.push((st.container_name(name), ip.clone()));
+        address.insert(name.clone(), ip);
+    }
+
+    let mut started = 0usize;
+    for name in &order {
+        let id = st.container_name(name);
+        if let Ok(state) = State::load(paths, &id)
+            && matches!(state.observed_status(), Status::Running | Status::Created)
+        {
+            println!("{id}  already running");
+            continue;
+        }
+        // A previous run's remains. Removed rather than refused: `up` is
+        // the command people run after `down` failed half way.
+        if paths.dir(&id).exists() {
+            let _ = supervise::remove(paths, &id, true);
+        }
+
+        let svc = &st.services[name];
+        let mut command: Vec<OsString> = vec![svc.image.clone().into()];
+        command.extend(svc.command.iter().map(OsString::from));
+        let args = RunArgs {
+            rootfs: None,
+            pull: false,
+            detach: true,
+            name: Some(id.clone()),
+            network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
+            hostname: name.clone(),
+            workdir: svc.workdir.clone(),
+            volumes: svc.volumes.clone(),
+            add_host: peers
+                .iter()
+                .filter(|(n, _)| n != name && *n != id)
+                .map(|(n, ip)| format!("{n}:{ip}"))
+                .collect(),
+            ip: address.get(name).cloned(),
+            stack_name: Some(st.name.clone()),
+            service_name: Some(name.clone()),
+            memory: svc.memory.clone(),
+            cpus: svc.cpus,
+            pids_limit: svc.pids_limit,
+            user: svc.user.clone(),
+            env: svc.env.clone(),
+            publish: svc.ports.clone(),
+            command,
+            ..Default::default()
+        };
+        // The exit code is the CLI's, and for a detached run it is always
+        // success - the interesting failure comes back as an Err and is
+        // propagated. Discarded explicitly so it is clear that is why.
+        let _ = cmd_run(paths, args).with_context(|| format!("starting {id}"))?;
+        started += 1;
+    }
+    println!(
+        "{} service(s) started, {} already running",
+        started,
+        order.len() - started
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn stack_down(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
+    // Reverse of the start order: a service is stopped before the things
+    // it depends on, which is the only order in which shutting down looks
+    // like anything other than a cascade of connection errors.
+    let mut order = st.start_order()?;
+    order.reverse();
+    for name in order {
+        let id = st.container_name(&name);
+        if !paths.dir(&id).exists() {
+            continue;
+        }
+        let _ = supervise::stop(paths, &id, Duration::from_secs(5));
+        match supervise::remove(paths, &id, true) {
+            Ok(()) => println!("{id}  removed"),
+            Err(e) => eprintln!("rustainer: {id}: {e}"),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn stack_ps(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
+    println!(
+        "{:<24} {:<9} {:<8} {:<15} COMMAND",
+        "SERVICE", "STATUS", "PID", "ADDRESS"
+    );
+    for name in st.start_order()? {
+        let id = st.container_name(&name);
+        let (status, pid, addr, cmd) = match State::load(paths, &id) {
+            Err(_) => (
+                "-".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+                String::new(),
+            ),
+            Ok(state) => {
+                let observed = state.observed_status();
+                let cfg = Config::load(paths, &id).ok();
+                (
+                    observed.to_string(),
+                    match (observed, state.init_pid) {
+                        (Status::Running | Status::Created, Some(p)) => p.to_string(),
+                        _ => "-".into(),
+                    },
+                    cfg.as_ref()
+                        .and_then(|c| c.ip.clone())
+                        .unwrap_or_else(|| "-".into()),
+                    state.command.join(" "),
+                )
+            }
+        };
+        println!("{name:<24} {status:<9} {pid:<8} {addr:<15} {cmd}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_serve(root: Option<PathBuf>, args: ServeArgs) -> Result<ExitCode> {
+    use std::net::{TcpListener, ToSocketAddrs};
+
+    let paths = Paths::new(root.clone().unwrap_or_else(Paths::default_root));
+    paths
+        .ensure_root()
+        .context("preparing the state directory")?;
+
+    let addr = args
+        .addr
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {:?}", args.addr))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("{:?} resolved to no address", args.addr))?;
+
+    // Said plainly, once, and not buried in a man page. An API with no
+    // authentication on a routable address is a root shell with extra
+    // steps, and the person who binds 0.0.0.0 to "check it from my
+    // laptop" is exactly the person who needs to be told.
+    if !addr.ip().is_loopback() {
+        eprintln!(
+            "rustainer: WARNING: {addr} is not loopback and this API has NO \
+             AUTHENTICATION. Anything that can reach this port can start a \
+             container, and a container is a path to root on this host. Put it \
+             behind something, or bind 127.0.0.1 and use an SSH tunnel."
+        );
+    }
+
+    let listener = TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
+    let local = listener.local_addr().unwrap_or(addr);
+    println!("rustainer: serving http://{local}/");
+    if args.check {
+        return Ok(ExitCode::SUCCESS);
+    }
+    rustainer_api::Server::new(paths, root.map(|r| r.to_string_lossy().into_owned()))
+        .serve(listener)
+        .context("serving")?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_volume(cmd: VolumeCmd) -> Result<ExitCode> {

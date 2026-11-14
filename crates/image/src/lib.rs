@@ -37,6 +37,11 @@ pub enum Error {
         expected: String,
         actual: String,
     },
+    #[error(
+        "no image {reference:?} in the local store. `rustainer images` lists what is \
+         there, by the same name it accepts here."
+    )]
+    NoSuchImage { reference: String },
     #[error("{op} {path}: {source}")]
     Io {
         op: &'static str,
@@ -174,8 +179,43 @@ impl Store {
     }
 
     pub fn remove(&self, reference: &str) -> Result<(), Error> {
-        let r = Reference::parse(reference).map_err(Error::Reference)?;
-        let tag = self.tag_path(&r.store_key());
+        // A reference, or the key `list` printed for it.
+        //
+        // Those are not the same string: a store key has `/` and `:`
+        // replaced by `_`, so `mirror.gcr.io/library/alpine:3.21` is
+        // listed as `mirror.gcr.io_library_alpine_3.21` - and feeding
+        // that back produced "no such file" naming a path nobody typed.
+        // A tool has to accept what it prints; the UI's remove button is
+        // simply the first caller that had nothing else to pass.
+        let by_reference = Reference::parse(reference)
+            .ok()
+            .map(|r| self.tag_path(&r.store_key()))
+            .filter(|p| p.exists());
+        let tag = match by_reference {
+            Some(p) => p,
+            None => {
+                let direct = self.tag_path(reference);
+                if direct.exists() {
+                    direct
+                } else {
+                    // Report the reference form, which is what a person
+                    // most likely meant, rather than whichever of the two
+                    // we happened to try second.
+                    self.tag_path(
+                        &Reference::parse(reference)
+                            .map_err(Error::Reference)?
+                            .store_key(),
+                    )
+                }
+            }
+        };
+        if !tag.exists() {
+            // Said as the thing the person did, not as the path we
+            // happened to build out of it.
+            return Err(Error::NoSuchImage {
+                reference: reference.to_owned(),
+            });
+        }
         let digest = std::fs::read_to_string(&tag).ok();
         std::fs::remove_file(&tag).map_err(io("removing the tag", &tag))?;
         if let Some(d) = digest {
