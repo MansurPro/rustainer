@@ -55,6 +55,10 @@ impl std::fmt::Display for Publish {
 }
 
 /// What a backend must do for us. Deliberately small.
+/// The chain that keeps networks apart. Ours, named so an operator
+/// reading `iptables -S` can tell who put it there.
+const ISOLATION: &str = "RUSTAINER-ISOLATION";
+
 pub trait Firewall {
     /// Everything needed for a container subnet to reach the outside
     /// world, applied as one unit.
@@ -69,6 +73,25 @@ pub trait Firewall {
     /// perfectly correct address, route and NAT rule in place. Docker adds
     /// the same rules for the same reason.
     fn ensure_forward(&self, bridge: &str) -> Result<(), Error>;
+
+    /// Keep separate networks separate.
+    ///
+    /// Without this a user-defined network is only a separate subnet,
+    /// not a separate network: `ip_forward` is on and both bridges are
+    /// on the same host, so the kernel cheerfully routes between them
+    /// and a container on one reaches a container on another **by
+    /// address**. Names do not resolve across networks, which makes it
+    /// look isolated right up until somebody types an address.
+    ///
+    /// The shape is Docker's, because it is the shape that works: a
+    /// first chain matches "left one of our bridges and is not going
+    /// back to the same one", and a second drops it if its destination
+    /// is another of ours. Pairwise rules would be N² and would have to
+    /// be reordered every time a network is added.
+    ///
+    /// Called with the full list each time, and rebuilt from empty, so
+    /// a network that was removed stops being isolated against.
+    fn ensure_isolation(&self, bridges: &[String]) -> Result<(), Error>;
 
     /// Is a policy somebody else set going to drop our traffic anyway?
     ///
@@ -266,6 +289,30 @@ impl Firewall for Nft {
         }
         Ok(())
     }
+
+    fn ensure_isolation(&self, bridges: &[String]) -> Result<(), Error> {
+        // A chain of our own, flushed and rebuilt. `nft` evaluates rules
+        // in order within a chain, and the accepts added above are in
+        // the same chain - so the jump has to be INSERTED at the top
+        // rather than appended, or every packet is accepted before it is
+        // ever considered for dropping.
+        run_ok("nft", &["add", "chain", "ip", TABLE, ISOLATION]);
+        run_ok("nft", &["flush", "chain", "ip", TABLE, ISOLATION]);
+        for a in bridges {
+            for b in bridges {
+                if a == b {
+                    continue;
+                }
+                let rule = format!("iifname \"{a}\" oifname \"{b}\" counter drop");
+                run("nft", &["add", "rule", "ip", TABLE, ISOLATION, &rule])?;
+            }
+        }
+        let jump = format!("counter jump {ISOLATION}");
+        if !rule_present("nft", &["list", "table", "ip", TABLE], &jump) {
+            run("nft", &["insert", "rule", "ip", TABLE, "forward", &jump])?;
+        }
+        Ok(())
+    }
 }
 
 impl Nft {
@@ -386,6 +433,48 @@ impl Firewall for Iptables {
                 run_owned("iptables", &with_wait(&add))?;
             }
         }
+        Ok(())
+    }
+
+    fn ensure_isolation(&self, bridges: &[String]) -> Result<(), Error> {
+        // Our own chain, created once and flushed every time, so a
+        // removed network stops being isolated against and a re-added
+        // one is not isolated twice.
+        let _ = Command::new("iptables")
+            .args(with_wait(&["-N", ISOLATION]))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        run_owned("iptables", &with_wait(&["-F", ISOLATION]))?;
+        for a in bridges {
+            for b in bridges {
+                if a == b {
+                    continue;
+                }
+                run_owned(
+                    "iptables",
+                    &with_wait(&["-A", ISOLATION, "-i", a, "-o", b, "-j", "DROP"]),
+                )?;
+            }
+        }
+        // Deleted and re-inserted at position 1, every time, rather than
+        // left alone when present. `ensure_forward` inserts its blanket
+        // accepts with `-I` - at the TOP - so every container started
+        // after the first pushed its accepts above an existing jump, and
+        // the jump stopped seeing packets. The symptom is isolation that
+        // works until the second container on the second network.
+        //
+        // Deleting a rule that is not there fails harmlessly, which is
+        // why the result is discarded.
+        let _ = Command::new("iptables")
+            .args(with_wait(&["-D", "FORWARD", "-j", ISOLATION]))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        run_owned(
+            "iptables",
+            &with_wait(&["-I", "FORWARD", "1", "-j", ISOLATION]),
+        )?;
         Ok(())
     }
 

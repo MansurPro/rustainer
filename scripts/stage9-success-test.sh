@@ -176,7 +176,11 @@ check "no veth outlives its container" "$VETHS" "0"
 
 echo
 echo "7. Refusals stay explicit"
-"$B" run --network nonsense --layer "$BASE" /bin/true 2>&1 | grep -q 'not supported' \
+# The wording changed at stage 23, when a name that is not one of the
+# three modes became a thing you can CREATE. The refusal now points at
+# the command that would make it, which is more useful than "not
+# supported" ever was.
+"$B" run --network nonsense --layer "$BASE" /bin/true 2>&1 | grep -q 'is not a network' \
     && ok "an unknown network mode refuses" || bad "an unknown network mode was accepted"
 
 echo

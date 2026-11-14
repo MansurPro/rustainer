@@ -82,17 +82,17 @@ pub enum Fetched {
     Manifest(Manifest),
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Descriptor {
     #[serde(rename = "mediaType")]
     pub media_type: String,
     pub digest: String,
     pub size: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Platform {
     #[serde(default)]
     pub os: String,
@@ -108,11 +108,25 @@ pub struct Index {
     pub manifests: Vec<Descriptor>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
+    /// Written on the way out, defaulted on the way in: a registry may
+    /// put the media type only in the Content-Type header.
+    #[serde(rename = "schemaVersion", default = "two")]
+    pub schema_version: u32,
+    #[serde(
+        rename = "mediaType",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub media_type: String,
     pub config: Descriptor,
     #[serde(default)]
     pub layers: Vec<Descriptor>,
+}
+
+fn two() -> u32 {
+    2
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -146,6 +160,15 @@ pub struct ConfigSection {
 pub struct Client {
     agent: ureq::Agent,
     token: Option<String>,
+    /// `user:password`, for registries that will not hand out a push
+    /// token to nobody - which is all of them. Supplied by the caller
+    /// from a flag or the environment; never read from a file, and never
+    /// logged.
+    credentials: Option<String>,
+    /// What the token was taken out for. A pull token is not a push
+    /// token, and a registry that issued one will reject the other with
+    /// a 401 that looks exactly like "you are not logged in".
+    scope: &'static str,
 }
 
 impl Default for Client {
@@ -167,7 +190,21 @@ impl Client {
                 .build()
                 .new_agent(),
             token: None,
+            credentials: None,
+            scope: "pull",
         }
+    }
+
+    /// Supply `user:password` for the token exchange.
+    pub fn with_credentials(mut self, creds: Option<String>) -> Self {
+        self.credentials = creds;
+        self
+    }
+
+    /// Ask for push rights in the next token exchange.
+    pub fn for_push(mut self) -> Self {
+        self.scope = "pull,push";
+        self
     }
 
     /// Fetch a manifest or index, verified.
@@ -315,6 +352,161 @@ impl Client {
         Err(Error::Http("authentication did not converge".into()))
     }
 
+    /// Is this blob already there?
+    ///
+    /// Asked first for every blob, because a push that re-uploads layers
+    /// the registry already has is a push that takes minutes instead of
+    /// seconds - and for a `FROM alpine` image, every layer but one is
+    /// already there.
+    pub fn blob_exists(&mut self, r: &Reference, digest: &str) -> Result<bool, Error> {
+        let url = format!("{}/v2/{}/blobs/{}", r.base_url(), r.name, digest);
+        for attempt in 0..2 {
+            let mut req = self.agent.head(&url);
+            if let Some(t) = &self.token {
+                req = req.header("Authorization", &format!("Bearer {t}"));
+            }
+            let resp = req.call().map_err(|e| Error::Http(e.to_string()))?;
+            let status = resp.status().as_u16();
+            if status == 401 && attempt == 0 {
+                let challenge = resp
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned();
+                self.authenticate(r, &challenge)?;
+                continue;
+            }
+            return Ok((200..300).contains(&status));
+        }
+        Ok(false)
+    }
+
+    /// Upload one blob, monolithically.
+    ///
+    /// Two requests, which is what the distribution spec calls the
+    /// monolithic upload: `POST` to start a session and read the
+    /// `Location` it hands back, then `PUT` the bytes to that location
+    /// with `?digest=`. Chunked uploads exist for resuming a large layer
+    /// over a bad link and are deliberately not implemented - the
+    /// failure mode they fix is "upload it again", which is survivable.
+    ///
+    /// The `Location` is used EXACTLY as given, including its query
+    /// string, and resolved against the base URL when it is relative.
+    /// Registries differ here: some return an absolute URL on another
+    /// host, some return a path, and some embed a session token in the
+    /// query that is lost if the URL is rebuilt rather than appended to.
+    /// Returns whether anything was actually uploaded, so the caller can
+    /// say which. "pushing" printed for a blob that was skipped is a
+    /// progress report that lies about where the time went.
+    pub fn push_blob(&mut self, r: &Reference, digest: &str, bytes: &[u8]) -> Result<bool, Error> {
+        if self.blob_exists(r, digest)? {
+            return Ok(false);
+        }
+        let start = format!("{}/v2/{}/blobs/uploads/", r.base_url(), r.name);
+        let location = {
+            let mut req = self.agent.post(&start).header("Content-Length", "0");
+            if let Some(t) = &self.token {
+                req = req.header("Authorization", &format!("Bearer {t}"));
+            }
+            let resp = req
+                .send(&[][..])
+                .map_err(|e| Error::Http(format!("starting an upload: {e}")))?;
+            let status = resp.status().as_u16();
+            if !(200..300).contains(&status) {
+                return Err(Error::Status {
+                    registry: r.endpoint(),
+                    status,
+                    what: "starting a blob upload".into(),
+                    body: String::new(),
+                });
+            }
+            resp.headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    Error::Http("the registry accepted an upload but gave no Location".into())
+                })?
+        };
+        let url = if location.starts_with("http") {
+            location
+        } else {
+            format!("{}{}", r.base_url(), location)
+        };
+        let sep = if url.contains('?') { '&' } else { '?' };
+        let put = format!("{url}{sep}digest={digest}");
+
+        let mut req = self
+            .agent
+            .put(&put)
+            .header("Content-Type", "application/octet-stream");
+        if let Some(t) = &self.token {
+            req = req.header("Authorization", &format!("Bearer {t}"));
+        }
+        let resp = req
+            .send(bytes)
+            .map_err(|e| Error::Http(format!("uploading a blob: {e}")))?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let mut body = Vec::new();
+            let _ = resp.into_body().into_reader().read_to_end(&mut body);
+            return Err(Error::Status {
+                registry: r.endpoint(),
+                status,
+                what: format!("uploading blob {digest}"),
+                body: String::from_utf8_lossy(&body).chars().take(300).collect(),
+            });
+        }
+        Ok(true)
+    }
+
+    /// Upload the manifest, which is what makes the tag exist.
+    ///
+    /// Last, always. A manifest naming blobs the registry does not have
+    /// is a tag that resolves to a broken image, and some registries
+    /// accept it rather than checking.
+    pub fn push_manifest(
+        &mut self,
+        r: &Reference,
+        media_type: &str,
+        bytes: &[u8],
+    ) -> Result<String, Error> {
+        let url = format!("{}/v2/{}/manifests/{}", r.base_url(), r.name, r.tag);
+        for attempt in 0..2 {
+            let mut req = self.agent.put(&url).header("Content-Type", media_type);
+            if let Some(t) = &self.token {
+                req = req.header("Authorization", &format!("Bearer {t}"));
+            }
+            let resp = req
+                .send(bytes)
+                .map_err(|e| Error::Http(format!("uploading the manifest: {e}")))?;
+            let status = resp.status().as_u16();
+            if status == 401 && attempt == 0 {
+                let challenge = resp
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned();
+                self.authenticate(r, &challenge)?;
+                continue;
+            }
+            if !(200..300).contains(&status) {
+                let mut body = Vec::new();
+                let _ = resp.into_body().into_reader().read_to_end(&mut body);
+                return Err(Error::Status {
+                    registry: r.endpoint(),
+                    status,
+                    what: "uploading the manifest".into(),
+                    body: String::from_utf8_lossy(&body).chars().take(300).collect(),
+                });
+            }
+            return Ok(sha256_hex(bytes));
+        }
+        Err(Error::Http("authentication did not converge".into()))
+    }
+
     fn authenticate(&mut self, r: &Reference, challenge: &str) -> Result<(), Error> {
         let realm = challenge_field(challenge, "realm").unwrap_or_else(|| {
             // mcr.microsoft.com never challenges at all; if something else
@@ -329,12 +521,19 @@ impl Client {
         // literal placeholder `repository:user/image:pull`, and
         // public.ecr.aws returns `scope="aws"`. A client that echoes it
         // back requests a token for a repository called `user/image`.
-        let scope = format!("repository:{}:pull", r.name);
+        let scope = format!("repository:{}:{}", r.name, self.scope);
         let token_url = format!("{realm}?service={service}&scope={scope}");
 
-        let resp = self
-            .agent
-            .get(&token_url)
+        let mut req = self.agent.get(&token_url);
+        if let Some(creds) = &self.credentials {
+            // Basic, over the TLS the base_url already insists on for
+            // anything that is not loopback.
+            req = req.header(
+                "Authorization",
+                &format!("Basic {}", base64(creds.as_bytes())),
+            );
+        }
+        let resp = req
             .call()
             .map_err(|e| Error::Http(format!("fetching a token from {realm}: {e}")))?;
         if !(200..300).contains(&resp.status().as_u16()) {
@@ -363,6 +562,33 @@ impl Client {
 }
 
 /// Pull `name="value"` out of a `WWW-Authenticate` header.
+/// Base64, for one `Authorization: Basic` header.
+///
+/// Sixteen lines rather than a dependency: this is the only place the
+/// whole engine needs it, and a crate whose job is an alphabet is a crate
+/// whose advisories we would track forever.
+fn base64(input: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for c in input.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        out.push(A[(n >> 18 & 63) as usize] as char);
+        out.push(A[(n >> 12 & 63) as usize] as char);
+        out.push(if c.len() > 1 {
+            A[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            A[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 pub fn challenge_field(challenge: &str, name: &str) -> Option<String> {
     let needle = format!("{name}=\"");
     let start = challenge.find(&needle)? + needle.len();

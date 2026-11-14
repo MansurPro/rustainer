@@ -156,7 +156,7 @@ echo "6. Unsupported options refuse, and say what would support them"
 "$B" run --rootfs /etc/hostname --network host /bin/true 2>&1 | grep -q 'not a directory' && ok "a non-directory rootfs refuses" || bad "a non-directory rootfs did not refuse"
 # `bridge` is the default from stage 9 on, so it is no longer a refusal.
 # What must still refuse is a mode that does not exist.
-"$B" run --rootfs / --network nonsense /bin/true 2>&1 | grep -q 'not supported' && ok "an unknown network mode refuses" || bad "an unknown network mode was accepted"
+"$B" run --rootfs / --network nonsense /bin/true 2>&1 | grep -q 'is not a network' && ok "an unknown network mode refuses" || bad "an unknown network mode was accepted"
 "$B" run --rootfs / --network host sh 2>&1 | grep -q 'absolute path'      && ok "relative command refuses" || bad "relative command did not refuse"
 
 echo

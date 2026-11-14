@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod build;
+mod dockerfile;
 mod stack;
 
 use anyhow::{Context, Result, bail};
@@ -70,8 +72,12 @@ enum Command {
     Logs(LogsArgs),
     /// Run a command inside a running container.
     Exec(ExecArgs),
+    /// Build an image from a Dockerfile.
+    Build(BuildArgs),
     /// Download an image and extract it into the local store.
     Pull(PullArgs),
+    /// Upload a local image to a registry.
+    Push(PushArgs),
     /// List images in the local store.
     Images,
     /// Remove an image from the local store.
@@ -79,6 +85,11 @@ enum Command {
     /// List or remove named volumes.
     #[command(subcommand)]
     Volume(VolumeCmd),
+    /// Create, list or remove user-defined networks.
+    #[command(subcommand)]
+    Network(NetworkCmd),
+    /// Show what the engine has done: starts, exits, restarts, pulls.
+    Events(EventsArgs),
     /// Serve the local web UI and HTTP API.
     Serve(ServeArgs),
     /// Start, stop and inspect a stack of containers described in a file.
@@ -87,6 +98,21 @@ enum Command {
     /// Internal: become the supervisor for an already-prepared container.
     #[command(hide = true)]
     Supervise { id: String },
+
+    /// Internal: forward a host port to a container, in a process of its
+    /// own.
+    ///
+    /// A process rather than a thread in the supervisor, because the
+    /// supervisor has to be able to call `clone3` and `clone3` refuses a
+    /// process that has ever had a second thread.
+    #[command(hide = true)]
+    Forward {
+        /// An already-bound listening socket, inherited across the exec.
+        #[arg(long)]
+        fd: i32,
+        #[arg(long)]
+        to: String,
+    },
 }
 
 // `Default` so a stack can build one field by field. clap fills every
@@ -136,6 +162,22 @@ struct RunArgs {
     /// Repeatable.
     #[arg(short = 'v', long = "volume")]
     volumes: Vec<String>,
+
+    /// What to do when the container exits: `no` (the default), `always`,
+    /// `unless-stopped`, or `on-failure[:attempts]`.
+    #[arg(long, default_value = "no")]
+    restart: String,
+
+    /// Give the container a pseudo-terminal. Programs ask `isatty(1)` and
+    /// behave differently: a shell prints a prompt, `^C` arrives as a
+    /// signal rather than as the byte 0x03, and `ls` colours its output.
+    #[arg(short = 't', long)]
+    tty: bool,
+
+    /// Keep stdin open and connected. With `-t` this is an interactive
+    /// session; `-it` together is the usual spelling.
+    #[arg(short = 'i', long)]
+    interactive: bool,
 
     /// Set an environment entry, `KEY=VALUE`. Replaces the image's own
     /// entry for that key rather than shadowing it. Repeatable.
@@ -273,6 +315,69 @@ struct StackArgs {
 }
 
 #[derive(Args)]
+struct PushArgs {
+    /// The image in the local store.
+    image: String,
+
+    /// Where to push it. Defaults to the same reference.
+    #[arg(long)]
+    to: Option<String>,
+
+    /// `user:password` for the registry. Prefer the environment variable
+    /// RUSTAINER_REGISTRY_AUTH, which does not appear in `ps` output or
+    /// in your shell history.
+    #[arg(long)]
+    creds: Option<String>,
+}
+
+#[derive(Args)]
+struct BuildArgs {
+    /// Name for the built image, e.g. `-t myapp:1`.
+    #[arg(short = 't', long = "tag")]
+    tag: String,
+
+    /// The Dockerfile. `<context>/Dockerfile` by default.
+    #[arg(short = 'f', long)]
+    file: Option<PathBuf>,
+
+    /// Set a build argument, `KEY=value`. Repeatable.
+    #[arg(long = "build-arg")]
+    build_args: Vec<String>,
+
+    /// The network a RUN step gets: `bridge`, `none`, `host`, or one
+    /// you created. The same values `run --network` takes, because a
+    /// step is an ordinary container.
+    ///
+    /// `none` is the one worth knowing about. A bridge needs
+    /// CAP_NET_ADMIN in the user namespace that owns the HOST's network
+    /// namespace, which a nested one can never have, so without this a
+    /// build is impossible rootless even when no step wants the network.
+    /// It is also how a build is made hermetic: a step that cannot
+    /// reach a registry cannot quietly depend on one.
+    #[arg(long, default_value = "bridge")]
+    network: String,
+
+    /// The build context: the directory COPY may read from.
+    #[arg(default_value = ".")]
+    context: PathBuf,
+}
+
+#[derive(Args)]
+struct EventsArgs {
+    /// Only events from the last N seconds.
+    #[arg(long, default_value_t = 3600)]
+    since: u64,
+
+    /// At most this many, newest last.
+    #[arg(long, default_value_t = 200)]
+    limit: usize,
+
+    /// Keep printing as they happen.
+    #[arg(short, long)]
+    follow: bool,
+}
+
+#[derive(Args)]
 struct ServeArgs {
     /// Address to listen on. Loopback by default, and for a reason: there
     /// is no authentication, and anything that can reach this port can
@@ -283,6 +388,21 @@ struct ServeArgs {
     /// Print the URL and exit without serving. For scripts and tests.
     #[arg(long, hide = true)]
     check: bool,
+}
+
+#[derive(Subcommand)]
+enum NetworkCmd {
+    /// Create a network with a bridge and subnet of its own.
+    Create {
+        name: String,
+        /// `10.89.N.0/24` by default, picked from what is free.
+        #[arg(long)]
+        subnet: Option<String>,
+    },
+    /// List networks.
+    Ls,
+    /// Remove a network. Refused while containers are on it.
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -306,6 +426,14 @@ struct ExecArgs {
     /// Run as `uid[:gid]`. Defaults to the user the container runs as.
     #[arg(short = 'u', long)]
     user: Option<String>,
+
+    /// Give the command a pseudo-terminal.
+    #[arg(short = 't', long)]
+    tty: bool,
+
+    /// Keep stdin open. `-it` together is the usual spelling.
+    #[arg(short = 'i', long)]
+    interactive: bool,
 
     id: String,
 
@@ -350,13 +478,18 @@ fn real_main() -> Result<ExitCode> {
         Command::Rm(a) => cmd_rm(&paths, a),
         Command::Logs(a) => cmd_logs(&paths, a),
         Command::Exec(a) => cmd_exec(&paths, a),
+        Command::Build(a) => cmd_build(&paths, a),
         Command::Pull(a) => cmd_pull(a),
+        Command::Push(a) => cmd_push(&paths, a),
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
         Command::Volume(a) => cmd_volume(a),
+        Command::Network(a) => cmd_network(&paths, a),
+        Command::Events(a) => cmd_events(&paths, a),
         Command::Serve(a) => cmd_serve(cli_root.clone(), a),
         Command::Stack(a) => cmd_stack(&paths, a),
         Command::Supervise { id } => cmd_supervise(&paths, &id),
+        Command::Forward { fd, to } => cmd_forward(fd, &to),
     }
 }
 
@@ -376,11 +509,22 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             );
             (false, false)
         }
-        other => bail!(
-            "--network {other} is not supported. `bridge` gives the container an address \
-             and a route off the machine; `none` gives it only loopback; `host` shares \
-             the host's stack. Custom networks are not implemented."
-        ),
+        other => {
+            if networks_dir().join(format!("{other}.json")).exists() {
+                (true, true)
+            } else {
+                bail!(
+                    "--network {other} is not a network. `bridge` gives the container an \
+                     address on the engine's own bridge; `none` gives it only loopback; \
+                     `host` shares the host's stack. Make a network of your own with \
+                     `rustainer network create {other}`."
+                )
+            }
+        }
+    };
+    let network_def = match args.network.as_str() {
+        "bridge" | "none" | "host" => None,
+        other => Some(load_network(other)?),
     };
 
     // Three shapes, chosen by --rootfs:
@@ -569,6 +713,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
 
     // An address, before the container exists: the netlink messages the
     // container sends to configure itself are built from it in the parent.
+    let net_def = network_def.clone().unwrap_or_default();
     let lease = match (bridge, &args.ip) {
         (false, Some(ip)) => bail!(
             "--ip {ip} needs --network bridge: with `none` there is no interface to \
@@ -582,11 +727,11 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             ip: ip
                 .parse()
                 .with_context(|| format!("--ip {ip:?} is not an IPv4 address"))?,
-            prefix: rustainer_core::net::SUBNET_PREFIX,
-            gateway: rustainer_core::net::GATEWAY,
+            prefix: net_def.prefix,
+            gateway: net_def.gateway,
         }),
         (true, None) => Some(
-            rustainer_core::net::allocate(&paths_root(paths))
+            rustainer_core::net::allocate_in(&paths_root(paths), &net_def)
                 .context("allocating an address for the container")?,
         ),
     };
@@ -613,6 +758,9 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .iter()
         .map(|v| parse_volume(v))
         .collect::<Result<Vec<_>>>()?;
+
+    let (restart_policy, restart_max) = supervise::RestartPolicy::parse(&args.restart)
+        .map_err(|e| anyhow::anyhow!("--restart: {e}"))?;
 
     let config = Config {
         id: id.clone(),
@@ -662,7 +810,11 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         // overlayfs, and overlayfs cannot host an upperdir at all.
         private_net,
         bridge,
+        network: network_def.clone(),
         userns,
+        tty: args.tty,
+        restart: restart_policy,
+        restart_max,
         volumes,
         stack: args.stack_name.clone(),
         service: args.service_name.clone(),
@@ -738,12 +890,24 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .context("locking the container directory")?;
 
     let (handshake_rx, handshake_tx) = sys::pipe()?;
-    let mut child = spawn_supervisor(paths, &id, handshake_tx, args.detach)?;
+    let interactive = !args.detach && (args.tty || args.interactive);
+    let mut child = spawn_supervisor(paths, &id, handshake_tx, args.detach, interactive)?;
     let init_pid = read_handshake(paths, &handshake_rx, &mut child, &id)?;
 
     // Release before doing anything slow: `stop` and `rm` on this container
     // must not be blocked by a foreground `run` that is merely waiting.
     drop(lock);
+
+    rustainer_core::events::record(
+        paths,
+        "create",
+        &id,
+        serde_json::json!({
+            "image": config.rootfs.clone().unwrap_or_default(),
+            "command": config.argv.join(" "),
+            "detached": args.detach,
+        }),
+    );
 
     if args.detach {
         // Reap the supervisor's *launcher* relationship: it is our child
@@ -753,6 +917,19 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Raw mode here, in the CLI, because the CLI owns the terminal: no
+    // line buffering so a keystroke arrives at once, no echo so the
+    // container's is the only one, and no signal generation so `^C`
+    // reaches the container as a byte and becomes SIGINT *there*.
+    //
+    // The guard restores it on every path out, including a panic, which
+    // is the whole reason it is a guard: a shell left in raw mode is a
+    // shell the user has to `reset` blind.
+    let _raw = if interactive && args.tty {
+        rustainer_core::pty::RawMode::enter(0)
+    } else {
+        None
+    };
     let status = wait_foreground(paths, &id, &mut child, init_pid)?;
     Ok(ExitCode::from(status.min(255) as u8))
 }
@@ -767,6 +944,7 @@ fn spawn_supervisor(
     id: &str,
     handshake_tx: OwnedFd,
     detach: bool,
+    interactive: bool,
 ) -> Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -783,7 +961,15 @@ fn spawn_supervisor(
         .arg("supervise")
         .arg(id);
 
-    cmd.stdin(Stdio::null());
+    // The supervisor relays the pty, so for an interactive run it needs
+    // our terminal - all three descriptors, not just the two it normally
+    // tees onto. Everything else gets /dev/null, because a container is
+    // not entitled to read the operator's keyboard unless asked.
+    cmd.stdin(if interactive {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    });
     if detach {
         // Detached: the container's output goes to the log files only -
         // but the SUPERVISOR's own stderr is kept, in a file of its own.
@@ -1000,15 +1186,42 @@ fn cmd_ps(paths: &Paths, args: PsArgs) -> Result<ExitCode> {
 }
 
 fn cmd_exec(paths: &Paths, args: ExecArgs) -> Result<ExitCode> {
-    let req = exec::Request {
+    let mut req = exec::Request {
         argv: args.command,
         env: args.env,
         workdir: args.workdir,
         // Passed through unparsed: a name is only meaningful against this
         // container's /etc/passwd, which exec can read and we cannot.
         user: args.user,
+        stdio: None,
+        tty: args.tty,
+        master: None,
     };
-    let exit = exec::exec(paths, &args.id, &req).with_context(|| format!("exec in {}", args.id))?;
+
+    // The pty is allocated HERE rather than in `exec`, because the
+    // terminal being attached to is this process's, and the raw-mode
+    // guard below has to outlive the call.
+    let _raw = if args.tty {
+        let pty = rustainer_core::pty::open().context("allocating a pseudo-terminal")?;
+        if let Some((rows, cols)) = rustainer_core::pty::size_of(0) {
+            let _ = rustainer_core::pty::set_size(&pty.master, rows, cols);
+        }
+        req.stdio = Some(rustainer_core::child::Stdio {
+            stdin: pty.slave.try_clone()?,
+            stdout: pty.slave.try_clone()?,
+            stderr: pty.slave.try_clone()?,
+        });
+        req.master = Some(pty.master);
+        // Our own copy of the slave goes now. While any descriptor on it
+        // is open the master never reports EOF, and the relay would wait
+        // for an end that cannot come.
+        drop(pty.slave);
+        rustainer_core::pty::RawMode::enter(0)
+    } else {
+        None
+    };
+    let exit =
+        exec::exec(paths, &args.id, &mut req).with_context(|| format!("exec in {}", args.id))?;
     // The exec'd command's status, not ours: `rustainer exec sh -c 'exit 7'`
     // has to be usable in a shell conditional the same way `docker exec` is.
     Ok(ExitCode::from(exit.to_shell_status().min(255) as u8))
@@ -1059,6 +1272,12 @@ fn cmd_pull(args: PullArgs) -> Result<ExitCode> {
         eprintln!("rustainer: refused a device node in the image: {d}");
     }
     warn_about_whiteouts(&image.report);
+    rustainer_core::events::record(
+        &Paths::new(Paths::default_root()),
+        "pull",
+        &args.image,
+        serde_json::json!({ "digest": image.digest }),
+    );
     println!("{}", image.digest);
     Ok(ExitCode::SUCCESS)
 }
@@ -1101,6 +1320,194 @@ fn parse_add_host(spec: &str) -> Result<(String, String)> {
         .parse()
         .with_context(|| format!("--add-host {spec:?}: {ip:?} is not an IPv4 address"))?;
     Ok((name.to_owned(), addr.to_string()))
+}
+
+/// Where user-defined networks are recorded.
+///
+/// Beside the volumes, because a network outlives a reboot in the same
+/// way: the bridge does not, but the NAME, the subnet and the containers
+/// that reference it all do, and recreating the bridge from the record is
+/// what the first container on it does anyway.
+fn networks_dir() -> PathBuf {
+    Store::default_root().join("networks")
+}
+
+fn load_network(name: &str) -> Result<rustainer_core::net::Network> {
+    let p = networks_dir().join(format!("{name}.json"));
+    let text = std::fs::read_to_string(&p)
+        .with_context(|| format!("no network {name:?}. `rustainer network ls` lists them."))?;
+    serde_json::from_str(&text).with_context(|| format!("reading the network {name:?}"))
+}
+
+fn all_networks() -> Vec<rustainer_core::net::Network> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(networks_dir()) {
+        for e in rd.flatten() {
+            if e.path().extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(t) = std::fs::read_to_string(e.path())
+                && let Ok(n) = serde_json::from_str(&t)
+            {
+                out.push(n);
+            }
+        }
+    }
+    out.sort_by(|a: &rustainer_core::net::Network, b| a.name.cmp(&b.name));
+    out
+}
+
+fn cmd_network(paths: &Paths, cmd: NetworkCmd) -> Result<ExitCode> {
+    use rustainer_core::net::Network;
+    match cmd {
+        NetworkCmd::Create { name, subnet } => {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                bail!("{name:?} is not a usable network name");
+            }
+            if matches!(name.as_str(), "bridge" | "none" | "host") {
+                bail!(
+                    "{name:?} is one of the three built-in network modes, so a network \
+                     of that name could never be selected"
+                );
+            }
+            std::fs::create_dir_all(networks_dir())?;
+            let path = networks_dir().join(format!("{name}.json"));
+            if path.exists() {
+                bail!("a network called {name:?} already exists");
+            }
+            let existing = all_networks();
+            let (gateway, prefix) = match &subnet {
+                Some(cidr) => parse_subnet(cidr)?,
+                None => {
+                    // 10.89.N.0/24, taking the first N nobody is using.
+                    // Deliberately not in 172.16/12: Docker allocates
+                    // there, and two engines on one host colliding on a
+                    // subnet is a routing bug nobody enjoys.
+                    let used: Vec<u8> = existing
+                        .iter()
+                        .filter(|n| n.gateway.octets()[..2] == [10, 89])
+                        .map(|n| n.gateway.octets()[2])
+                        .collect();
+                    let third = (0u8..=254)
+                        .find(|n| !used.contains(n))
+                        .ok_or_else(|| anyhow::anyhow!("no free subnet in 10.89.0.0/16"))?;
+                    (std::net::Ipv4Addr::new(10, 89, third, 1), 24)
+                }
+            };
+            for n in &existing {
+                if n.gateway == gateway {
+                    bail!("the network {:?} already uses {gateway}", n.name);
+                }
+            }
+            let net = Network {
+                name: name.clone(),
+                bridge: Network::bridge_for(&name),
+                gateway,
+                prefix,
+            };
+            std::fs::write(&path, serde_json::to_vec_pretty(&net)?)?;
+            rustainer_core::events::record(
+                paths,
+                "network-create",
+                &name,
+                serde_json::json!({ "subnet": format!("{gateway}/{prefix}"), "bridge": net.bridge }),
+            );
+            println!("{name}");
+        }
+        NetworkCmd::Ls => {
+            println!(
+                "{:<20} {:<20} {:<18} CONTAINERS",
+                "NAME", "SUBNET", "BRIDGE"
+            );
+            let mut rows = vec![Network::default()];
+            rows.extend(all_networks());
+            for n in rows {
+                let count = containers_on(paths, &n.name).len();
+                println!(
+                    "{:<20} {:<20} {:<18} {}",
+                    n.name,
+                    format!("{}/{}", n.gateway, n.prefix),
+                    n.bridge,
+                    count
+                );
+            }
+        }
+        NetworkCmd::Rm { name } => {
+            if name.contains('/') || name.contains("..") {
+                bail!("{name:?} is not a network name");
+            }
+            let on_it = containers_on(paths, &name);
+            if !on_it.is_empty() {
+                bail!(
+                    "{} container(s) are still on {name}: {}. Remove them first - \
+                     taking the network away under a running container leaves it with \
+                     an address nothing routes.",
+                    on_it.len(),
+                    on_it.join(", ")
+                );
+            }
+            let path = networks_dir().join(format!("{name}.json"));
+            if !path.exists() {
+                bail!("no network {name:?}");
+            }
+            std::fs::remove_file(&path)?;
+            rustainer_core::events::record(paths, "network-remove", &name, serde_json::json!({}));
+            println!("{name}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `10.89.3.0/24` or `10.89.3.1/24` - the gateway is always `.1`.
+fn parse_subnet(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
+    let (addr, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("{cidr:?} is not a CIDR subnet like 10.89.3.0/24"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{prefix:?} is not a prefix length"))?;
+    if !(8..=24).contains(&prefix) {
+        bail!("a prefix of /{prefix} is not supported; use between /8 and /24");
+    }
+    let a: std::net::Ipv4Addr = addr
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{addr:?} is not an IPv4 address"))?;
+    let o = a.octets();
+    Ok((std::net::Ipv4Addr::new(o[0], o[1], o[2], 1), prefix))
+}
+
+/// Which containers are on a network right now.
+///
+/// Read from the containers themselves rather than from a membership
+/// list: a list would be a second thing to keep correct, and a container
+/// that died without updating it would leave the network permanently
+/// un-removable.
+fn containers_on(paths: &Paths, network: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for id in paths.list().unwrap_or_default() {
+        let Ok(cfg) = Config::load(paths, &id) else {
+            continue;
+        };
+        let name = cfg
+            .network
+            .as_ref()
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| "bridge".into());
+        if name != network || !cfg.bridge {
+            continue;
+        }
+        if State::load(paths, &id)
+            .map(|s| matches!(s.observed_status(), Status::Running | Status::Created))
+            .unwrap_or(false)
+        {
+            out.push(id);
+        }
+    }
+    out
 }
 
 fn volumes_root() -> PathBuf {
@@ -1363,6 +1770,91 @@ fn stack_ps(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn cmd_forward(fd: i32, to: &str) -> Result<ExitCode> {
+    use rustainer_core::firewall::Publish;
+    use std::os::fd::FromRawFd;
+    let (a, p) = to
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("{to:?} is not address:port"))?;
+    let container_ip: std::net::Ipv4Addr = a
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{a:?} is not an IPv4 address"))?;
+    let container_port: u16 = p
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{p:?} is not a port"))?;
+    // SAFETY: the supervisor bound this listener and dup'd it onto this
+    // descriptor immediately before the execve that produced us.
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    let local = listener.local_addr()?;
+    let (host_ip, host_port) = match local {
+        std::net::SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
+        _ => bail!("the inherited listener is not IPv4"),
+    };
+    let mut f = rustainer_core::proxy::Forwarder::from_listener(
+        listener,
+        Publish {
+            host_ip,
+            host_port,
+            container_ip,
+            container_port,
+        },
+    )
+    .with_context(|| format!("forwarding {local} to {to}"))?;
+    // Until killed. The supervisor owns this process and ends it when the
+    // container's ports are torn down.
+    loop {
+        std::thread::park();
+        let _ = &mut f;
+    }
+}
+
+fn cmd_events(paths: &Paths, args: EventsArgs) -> Result<ExitCode> {
+    use rustainer_core::events;
+    let now = rustainer_core::state::now();
+    let mut since = now.saturating_sub(args.since);
+    let mut seen = 0usize;
+    loop {
+        let batch = events::read(paths, since, args.limit);
+        for e in &batch {
+            let at = e["at"].as_u64().unwrap_or(0);
+            // Printed as a local clock time rather than a unix second:
+            // the reader is looking for "what happened just now", and
+            // 1794678683 answers a different question.
+            let hhmmss = {
+                let secs = at % 86400;
+                format!(
+                    "{:02}:{:02}:{:02}",
+                    secs / 3600,
+                    (secs % 3600) / 60,
+                    secs % 60
+                )
+            };
+            println!(
+                "{hhmmss}  {:<10} {:<14} {}",
+                e["kind"].as_str().unwrap_or("?"),
+                e["id"].as_str().unwrap_or("-"),
+                e["detail"]
+            );
+            since = at.max(since);
+            seen += 1;
+        }
+        if !args.follow {
+            break;
+        }
+        // Polling, not inotify: the file is appended to by processes that
+        // come and go, and a 400ms poll on a small file costs nothing
+        // next to the complexity of watching it properly.
+        std::thread::sleep(Duration::from_millis(400));
+        // `since` is a whole second, so events written later in the same
+        // second would repeat. Step past it once we have seen anything.
+        if seen > 0 {
+            since += 1;
+            seen = 0;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_serve(root: Option<PathBuf>, args: ServeArgs) -> Result<ExitCode> {
     use std::net::{TcpListener, ToSocketAddrs};
 
@@ -1442,6 +1934,34 @@ fn cmd_volume(cmd: VolumeCmd) -> Result<ExitCode> {
             println!("{name}");
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_push(paths: &Paths, args: PushArgs) -> Result<ExitCode> {
+    let target = args.to.clone().unwrap_or_else(|| args.image.clone());
+    // The flag loses to the environment variable deliberately: a password
+    // on a command line is in `ps` for everyone on the machine and in the
+    // shell history forever.
+    let creds = std::env::var("RUSTAINER_REGISTRY_AUTH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(args.creds);
+    let store = Store::new(Store::default_root());
+    let digest = store
+        // Printed verbatim: the message already says whether anything
+        // was uploaded, and a wrapper that prefixes "pushing" onto
+        // "is already there" is a progress report that contradicts
+        // itself.
+        .push(&args.image, &target, creds, |what| println!("{what}"))
+        .with_context(|| format!("pushing {} to {target}", args.image))?;
+    rustainer_core::events::record(
+        paths,
+        "push",
+        &target,
+        serde_json::json!({ "digest": digest }),
+    );
+    println!("{digest}");
+    println!("pushed {target}");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1685,4 +2205,281 @@ fn new_id() -> Result<String> {
         .context("opening /dev/urandom")?
         .read_exact(&mut b)?;
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+// ---------------------------------------------------------------------------
+// build
+// ---------------------------------------------------------------------------
+
+/// Build an image, running each filesystem step as a real container.
+///
+/// The step's own overlay **upper directory is the new layer**: overlayfs
+/// has already written down exactly what changed, including the
+/// deletions, which it records as the same `0:0` character devices this
+/// engine's layer store uses. Nothing has to diff anything.
+///
+/// Which means the build inherits the engine's isolation, cgroups,
+/// networking and security posture for free, because it is not a second
+/// implementation of any of them.
+fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
+    use crate::dockerfile::Instruction;
+    use std::collections::BTreeMap;
+
+    let context = args.context.canonicalize().with_context(|| {
+        format!(
+            "the build context {} does not exist",
+            args.context.display()
+        )
+    })?;
+    let file = args
+        .file
+        .clone()
+        .unwrap_or_else(|| context.join("Dockerfile"));
+    let text =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    let instructions = crate::dockerfile::parse(&text)?;
+
+    let mut vars: BTreeMap<String, String> = BTreeMap::new();
+    for a in &args.build_args {
+        let (k, v) = a
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--build-arg {a:?} is not KEY=value"))?;
+        vars.insert(k.to_owned(), v.to_owned());
+    }
+
+    let store = Store::new(Store::default_root());
+    let mut built = build::Built {
+        layers: Vec::new(),
+        diff_ids: Vec::new(),
+        env: Vec::new(),
+        workdir: None,
+        user: None,
+        cmd: Vec::new(),
+        entrypoint: Vec::new(),
+        labels: BTreeMap::new(),
+        exposed: Vec::new(),
+    };
+    // Layers are sealed as they are produced, and their tars kept, so the
+    // image can be pushed later without rebuilding it.
+    let mut sealed: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
+    let mut base_diff_ids: Vec<String> = Vec::new();
+    let mut base_descriptors: Vec<rustainer_image::registry::Descriptor> = Vec::new();
+    let staging = Store::default_root().join("build").join(new_id()?);
+    std::fs::create_dir_all(&staging)?;
+    let cleanup_staging = || {
+        let _ = std::fs::remove_dir_all(&staging);
+    };
+
+    let total = instructions.len();
+    for (n, ins) in instructions.iter().enumerate() {
+        println!("[{}/{}] {}", n + 1, total, build::describe(ins));
+        match ins {
+            Instruction::Arg(k, default) => {
+                // A --build-arg wins over the file's default, which is the
+                // point of having a default.
+                if !vars.contains_key(k)
+                    && let Some(d) = default
+                {
+                    vars.insert(k.clone(), d.clone());
+                }
+            }
+            Instruction::From { image, .. } => {
+                if !built.layers.is_empty() {
+                    cleanup_staging();
+                    bail!(
+                        "a second FROM starts a new build stage, which is not \
+                         implemented. Multi-stage builds need a graph where this \
+                         has a list; build the stages separately and COPY between \
+                         images instead."
+                    );
+                }
+                let reference = build::expand(image, &vars);
+                let base = match store.local(&reference) {
+                    Some(i) => i,
+                    None => store
+                        .pull(&reference, false)
+                        .with_context(|| format!("pulling the base image {reference}"))?,
+                };
+                built.layers = base.layers.clone();
+                base_diff_ids = base.diff_ids.clone();
+                base_descriptors = store
+                    .manifest_for(&reference)
+                    .map(|m| m.layers)
+                    .unwrap_or_default();
+                if base_descriptors.len() != base.layers.len() {
+                    bail!(
+                        "the base image {reference} has no usable manifest in the \
+                         store, so a build on it could not be pushed. Pull it again \
+                         with `rustainer pull {reference} --force`."
+                    );
+                }
+                built.diff_ids = Vec::new();
+                built.env = base.env.clone();
+                built.workdir = base.working_dir.clone();
+                built.user = base.user.clone();
+                built.cmd = base.cmd.clone();
+                built.entrypoint = base.entrypoint.clone();
+            }
+            Instruction::Env(k, v) => {
+                let v = build::expand(v, &vars);
+                built
+                    .env
+                    .retain(|e| e.split('=').next() != Some(k.as_str()));
+                built.env.push(format!("{k}={v}"));
+                // ENV also feeds later expansions, as Docker's does.
+                vars.insert(k.clone(), v);
+            }
+            Instruction::Label(k, v) => {
+                built.labels.insert(k.clone(), build::expand(v, &vars));
+            }
+            Instruction::Workdir(w) => built.workdir = Some(build::expand(w, &vars)),
+            Instruction::User(u) => built.user = Some(build::expand(u, &vars)),
+            Instruction::Expose(p) => built.exposed.push(build::expand(p, &vars)),
+            Instruction::Cmd(c) => {
+                built.cmd = c.iter().map(|x| build::expand(x, &vars)).collect();
+            }
+            Instruction::Entrypoint(c) => {
+                built.entrypoint = c.iter().map(|x| build::expand(x, &vars)).collect();
+            }
+            Instruction::Copy {
+                sources,
+                dest,
+                from,
+            } => {
+                if from.is_some() {
+                    cleanup_staging();
+                    bail!("COPY --from needs multi-stage builds, which are not implemented");
+                }
+                let dest = build::expand(dest, &vars);
+                let layer_dir = staging.join(format!("layer{n}"));
+                std::fs::create_dir_all(&layer_dir)?;
+                // A trailing slash means "into this directory", exactly as
+                // `cp` reads it, and several sources always do.
+                let into_dir = dest.ends_with('/') || sources.len() > 1;
+                for src in sources {
+                    let src = build::expand(src, &vars);
+                    let from_path = build::resolve_source(&context, &src)?;
+                    let rel = dest.trim_start_matches('/');
+                    let target = if into_dir {
+                        layer_dir.join(rel).join(
+                            from_path
+                                .file_name()
+                                .ok_or_else(|| anyhow::anyhow!("{src:?} has no name"))?,
+                        )
+                    } else {
+                        layer_dir.join(rel)
+                    };
+                    build::copy_into(&from_path, &target)
+                        .with_context(|| format!("copying {src} into the image"))?;
+                }
+                let (diff_id, tar) = build::seal_layer(&layer_dir)?;
+                built.layers.push(layer_dir.clone());
+                built.diff_ids.push(diff_id.clone());
+                sealed.push((diff_id, layer_dir, tar));
+            }
+            Instruction::Run(argv) => {
+                let step_id = format!("build-{}", new_id()?);
+                let mut command: Vec<OsString> =
+                    vec![built.layers.first().cloned().unwrap_or_default().into()];
+                command.clear();
+                command.push(OsString::from("/"));
+                // The step is an ordinary container over the layers so
+                // far. Run in the foreground so the build waits, and with
+                // the engine's normal isolation - a build step is not
+                // entitled to more than a container is.
+                let run = RunArgs {
+                    name: Some(step_id.clone()),
+                    layer: built.layers.clone(),
+                    network: args.network.clone(),
+                    hostname: "build".into(),
+                    workdir: built.workdir.clone(),
+                    user: built.user.clone(),
+                    env: built.env.clone(),
+                    command: argv
+                        .iter()
+                        .map(|a| OsString::from(build::expand(a, &vars)))
+                        .collect(),
+                    ..Default::default()
+                };
+                let _ = cmd_run(paths, run).with_context(|| format!("running step {}", n + 1))?;
+
+                let st = State::load(paths, &step_id)
+                    .with_context(|| format!("reading the result of step {}", n + 1))?;
+                let code = st.exit_code.unwrap_or(-1);
+                let upper = Store::default_root()
+                    .join("containers")
+                    .join(&step_id)
+                    .join("upper");
+                if code != 0 {
+                    let _ = supervise::remove(paths, &step_id, true);
+                    cleanup_staging();
+                    bail!(
+                        "step {} failed with exit status {code}: {}",
+                        n + 1,
+                        build::describe(ins)
+                    );
+                }
+                // The upper IS the layer. Moved out before the container
+                // is removed, because `rm` takes its overlay directory
+                // with it.
+                let layer_dir = staging.join(format!("layer{n}"));
+                std::fs::rename(&upper, &layer_dir)
+                    .with_context(|| format!("harvesting the layer of step {}", n + 1))?;
+                let _ = supervise::remove(paths, &step_id, true);
+
+                let (diff_id, tar) = build::seal_layer(&layer_dir)?;
+                built.layers.push(layer_dir.clone());
+                built.diff_ids.push(diff_id.clone());
+                sealed.push((diff_id, layer_dir, tar));
+            }
+        }
+    }
+
+    if built.layers.is_empty() {
+        cleanup_staging();
+        bail!("the build produced no layers, so there is no image to tag");
+    }
+
+    // The base image's diff_ids come first, taken from the base image
+    // rather than from its directory NAMES: the store strips the
+    // `sha256:` prefix when naming a directory, so reading them back
+    // gives a string that looks like a diff_id and is not one.
+    let mut diff_ids: Vec<String> = base_diff_ids.clone();
+    diff_ids.extend(built.diff_ids.iter().cloned());
+
+    let config = serde_json::json!({
+        "architecture": match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        },
+        "os": "linux",
+        "config": {
+            "Env": built.env,
+            "Cmd": built.cmd,
+            "Entrypoint": built.entrypoint,
+            "WorkingDir": built.workdir,
+            "User": built.user,
+            "Labels": built.labels,
+            "ExposedPorts": built.exposed.iter()
+                .map(|p| (format!("{p}/tcp"), serde_json::json!({})))
+                .collect::<serde_json::Map<_, _>>(),
+        },
+        "rootfs": { "type": "layers", "diff_ids": diff_ids },
+    });
+    let config_bytes = serde_json::to_vec_pretty(&config)?;
+    let digest = store
+        .adopt(&base_descriptors, &sealed, &config_bytes, &args.tag)
+        .context("storing the built image")?;
+    cleanup_staging();
+
+    rustainer_core::events::record(
+        paths,
+        "build",
+        &args.tag,
+        serde_json::json!({ "digest": digest, "steps": total }),
+    );
+    println!("{digest}");
+    println!("tagged {}", args.tag);
+    Ok(ExitCode::SUCCESS)
 }

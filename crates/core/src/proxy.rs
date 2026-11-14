@@ -22,6 +22,83 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::firewall::Publish;
 
 /// A listener forwarding to one container port.
+/// A forwarder running in a **process of its own**.
+///
+/// Not a thread, and the reason is the oldest rule in this engine: a
+/// container is created by a process that has never had a second thread,
+/// because after a raw `clone` the child inherits every lock in whatever
+/// state it was in. The supervisor publishes ports and then clones - and
+/// when the publish was moved above the restart loop in stage 20, its
+/// accept thread existed before `clone3` and the engine refused to start
+/// anything at all. The invariant was right; the forwarder was in the
+/// wrong process.
+///
+/// So the supervisor spawns a child that does nothing else, and the
+/// child may have all the threads it likes. `Drop` kills it, which is
+/// what keeps a published port from outliving its container.
+pub struct Child {
+    child: std::process::Child,
+    pub published: Publish,
+}
+
+impl Child {
+    /// `exe` is the engine's own binary, re-executed with a hidden
+    /// subcommand. `/proc/self/exe`, so the sealed memfd is what runs.
+    pub fn start(exe: &str, p: Publish) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        // BOUND HERE, in the supervisor, and handed to the child as a
+        // descriptor. Binding is what RESERVES the port: a second
+        // container publishing the same one has to fail immediately with
+        // EADDRINUSE rather than quietly adding a second set of rules
+        // that never match. Spawn the child first and the bind happens
+        // where nobody is listening for its failure - which is exactly
+        // what happened, and the stage 10 test caught it.
+        //
+        // `bind` spawns no thread, so the supervisor can still clone3.
+        let listener = TcpListener::bind(SocketAddrV4::new(p.host_ip, p.host_port))?;
+        let raw = listener.as_raw_fd();
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("forward")
+            .arg("--fd")
+            .arg("3")
+            .arg("--to")
+            .arg(format!("{}:{}", p.container_ip, p.container_port))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            cmd.pre_exec(move || {
+                // dup2 clears O_CLOEXEC on the destination, which is
+                // precisely what makes the listener survive the execve.
+                if libc::dup2(raw, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn()?;
+        // Our copy goes, so the port belongs to the child alone and
+        // closing it is the child exiting.
+        drop(listener);
+        Ok(Self {
+            child,
+            published: p,
+        })
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        // Reaped, not left: the supervisor is a subreaper, and a zombie
+        // forwarder per restart would accumulate for the life of a
+        // crash-looping container.
+        let _ = self.child.wait();
+    }
+}
+
 pub struct Forwarder {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -36,7 +113,18 @@ impl Forwarder {
     /// immediately with `EADDRINUSE` instead of silently adding a second
     /// DNAT rule that never matches.
     pub fn start(p: Publish) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(SocketAddrV4::new(p.host_ip, p.host_port))?;
+        Self::from_listener(
+            TcpListener::bind(SocketAddrV4::new(p.host_ip, p.host_port))?,
+            p,
+        )
+    }
+
+    /// Take over a listener somebody else bound.
+    ///
+    /// How the forwarder process receives its port: the supervisor binds
+    /// it - which is what reserves it - and passes the descriptor across
+    /// the `execve`.
+    pub fn from_listener(listener: TcpListener, p: Publish) -> std::io::Result<Self> {
         listener.set_nonblocking(false)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);

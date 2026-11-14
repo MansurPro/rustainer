@@ -179,6 +179,15 @@ manifest_bytes = json.dumps(manifest).encode()
 manifest_digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
 
 
+# Anything pushed to us, kept in memory. A push followed by a pull of
+# the same reference is the only way to test that what we uploaded is
+# what a registry would hand back - and doing it against a registry we
+# wrote ourselves is the only way to do it without a network.
+pushed_blobs = {}
+pushed_manifests = {}
+uploads = {}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -196,10 +205,92 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET()
 
+    def _read_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n else b""
+
+    def do_POST(self):
+        # Start a blob upload. The Location carries a session id, and a
+        # client that rebuilds the URL instead of using what it was given
+        # loses it - which is why we put one here.
+        if self.path.endswith("/blobs/uploads/"):
+            name = self.path[len("/v2/"):-len("/blobs/uploads/")]
+            uid = hashlib.sha256(os.urandom(16)).hexdigest()[:16]
+            uploads[uid] = name
+            self.send_response(202)
+            self.send_header("Location", f"/v2/{name}/blobs/uploads/{uid}?state=abc")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_error(404)
+
+    def do_PUT(self):
+        path = self.path.split("?")[0]
+        query = self.path.split("?")[1] if "?" in self.path else ""
+        if "/blobs/uploads/" in path:
+            digest = None
+            for kv in query.split("&"):
+                if kv.startswith("digest="):
+                    digest = kv[len("digest="):]
+            body = self._read_body()
+            if not digest:
+                return self.send_error(400, "no digest")
+            actual = "sha256:" + hashlib.sha256(body).hexdigest()
+            if actual != digest:
+                # A registry that accepted a mismatch would hide exactly
+                # the bug this test exists to catch.
+                return self.send_error(400, "digest mismatch")
+            pushed_blobs[digest] = body
+            self.send_response(201)
+            self.send_header("Docker-Content-Digest", digest)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if "/manifests/" in path:
+            body = self._read_body()
+            ref = path.split("/manifests/")[1]
+            name = path[len("/v2/"):].split("/manifests/")[0]
+            # Blobs first, manifest last: refuse a manifest naming blobs
+            # we do not have, which is what a strict registry does and
+            # what catches a client that uploads in the wrong order.
+            try:
+                doc = json.loads(body)
+                needed = [doc["config"]["digest"]] + [l["digest"] for l in doc.get("layers", [])]
+            except Exception:
+                return self.send_error(400, "unparseable manifest")
+            missing = [d for d in needed if d not in pushed_blobs and d not in blobs]
+            if missing:
+                return self.send_error(400, f"manifest references missing blobs: {missing[0]}")
+            d = "sha256:" + hashlib.sha256(body).hexdigest()
+            pushed_manifests[(name, ref)] = (body, d, self.headers.get("Content-Type", ""))
+            pushed_manifests[(name, d)] = (body, d, self.headers.get("Content-Type", ""))
+            self.send_response(201)
+            self.send_header("Docker-Content-Digest", d)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_error(404)
+
     def do_GET(self):
         p = self.path
         if p == "/v2/" or p == "/v2":
             return self._send(b"{}", "application/json")
+        # Anything that was pushed is served back, so a push can be
+        # followed by a pull of the same reference.
+        if "/manifests/" in p:
+            name = p[len("/v2/"):].split("/manifests/")[0]
+            ref = p.split("/manifests/")[1]
+            if (name, ref) in pushed_manifests:
+                body, d, ctype = pushed_manifests[(name, ref)]
+                return self._send(
+                    body,
+                    ctype or "application/vnd.oci.image.manifest.v1+json",
+                    {"Docker-Content-Digest": d},
+                )
+        if "/blobs/" in p:
+            d = p.split("/blobs/")[1]
+            if d in pushed_blobs:
+                return self._send(pushed_blobs[d], "application/octet-stream")
         prefix = f"/v2/{NAME}/"
         if p.startswith(prefix + "manifests/"):
             ref = p[len(prefix + "manifests/"):]

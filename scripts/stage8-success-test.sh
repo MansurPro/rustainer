@@ -143,7 +143,7 @@ check "no nsfs bind mount was left" "$LEFT" "0"
 
 echo
 echo "7. Refusals stay explicit"
-"$B" run --network nonsense --layer "$BASE" /bin/true 2>&1 | grep -q 'not supported' \
+"$B" run --network nonsense --layer "$BASE" /bin/true 2>&1 | grep -q 'is not a network' \
     && ok "an unknown network mode refuses" \
     || bad "an unknown network mode was accepted"
 

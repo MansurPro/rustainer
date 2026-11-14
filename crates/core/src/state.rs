@@ -36,6 +36,25 @@ impl Paths {
 
     /// `$RUSTAINER_ROOT`, else `/run/rustainer` for root, else
     /// `$XDG_RUNTIME_DIR/rustainer`, else a per-uid directory under `/tmp`.
+    /// Where data that must outlive a reboot lives: volumes, networks,
+    /// images.
+    ///
+    /// Not the same as the runtime root, which is usually a tmpfs. Kept
+    /// here so the supervisor can find the network records without
+    /// depending on the image crate.
+    pub fn data_root() -> PathBuf {
+        if let Some(v) = std::env::var_os("RUSTAINER_IMAGE_ROOT") {
+            return PathBuf::from(v);
+        }
+        if rustix::process::geteuid().is_root() {
+            return PathBuf::from("/var/lib/rustainer");
+        }
+        match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h).join(".local/share/rustainer"),
+            None => PathBuf::from("/tmp/rustainer-images"),
+        }
+    }
+
     pub fn default_root() -> PathBuf {
         if let Some(v) = std::env::var_os("RUSTAINER_ROOT") {
             return PathBuf::from(v);
@@ -189,6 +208,15 @@ pub struct State {
     /// `inspect` can explain a container that exited 127 three days ago.
     #[serde(default)]
     pub error: Option<String>,
+    /// A `stop` was asked for. Read by the supervisor after the container
+    /// exits, so that `--restart always` does not immediately undo what
+    /// the operator just did - which is Docker's rule too, and the only
+    /// one that makes `stop` mean anything.
+    #[serde(default)]
+    pub stop_requested: bool,
+    /// How many times the restart policy has restarted it.
+    #[serde(default)]
+    pub restarts: u32,
 }
 
 impl State {
@@ -210,6 +238,8 @@ impl State {
             rootfs: None,
             hostname: None,
             error: None,
+            stop_requested: false,
+            restarts: 0,
         }
     }
 

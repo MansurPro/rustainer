@@ -59,6 +59,10 @@ pub struct Server {
     /// re-executes the sealed image.
     exe: PathBuf,
     root_arg: Option<String>,
+    /// Live terminal sessions, by id. The only state this server has,
+    /// and it is deliberately not persisted: a session is a live pty
+    /// and a live process, and neither survives the server anyway.
+    terms: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Term>>>,
 }
 
 impl Server {
@@ -67,6 +71,7 @@ impl Server {
             paths,
             exe: PathBuf::from("/proc/self/exe"),
             root_arg,
+            terms: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -119,6 +124,28 @@ impl Server {
             ("GET", "/api/images") => return http::json(stream, 200, &self.images()),
             ("POST", "/api/images/pull") => return self.pull(stream, req),
             ("GET", "/api/volumes") => return http::json(stream, 200, &self.volumes()),
+            ("GET", "/api/networks") => return http::json(stream, 200, &self.networks()),
+            ("POST", "/api/build") => return self.build(stream, req),
+            ("GET", "/api/events") => {
+                let since = req
+                    .param("since")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let limit = req
+                    .param("limit")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(200)
+                    .min(2000);
+                return http::json(
+                    stream,
+                    200,
+                    &serde_json::Value::Array(rustainer_core::events::read(
+                        &self.paths,
+                        since,
+                        limit,
+                    )),
+                );
+            }
             _ => {}
         }
 
@@ -138,10 +165,35 @@ impl Server {
                 ("POST", "stop") => self.run_cli(stream, &["stop", "-t", "5", &id]),
                 ("POST", "kill") => self.run_cli(stream, &["stop", "-t", "0", &id]),
                 ("POST", "exec") => self.exec(stream, &id, req),
+                ("POST", "term") => self.term_open(stream, &id, req),
                 ("DELETE", "") => self.run_cli(stream, &["rm", "--force", &id]),
                 ("GET", "") => http::json(stream, 200, &self.one(&id)),
                 _ => http::error(stream, 405, "no such container action"),
             };
+        }
+
+        if let Some(rest) = path.strip_prefix("/api/term/") {
+            let (session, action) = match rest.split_once('/') {
+                Some((s, a)) => (s, a),
+                None => (rest, ""),
+            };
+            if !is_safe_id(session) {
+                return http::error(stream, 400, "not a session id");
+            }
+            return match (method, action) {
+                ("GET", "out") => self.term_read(stream, session, req),
+                ("POST", "in") => self.term_write(stream, session, req),
+                ("DELETE", "") => self.term_close(stream, session),
+                _ => http::error(stream, 405, "no such terminal action"),
+            };
+        }
+
+        if let Some(name) = path.strip_prefix("/api/networks/") {
+            let name = http::percent_decode(name);
+            if method != "DELETE" {
+                return http::error(stream, 405, "only DELETE");
+            }
+            return self.run_cli(stream, &["network", "rm", &name]);
         }
 
         if let Some(name) = path.strip_prefix("/api/volumes/") {
@@ -202,6 +254,8 @@ impl Server {
                 (Status::Running | Status::Created, Some(p)) => Value::from(p),
                 _ => Value::Null,
             },
+            "restarts": st.restarts,
+            "restart_policy": cfg.as_ref().map(|c| format!("{:?}", c.restart).to_lowercase()),
             "stack": cfg.as_ref().and_then(|c| c.stack.clone()),
             "service": cfg.as_ref().and_then(|c| c.service.clone()),
             "command": st.command.join(" "),
@@ -366,6 +420,21 @@ impl Server {
         self.run_cli(stream, &refs)
     }
 
+    fn build(&self, stream: &mut TcpStream, req: &http::Request) -> std::io::Result<()> {
+        let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let Some(tag) = spec["tag"].as_str().filter(|s| !s.is_empty()) else {
+            return http::error(stream, 400, "a tag is required");
+        };
+        let context = spec["context"].as_str().unwrap_or(".");
+        let mut args: Vec<&str> = vec!["build", "-t", tag];
+        if let Some(f) = spec["file"].as_str().filter(|s| !s.is_empty()) {
+            args.push("-f");
+            args.push(f);
+        }
+        args.push(context);
+        self.run_cli(stream, &args)
+    }
+
     fn pull(&self, stream: &mut TcpStream, req: &http::Request) -> std::io::Result<()> {
         let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
         let Some(reference) = spec["reference"].as_str().filter(|s| !s.is_empty()) else {
@@ -478,6 +547,232 @@ fn now_usec() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// terminal sessions
+// ---------------------------------------------------------------------------
+
+/// One live `exec -t` session, as seen from the page.
+///
+/// The server allocates the pty and spawns the CLI with the slave as its
+/// stdio - it does NOT create the container process itself, for the same
+/// reason as every other mutation here: this process is multi-threaded
+/// and `clone3` refuses one. The CLI it spawns is single-threaded and
+/// does the cloning.
+///
+/// Output accumulates in a bounded buffer that the page polls by offset.
+/// Polling rather than a websocket because a websocket is a second
+/// protocol, a second framing, and a second set of failure modes, for a
+/// page that already polls everything else twice a second.
+pub struct Term {
+    master: std::os::fd::OwnedFd,
+    child: std::process::Child,
+    /// Everything the session has produced, oldest first.
+    out: std::sync::Mutex<Vec<u8>>,
+    /// How many bytes have been dropped off the front, so a page that
+    /// polls by offset can tell it missed some rather than silently
+    /// resyncing to the wrong place.
+    dropped: std::sync::atomic::AtomicU64,
+    done: std::sync::atomic::AtomicBool,
+}
+
+/// The most output one session keeps. A terminal that has been open all
+/// day is a terminal whose first screen nobody wants.
+const TERM_BUFFER: usize = 256 * 1024;
+
+impl Term {
+    fn read_loop(me: std::sync::Arc<Term>) {
+        let mut buf = [0u8; 8192];
+        loop {
+            match rustainer_core::sys::read(&me.master, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut out = me.out.lock().unwrap_or_else(|e| e.into_inner());
+                    out.extend_from_slice(&buf[..n]);
+                    if out.len() > TERM_BUFFER {
+                        let cut = out.len() - TERM_BUFFER;
+                        out.drain(..cut);
+                        me.dropped
+                            .fetch_add(cut as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        me.done.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for Term {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Server {
+    fn term_open(
+        &self,
+        stream: &mut TcpStream,
+        id: &str,
+        req: &http::Request,
+    ) -> std::io::Result<()> {
+        let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let shell = spec["command"]
+            .as_str()
+            .unwrap_or("/bin/sh")
+            .trim()
+            .to_owned();
+        let rows = spec["rows"].as_u64().unwrap_or(24) as u16;
+        let cols = spec["cols"].as_u64().unwrap_or(80) as u16;
+
+        let pty = match rustainer_core::pty::open() {
+            Ok(p) => p,
+            Err(e) => return http::error(stream, 500, &format!("allocating a pty: {e}")),
+        };
+        let _ = rustainer_core::pty::set_size(&pty.master, rows, cols);
+
+        let mut cmd = std::process::Command::new(&self.exe);
+        if let Some(root) = &self.root_arg {
+            cmd.arg("--root").arg(root);
+        }
+        cmd.arg("exec").arg("-t").arg(id);
+        cmd.args(shell.split_whitespace());
+        // The slave becomes the CLI's stdio. `Stdio::from` takes
+        // ownership of each, so three clones - and every one of them
+        // must be gone from THIS process, or the master never sees EOF
+        // when the session ends.
+        let (a, b, c) = match (
+            pty.slave.try_clone(),
+            pty.slave.try_clone(),
+            pty.slave.try_clone(),
+        ) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            _ => return http::error(stream, 500, "could not duplicate the terminal"),
+        };
+        cmd.stdin(std::process::Stdio::from(a))
+            .stdout(std::process::Stdio::from(b))
+            .stderr(std::process::Stdio::from(c));
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return http::error(stream, 500, &format!("starting the session: {e}")),
+        };
+        drop(pty.slave);
+
+        let term = std::sync::Arc::new(Term {
+            master: pty.master,
+            child,
+            out: std::sync::Mutex::new(Vec::new()),
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            done: std::sync::atomic::AtomicBool::new(false),
+        });
+        let reader = std::sync::Arc::clone(&term);
+        std::thread::spawn(move || Term::read_loop(reader));
+
+        let session = format!("{:016x}", now_usec());
+        self.terms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session.clone(), term);
+        http::json(stream, 200, &json!({ "session": session }))
+    }
+
+    fn term_read(
+        &self,
+        stream: &mut TcpStream,
+        session: &str,
+        req: &http::Request,
+    ) -> std::io::Result<()> {
+        let from: u64 = req.param("from").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let terms = self.terms.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(t) = terms.get(session) else {
+            return http::error(stream, 404, "no such session");
+        };
+        let dropped = t.dropped.load(std::sync::atomic::Ordering::Relaxed);
+        let out = t.out.lock().unwrap_or_else(|e| e.into_inner());
+        let start = from.saturating_sub(dropped) as usize;
+        let slice = if start >= out.len() {
+            &out[out.len()..]
+        } else {
+            &out[start..]
+        };
+        http::json(
+            stream,
+            200,
+            &json!({
+                // Lossy on purpose: a terminal carries bytes, and a page
+                // cannot render half a UTF-8 sequence either way. The
+                // replacement character is visible; a 500 is not useful.
+                "data": String::from_utf8_lossy(slice),
+                "next": dropped + out.len() as u64,
+                "dropped": dropped > from,
+                "done": t.done.load(std::sync::atomic::Ordering::Relaxed),
+            }),
+        )
+    }
+
+    fn term_write(
+        &self,
+        stream: &mut TcpStream,
+        session: &str,
+        req: &http::Request,
+    ) -> std::io::Result<()> {
+        let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let terms = self.terms.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(t) = terms.get(session) else {
+            return http::error(stream, 404, "no such session");
+        };
+        if let Some(rows) = spec["rows"].as_u64()
+            && let Some(cols) = spec["cols"].as_u64()
+        {
+            let _ = rustainer_core::pty::set_size(&t.master, rows as u16, cols as u16);
+        }
+        if let Some(data) = spec["data"].as_str()
+            && !data.is_empty()
+        {
+            let _ = rustainer_core::sys::write(&t.master, data.as_bytes());
+        }
+        http::json(stream, 200, &json!({ "ok": true }))
+    }
+
+    fn term_close(&self, stream: &mut TcpStream, session: &str) -> std::io::Result<()> {
+        self.terms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session);
+        http::json(stream, 200, &json!({ "ok": true }))
+    }
+
+    fn networks(&self) -> Value {
+        let mut rows = vec![json!({
+            "name": "bridge",
+            "subnet": format!("{}/{}", rustainer_core::net::GATEWAY, rustainer_core::net::SUBNET_PREFIX),
+            "bridge": rustainer_core::net::BRIDGE,
+            "builtin": true,
+        })];
+        let dir = rustainer_core::state::Paths::data_root().join("networks");
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            let mut found: Vec<Value> = Vec::new();
+            for e in rd.flatten() {
+                if e.path().extension().and_then(|x| x.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(t) = std::fs::read_to_string(e.path())
+                    && let Ok(n) = serde_json::from_str::<rustainer_core::net::Network>(&t)
+                {
+                    found.push(json!({
+                        "name": n.name,
+                        "subnet": format!("{}/{}", n.gateway, n.prefix),
+                        "bridge": n.bridge,
+                        "builtin": false,
+                    }));
+                }
+            }
+            found.sort_by_key(|v| v["name"].as_str().unwrap_or("").to_owned());
+            rows.extend(found);
+        }
+        Value::Array(rows)
+    }
 }
 
 #[cfg(test)]

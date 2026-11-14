@@ -303,6 +303,58 @@ pub struct Lease {
     pub gateway: Ipv4Addr,
 }
 
+/// One bridge, its subnet, and the name people call it.
+///
+/// Introduced when user-defined networks arrived; before that these were
+/// three constants, which is why the default below is spelled out rather
+/// than derived - the engine's existing containers are on it, and moving
+/// them would be a migration for no benefit.
+///
+/// The bridge's interface name is NOT the network's name. `IFNAMSIZ` is
+/// 16 including the NUL, and a kernel that truncates silently would give
+/// two long network names the same bridge - so the interface is derived
+/// from a hash and the human name lives only in the engine's own files.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Network {
+    pub name: String,
+    pub bridge: String,
+    pub gateway: std::net::Ipv4Addr,
+    pub prefix: u8,
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Self {
+            name: "bridge".into(),
+            bridge: BRIDGE.into(),
+            gateway: GATEWAY,
+            prefix: SUBNET_PREFIX,
+        }
+    }
+}
+
+impl Network {
+    /// A bridge interface name that fits, and cannot collide by accident.
+    ///
+    /// `rtb` plus 12 hex of the name's hash: 15 characters, one under the
+    /// limit. Deriving it from the name rather than numbering them means
+    /// the same network always gets the same interface, which matters
+    /// because the firewall rules name it.
+    pub fn bridge_for(name: &str) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in name.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("rtb{:012x}", h & 0xffff_ffff_ffff)
+    }
+
+    /// The first usable address: the gateway is `.1`.
+    pub fn first_host(&self) -> u32 {
+        2
+    }
+}
+
 /// The default bridge subnet.
 ///
 /// A `/16` out of RFC 1918 space that Docker's own first-fit allocator
@@ -318,20 +370,33 @@ pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(172, 30, 0, 1);
 /// deferred decision, and the shape that matters now is that the engine
 /// records what it handed out rather than recomputing it.
 pub fn allocate(state_root: &Path) -> std::io::Result<Lease> {
-    let path = state_root.join("ipam");
+    allocate_in(state_root, &Network::default())
+}
+
+/// Hand out the next address on a particular network.
+///
+/// One counter file per network, named after the bridge rather than the
+/// network, because the bridge name is the thing that cannot collide.
+pub fn allocate_in(state_root: &Path, n: &Network) -> std::io::Result<Lease> {
+    let path = state_root.join(format!("ipam-{}", n.bridge));
     let next: u32 = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(2);
-    // .0 is the network, .1 is the gateway, and the broadcast address of a
-    // /16 is .255.255. Wrap well before any of them.
-    let next = if next >= 65_000 { 2 } else { next };
+        .unwrap_or_else(|| n.first_host());
+    // Wrap well before the broadcast address, whatever the prefix.
+    let limit: u32 = if n.prefix >= 24 { 250 } else { 65_000 };
+    let next = if next >= limit { n.first_host() } else { next };
     std::fs::write(&path, (next + 1).to_string())?;
-    let o = GATEWAY.octets();
+    let o = n.gateway.octets();
+    let ip = if n.prefix >= 24 {
+        Ipv4Addr::new(o[0], o[1], o[2], next as u8)
+    } else {
+        Ipv4Addr::new(o[0], o[1], (next / 256) as u8, (next % 256) as u8)
+    };
     Ok(Lease {
-        ip: Ipv4Addr::new(o[0], o[1], (next / 256) as u8, (next % 256) as u8),
-        prefix: SUBNET_PREFIX,
-        gateway: GATEWAY,
+        ip,
+        prefix: n.prefix,
+        gateway: n.gateway,
     })
 }
 

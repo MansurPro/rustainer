@@ -41,10 +41,88 @@ use serde::{Deserialize, Serialize};
 use crate::cgroup::{self, Cgroup, Limits};
 use crate::firewall::{self, Publish};
 use crate::net::{self, Lease};
-use crate::proxy::Forwarder;
 use crate::security::{self, CapabilitySet, Security, UserSpec};
 use crate::state::{self, Lock, Paths, State, Status};
 use crate::{Exit, MountPlan, Namespaces, Privileges, Spec, mount, sys};
+
+/// What to do when a container's init exits.
+///
+/// Docker's set, with Docker's meanings, including the one that surprises
+/// people: **`Always` does not restart a container the operator stopped**.
+/// A policy that undid `stop` would make `stop` meaningless, so a manual
+/// stop is recorded and both `Always` and `UnlessStopped` honour it. The
+/// difference between the two is what happens at *boot*, which this
+/// engine does not have - there is no daemon to start anything - so here
+/// they differ only in name, and that is said rather than papered over.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    #[default]
+    No,
+    Always,
+    UnlessStopped,
+    OnFailure,
+}
+
+impl RestartPolicy {
+    pub fn parse(s: &str) -> Result<(Self, Option<u32>), String> {
+        let (name, max) = match s.split_once(':') {
+            Some((n, m)) => (
+                n,
+                Some(
+                    m.parse::<u32>()
+                        .map_err(|_| format!("{m:?} is not a number of attempts"))?,
+                ),
+            ),
+            None => (s, None),
+        };
+        let policy = match name {
+            "no" | "" => Self::No,
+            "always" => Self::Always,
+            "unless-stopped" => Self::UnlessStopped,
+            "on-failure" => Self::OnFailure,
+            other => {
+                return Err(format!(
+                    "{other:?} is not a restart policy. Use `no`, `always`, \
+                     `unless-stopped`, or `on-failure[:attempts]`."
+                ));
+            }
+        };
+        if max.is_some() && policy != Self::OnFailure {
+            return Err(format!(
+                "a maximum only applies to `on-failure`; {name} restarts \
+                 until it is stopped"
+            ));
+        }
+        Ok((policy, max))
+    }
+
+    /// Should a container that ended like this be started again?
+    fn should_restart(self, exit: Exit, stopped: bool, restarts: u32, max: Option<u32>) -> bool {
+        if stopped {
+            return false;
+        }
+        match self {
+            Self::No => false,
+            Self::Always | Self::UnlessStopped => true,
+            Self::OnFailure => {
+                let failed = !matches!(exit, Exit::Code(0));
+                failed && max.is_none_or(|m| restarts < m)
+            }
+        }
+    }
+}
+
+/// How long to wait before restart number `n`.
+///
+/// Exponential from 100 ms, capped. Without a backoff, a container whose
+/// command does not exist is an unbounded fork loop that takes the
+/// machine with it - and "the image is wrong" is by far the most common
+/// reason a container exits immediately.
+fn restart_delay(n: u32) -> std::time::Duration {
+    let ms = 100u64.saturating_mul(1u64 << n.min(7));
+    std::time::Duration::from_millis(ms.min(10_000))
+}
 
 /// The container's bundle, written by the CLI and read by the supervisor.
 ///
@@ -106,6 +184,13 @@ pub struct Config {
     /// Attach to the bridge and get an address. Implies `private_net`.
     #[serde(default)]
     pub bridge: bool,
+    /// Which bridge, when it is not the default one.
+    ///
+    /// `None` means the engine's own `rustainer0`, which is what every
+    /// container used before user-defined networks existed - so an old
+    /// container's config still deserialises to exactly what it meant.
+    #[serde(default)]
+    pub network: Option<net::Network>,
     /// The address handed to this container, recorded so `ps` and teardown
     /// do not have to recompute it.
     #[serde(default)]
@@ -126,6 +211,18 @@ pub struct Config {
     pub stack: Option<String>,
     #[serde(default)]
     pub service: Option<String>,
+    /// What to do when the container exits.
+    #[serde(default)]
+    pub restart: RestartPolicy,
+    /// Attempts allowed for `on-failure`. `None` is unlimited.
+    #[serde(default)]
+    pub restart_max: Option<u32>,
+    /// Give the container a pseudo-terminal rather than pipes.
+    ///
+    /// Not cosmetic: `isatty(1)` decides whether a shell prints a prompt
+    /// at all, and whether `^C` arrives as a signal or as the byte 0x03.
+    #[serde(default)]
+    pub tty: bool,
     /// Extra `/etc/hosts` entries: `(name, address)`.
     ///
     /// How a stack's services find each other. Not DNS - a resolver in
@@ -168,16 +265,25 @@ impl Config {
             hostname: Some(self.hostname.clone().into()),
             workdir: self.workdir.clone().map(Into::into),
             net_messages: match (self.bridge, &self.ip) {
-                (true, Some(ip)) => ip
-                    .parse()
-                    .map(|ip| {
-                        net::container_messages(&Lease {
-                            ip,
-                            prefix: net::SUBNET_PREFIX,
-                            gateway: net::GATEWAY,
+                (true, Some(ip)) => {
+                    // The container's OWN network, not the default one.
+                    // Taking the prefix and gateway from the constants
+                    // gave a container on a user-defined network an
+                    // address in its subnet and a default route into
+                    // somebody else's - which the kernel reports as
+                    // ENETUNREACH while configuring eth0, a long way
+                    // from the mistake.
+                    let n = self.network.clone().unwrap_or_default();
+                    ip.parse()
+                        .map(|ip| {
+                            net::container_messages(&Lease {
+                                ip,
+                                prefix: n.prefix,
+                                gateway: n.gateway,
+                            })
                         })
-                    })
-                    .unwrap_or_default(),
+                        .unwrap_or_default()
+                }
                 _ => Vec::new(),
             },
             namespaces: Namespaces {
@@ -485,7 +591,12 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     st.rootfs.clone_from(&config.rootfs);
     st.hostname = Some(config.hostname.clone());
     st.status = Status::Creating;
+    st.stop_requested = false;
     st.store(paths)?;
+    // A container being started now has not been stopped, whatever a
+    // previous life recorded. `run` creates a fresh directory, so this
+    // only matters for a `supervise` run by hand over an old one.
+    let _ = std::fs::remove_file(stop_sentinel(paths, id));
 
     // --- the start rendezvous ------------------------------------------
     let fifo_path = paths.fifo(id);
@@ -501,68 +612,92 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     // even exists.
     let fifo_opath = sys::open_path_file(&cpath(&fifo_path)?)?;
 
-    // --- stdio ----------------------------------------------------------
-    let (out_r, out_w) = sys::pipe_with(sys::PipeFlags::CLOEXEC)?;
-    let (err_r, err_w) = sys::pipe_with(sys::PipeFlags::CLOEXEC)?;
-    let devnull = sys::open_devnull()?;
-    let stdio = crate::child::Stdio {
-        stdin: devnull,
-        stdout: out_w.try_clone()?,
-        stderr: err_w.try_clone()?,
-    };
-
-    // Resource limits, before the child exists. A requested limit that
-    // cannot be applied fails here, loudly, rather than producing a
-    // container that silently has none.
+    // Resource limits and published ports are arranged ONCE, above the
+    // restart loop. A restarted container keeps its cgroup, its address
+    // and its published ports: the rules name the address, the address is
+    // in the config, and tearing the whole lot down and back up between
+    // restarts would make a crash-looping container flap the host's
+    // firewall several times a second.
     let limits = config.limits();
     let cg = Cgroup::prepare(id, &limits)?;
     if let Some(c) = &cg {
         c.apply(&limits)?;
     }
-    let mounts = config.mount_plan(cg.as_ref().map(|c| c.dir()), &paths.dir(id))?;
+    let _published = publish_ports(&config)?;
 
-    let mut spawned = crate::spawn(
-        &spec,
-        mounts,
-        crate::Attach {
-            security: Some(config.security()?),
-            stdio: Some(stdio),
-            exec_fifo: Some(fifo_opath),
-            cgroup_fd: cg.as_ref().map(|c| c.fd()),
-            ..Default::default()
-        },
-    )?;
+    let mut fifo_once = Some(fifo_opath);
+    let mut restarts = 0u32;
+    let exit = loop {
+        let first_attempt = restarts == 0;
 
-    // Our copies of the child's write ends must go, or the reads below can
-    // never see EOF.
-    drop(out_w);
-    drop(err_w);
+        // --- stdio ----------------------------------------------------------
+        //
+        // Pipes normally; a pty when `--tty` was asked for, in which case
+        // there is only ONE stream. A terminal merges stdout and stderr by
+        // construction - they are the same device - so a tty container's log
+        // is one file, exactly as Docker's is.
+        //
+        // The supervisor allocates it rather than the CLI, because the
+        // supervisor is what outlives the CLI: `run -dt` has to work, and a
+        // master held by a process that has exited is a container whose
+        // output goes nowhere.
+        let (pty_master, mut pty_slave) = if config.tty {
+            let p = crate::pty::open().map_err(Error::Sys)?;
+            (Some(p.master), Some(p.slave))
+        } else {
+            (None, None)
+        };
+        let (out_r, out_w) = sys::pipe_with(sys::PipeFlags::CLOEXEC)?;
+        let (err_r, err_w) = sys::pipe_with(sys::PipeFlags::CLOEXEC)?;
+        let stdio = match &pty_slave {
+            Some(slave) => crate::child::Stdio {
+                stdin: slave.try_clone()?,
+                stdout: slave.try_clone()?,
+                stderr: slave.try_clone()?,
+            },
+            None => {
+                let devnull = sys::open_devnull()?;
+                crate::child::Stdio {
+                    stdin: devnull,
+                    stdout: out_w.try_clone()?,
+                    stderr: err_w.try_clone()?,
+                }
+            }
+        };
 
-    // The host side of the network, before the child is let go. The
-    // container's interface has to exist before the container tries to
-    // configure it, and the go-ahead is what guarantees the ordering.
-    if config.bridge
-        && let Err(e) = plumb_network(spawned.pid)
-    {
-        let _ = sys::kill_process(
-            rustix::process::Pid::from_raw(spawned.pid).unwrap(),
-            sys::Signal::KILL,
-        );
-        let _ = crate::reap_pid(spawned.pid);
-        return Err(e);
-    }
+        // Rebuilt per attempt: the mount set lives in the child's mount
+        // namespace, which died with the last child. The overlay's upper
+        // directory is on disk and is NOT recreated, so a restarted container
+        // keeps everything it wrote - which is what Docker does too.
+        let mounts = config.mount_plan(cg.as_ref().map(|c| c.dir()), &paths.dir(id))?;
 
-    st.init_pid = Some(spawned.pid);
-    st.init_start_time = state::start_time(spawned.pid);
-    st.status = Status::Created;
-    st.store(paths)?;
+        let network = config.network.clone().unwrap_or_default();
+        let mut spawned = crate::spawn(
+            &spec,
+            mounts,
+            crate::Attach {
+                security: Some(config.security()?),
+                stdio: Some(stdio),
+                tty: config.tty,
+                // Only the first attempt waits to be started. A restart
+                // is not a `create`, and there is nobody to send the byte.
+                exec_fifo: fifo_once.take(),
+                cgroup_fd: cg.as_ref().map(|c| c.fd()),
+                ..Default::default()
+            },
+        )?;
 
-    // Published ports: the firewall rules and the userland forwarder for
-    // the loopback case. Before the go-ahead, so a container is never
-    // briefly running with a port published and unauthorised.
-    let _published = match publish_ports(&config) {
-        Ok(p) => p,
-        Err(e) => {
+        // Our copies of the child's write ends must go, or the reads below can
+        // never see EOF.
+        drop(out_w);
+        drop(err_w);
+
+        // The host side of the network, before the child is let go. The
+        // container's interface has to exist before the container tries to
+        // configure it, and the go-ahead is what guarantees the ordering.
+        if config.bridge
+            && let Err(e) = plumb_network(spawned.pid, &network)
+        {
             let _ = sys::kill_process(
                 rustix::process::Pid::from_raw(spawned.pid).unwrap(),
                 sys::Signal::KILL,
@@ -570,71 +705,185 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
             let _ = crate::reap_pid(spawned.pid);
             return Err(e);
         }
-    };
 
-    // Everything the parent owed this child is done.
-    spawned.release();
+        st.init_pid = Some(spawned.pid);
+        st.init_start_time = state::start_time(spawned.pid);
+        st.status = Status::Created;
+        st.store(paths)?;
 
-    // Tell the CLI it may leave. Everything after this point happens with
-    // nobody waiting on us.
-    reply_ok(spawned.pid);
+        // Everything the parent owed this child is done.
+        spawned.release();
 
-    // --- wait for the start byte, WITHOUT a blocking open ----------------
-    //
-    // The naive version opens the FIFO read side blocking and reads a byte.
-    // That deadlocks forever whenever the init process died between create
-    // and start, which is trivially reachable: the user's binary does not
-    // exist. Polling the FIFO together with a pidfd turns that into a real
-    // error instead of a hang, with no background thread and no PID-reuse
-    // window.
-    let fifo_read = sys::open_read_nonblocking(&cpath(&fifo_path)?)?;
-    let started = wait_for_start(&fifo_read, &spawned.pidfd)?;
-    if !started {
-        let err = spawned.start_failure().map(Error::Core);
-        let status = reap_into(&mut st, spawned.pid);
+        // Both of these belong to the FIRST attempt only, and the second one
+        // is a real bug if it is not guarded: a restarted child was given no
+        // `exec_fifo`, so it never opens the rendezvous, so the poll below
+        // sees only the pidfd becoming ready and concludes the container
+        // "died before it reached the start rendezvous". The restart policy
+        // then stops after exactly one restart, reporting a failure that did
+        // not happen.
+        if first_attempt {
+            // Tell the CLI it may leave. Everything after this point happens
+            // with nobody waiting on us.
+            reply_ok(spawned.pid);
+
+            // --- wait for the start byte, WITHOUT a blocking open ------------
+            //
+            // The naive version opens the FIFO read side blocking and reads a
+            // byte. That deadlocks forever whenever the init process died
+            // between create and start, which is trivially reachable: the
+            // user's binary does not exist. Polling the FIFO together with a
+            // pidfd turns that into a real error instead of a hang, with no
+            // background thread and no PID-reuse window.
+            let fifo_read = sys::open_read_nonblocking(&cpath(&fifo_path)?)?;
+            let started = wait_for_start(&fifo_read, &spawned.pidfd)?;
+            if !started {
+                let err = spawned.start_failure().map(Error::Core);
+                let status = reap_into(&mut st, spawned.pid);
+                st.status = Status::Exited;
+                st.exited_at = Some(state::now());
+                st.store(paths)?;
+                let _ = status;
+                return Err(err.unwrap_or(Error::DiedBeforeStart));
+            }
+        }
+
+        st.status = Status::Running;
+        st.started_at = Some(state::now());
+        st.store(paths)?;
+        crate::events::record(
+            paths,
+            if first_attempt { "start" } else { "restarted" },
+            id,
+            serde_json::json!({ "pid": spawned.pid, "restarts": restarts }),
+        );
+
+        // Everyone on this network learns about us, and we learn about
+        // them. After the state says Running, because that is what the
+        // scan looks for - doing it earlier finds nobody, including
+        // ourselves.
+        if config.bridge {
+            refresh_network_hosts(paths, &network.name);
+        }
+
+        // --- the steady state ------------------------------------------------
+        let mut out_log = log_file(&paths.stdout_log(id))?;
+        let mut err_log = log_file(&paths.stderr_log(id))?;
+        match &pty_master {
+            Some(master) => {
+                // Our own copy of the slave goes first, and deliberately:
+                // while ANY descriptor on the slave is open the master never
+                // reports EOF, so a relay waiting for one would hang forever
+                // after the command exited. The child plan's copies were
+                // already dropped in the parent after the clone, for the same
+                // reason applied to the error pipe.
+                pty_slave.take();
+                crate::pty::relay(master, 0, 1, |bytes| {
+                    use std::io::Write;
+                    let _ = out_log.write_all(bytes);
+                });
+            }
+            None => pump(&out_r, &err_r, &spawned.pidfd, &mut out_log, &mut err_log)?,
+        }
+
+        // Drain and flush the logs BEFORE writing the terminal status. Writing
+        // `exited` first and then failing to flush produces a container
+        // reported as cleanly exited whose last few KiB of output - the panic
+        // message - is gone (RND.md §5.7).
+        out_log.flush()?;
+        err_log.flush()?;
+
+        // Now that init is gone its `O_CLOEXEC` error pipe is closed, so this
+        // cannot block. A failure recorded here means the child reached the
+        // start rendezvous and then failed - execve of a missing binary is the
+        // common case, and it is the difference between "exited 127" and
+        // "exited 127 because /bin/nonexistent does not exist".
+        let failure = spawned.start_failure();
+        let exit = reap_into(&mut st, spawned.pid);
+
+        // `memory.events`'s `oom_kill` is the only key that means a kill
+        // happened; `max` and `oom` do not. Read before the cgroup is removed.
+        if let Some(c) = &cg {
+            st.oom_killed = c.oom_killed();
+        }
+        if let Some(e) = &failure {
+            eprintln!("rustainer: {e}");
+            st.error = Some(e.to_string());
+        }
         st.status = Status::Exited;
         st.exited_at = Some(state::now());
+        st.stop_requested = stop_was_requested(paths, id);
         st.store(paths)?;
-        let _ = status;
-        return Err(err.unwrap_or(Error::DiedBeforeStart));
-    }
+        // And the network learns we are gone. A stale entry is worse
+        // than a missing one: a name resolving to an address nothing
+        // answers on gives a connection timeout instead of a lookup
+        // failure, which is a much longer afternoon.
+        if config.bridge {
+            refresh_network_hosts(paths, &network.name);
+        }
+        crate::events::record(
+            paths,
+            "die",
+            id,
+            serde_json::json!({ "exit": st.exit_code, "signal": st.signal, "oom": st.oom_killed }),
+        );
 
-    st.status = Status::Running;
-    st.started_at = Some(state::now());
-    st.store(paths)?;
+        // --- restart? --------------------------------------------------------
+        //
+        // The flag is re-read from DISK rather than taken from our own copy:
+        // `stop` is another process, and the whole point of the flag is that
+        // it was set after we last wrote the file. A policy that restarted a
+        // container the operator had just stopped would make `stop`
+        // meaningless.
+        //
+        // A directory that is GONE counts as a stop too. `remove` skips
+        // the stop path for a container it finds already exited - which
+        // is exactly what a container in restart backoff looks like -
+        // and without this the supervisor wakes from the backoff, starts
+        // a container whose record has just been deleted, and then waits
+        // on it forever: a process nothing lists and nothing can stop.
+        let stopped = stop_was_requested(paths, id) || !paths.dir(id).exists();
+        if !config
+            .restart
+            .should_restart(exit, stopped, restarts, config.restart_max)
+        {
+            break exit;
+        }
 
-    // --- the steady state ------------------------------------------------
-    let mut out_log = log_file(&paths.stdout_log(id))?;
-    let mut err_log = log_file(&paths.stderr_log(id))?;
-    pump(&out_r, &err_r, &spawned.pidfd, &mut out_log, &mut err_log)?;
+        restarts += 1;
+        let delay = restart_delay(restarts);
+        crate::events::record(
+            paths,
+            "restart",
+            id,
+            serde_json::json!({ "attempt": restarts, "after_ms": delay.as_millis() as u64 }),
+        );
+        st.restarts = restarts;
+        st.error = None;
+        st.store(paths)?;
+        // Backoff before, not after: without it a container whose command
+        // does not exist is an unbounded fork loop, and "the image is wrong"
+        // is by far the most common reason one exits immediately.
+        std::thread::sleep(delay);
+        // Again, because the sleep is where the window is - up to ten
+        // seconds of it, and `stop` or `rm` landing inside it is the
+        // normal case, not the rare one. A container that exits at once
+        // spends nearly all of its life in here, so `stop` almost never
+        // arrives anywhere else.
+        if !paths.dir(id).exists() {
+            // Nothing left to write to: the record this process exists
+            // to maintain has been deleted underneath it.
+            break exit;
+        }
+        if stop_was_requested(paths, id) {
+            // Recorded before leaving. Breaking out quietly would make
+            // `ps` report a container that stopped on its own, and the
+            // entire point of the flag is that somebody asked it to.
+            st.stop_requested = true;
+            st.store(paths)?;
+            break exit;
+        }
+    };
 
-    // Drain and flush the logs BEFORE writing the terminal status. Writing
-    // `exited` first and then failing to flush produces a container
-    // reported as cleanly exited whose last few KiB of output - the panic
-    // message - is gone (RND.md §5.7).
-    out_log.flush()?;
-    err_log.flush()?;
-
-    // Now that init is gone its `O_CLOEXEC` error pipe is closed, so this
-    // cannot block. A failure recorded here means the child reached the
-    // start rendezvous and then failed - execve of a missing binary is the
-    // common case, and it is the difference between "exited 127" and
-    // "exited 127 because /bin/nonexistent does not exist".
-    let failure = spawned.start_failure();
-    let exit = reap_into(&mut st, spawned.pid);
-
-    // `memory.events`'s `oom_kill` is the only key that means a kill
-    // happened; `max` and `oom` do not. Read before the cgroup is removed.
-    if let Some(c) = &cg {
-        st.oom_killed = c.oom_killed();
-    }
-    if let Some(e) = &failure {
-        eprintln!("rustainer: {e}");
-        st.error = Some(e.to_string());
-    }
-    st.status = Status::Exited;
-    st.exited_at = Some(state::now());
-    st.store(paths)?;
     if let Some(c) = &cg {
         c.remove();
     }
@@ -801,8 +1050,15 @@ fn reap_into(st: &mut State, pid: i32) -> Exit {
 /// does not work, whereas rules outliving their container are inherited by
 /// whichever container is handed that address next (RND.md §17).
 struct Published {
+    /// Which bridge the rules were written for, so the teardown removes
+    /// the ones that exist rather than the ones a default would name.
+    bridge: String,
     /// Dropped first, so the listener stops before the rules go.
-    forwarders: Vec<Forwarder>,
+    ///
+    /// Child PROCESSES, not threads: the supervisor must still be able
+    /// to call `clone3`, and `clone3` refuses a process that has ever
+    /// had a second thread.
+    forwarders: Vec<crate::proxy::Child>,
     ports: Vec<Publish>,
 }
 
@@ -811,7 +1067,7 @@ impl Drop for Published {
         // Stop listening before removing the rules, so there is no window
         // in which the port is reachable but no longer authorised.
         self.forwarders.clear();
-        unpublish_ports(&self.ports);
+        unpublish_ports_on(&self.ports, &self.bridge);
     }
 }
 
@@ -820,24 +1076,33 @@ impl Drop for Published {
 /// Partial failure is undone by dropping the half-built [`Published`], so
 /// there is one rollback path rather than one per failure point.
 fn publish_ports(config: &Config) -> Result<Published, Error> {
+    let bridge = config
+        .network
+        .as_ref()
+        .map(|n| n.bridge.clone())
+        .unwrap_or_else(|| net::BRIDGE.to_owned());
     let mut out = Published {
+        bridge: bridge.clone(),
         forwarders: Vec::new(),
         ports: Vec::new(),
     };
     if config.ports.is_empty() {
         return Ok(out);
     }
+    // The container's own bridge: a DNAT scoped to the wrong interface
+    // translates nothing, and the symptom is a published port that is
+    // open and silent.
     let fw = firewall::detect().ok_or(firewall::Error::NoBackend)?;
     for p in &config.ports {
         // Recorded BEFORE the rules are written. `publish` writes two
         // rules and can fail between them, so a failed publish has still
         // mutated the host and the rollback has to know about it.
         out.ports.push(*p);
-        fw.publish(p, net::BRIDGE)?;
+        fw.publish(p, &bridge)?;
         // The forwarder covers `curl localhost:<port>`, which no firewall
         // rule can: loopback is deliberately excluded from destination NAT.
         out.forwarders
-            .push(Forwarder::start(*p).map_err(Error::Io)?);
+            .push(crate::proxy::Child::start("/proc/self/exe", *p).map_err(Error::Io)?);
     }
     Ok(out)
 }
@@ -845,12 +1110,16 @@ fn publish_ports(config: &Config) -> Result<Published, Error> {
 /// Idempotent: removing a rule that is not there is not an error, which is
 /// what lets both the rollback and the teardown call it blindly.
 fn unpublish_ports(ports: &[Publish]) {
+    unpublish_ports_on(ports, net::BRIDGE);
+}
+
+fn unpublish_ports_on(ports: &[Publish], bridge: &str) {
     if ports.is_empty() {
         return;
     }
     if let Some(fw) = firewall::detect() {
         for p in ports {
-            fw.unpublish(p, net::BRIDGE);
+            fw.unpublish(p, bridge);
         }
     }
 }
@@ -862,7 +1131,7 @@ fn unpublish_ports(ports: &[Publish]) {
 /// holding an address and an on-link route reserves a subnet as far as any
 /// future allocator is concerned. It is created once and reused, never per
 /// container.
-fn plumb_network(pid: i32) -> Result<(), Error> {
+fn plumb_network(pid: i32, n: &net::Network) -> Result<(), Error> {
     // Stage 11: rootless, every one of these operations fails with EPERM
     // and the bare errno names nothing. The gate is CAP_NET_ADMIN in the
     // user namespace that owns the TARGET namespace - here the host's,
@@ -873,30 +1142,54 @@ fn plumb_network(pid: i32) -> Result<(), Error> {
     // "are we allowed to do this" has no honest answer short of trying:
     // under `unshare --user --net` the host side is our own new namespace
     // and these calls genuinely do succeed.
-    match plumb(pid) {
+    match plumb(pid, n) {
         Err(Error::Sys(sys::Error::PERM)) => Err(Error::BridgeUnprivileged),
         other => other,
     }
 }
 
-fn plumb(pid: i32) -> Result<(), Error> {
+/// Every user-defined network's bridge, read from the records the CLI
+/// writes.
+///
+/// Read rather than remembered: the supervisor is started once per
+/// container and a network may have been created since, so a cached list
+/// would isolate against yesterday's set.
+fn known_bridges() -> Vec<String> {
+    let dir = crate::state::Paths::data_root().join("networks");
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.path().extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(t) = std::fs::read_to_string(e.path())
+                && let Ok(n) = serde_json::from_str::<net::Network>(&t)
+            {
+                out.push(n.bridge);
+            }
+        }
+    }
+    out
+}
+
+fn plumb(pid: i32, n: &net::Network) -> Result<(), Error> {
     let nl = net::Netlink::open()?;
 
     // The bridge, once. `EEXIST` is the normal case after the first
     // container and is not an error.
-    if net::if_index(net::BRIDGE).is_none() {
-        match nl.request(&net::create_bridge(net::BRIDGE)) {
+    if net::if_index(&n.bridge).is_none() {
+        match nl.request(&net::create_bridge(&n.bridge)) {
             Ok(()) | Err(sys::Error::EXIST) => {}
             Err(e) => return Err(e.into()),
         }
-        let idx = net::if_index(net::BRIDGE).ok_or(sys::Error::NODEV)?;
-        match nl.request(&net::add_address(idx, net::GATEWAY, net::SUBNET_PREFIX)) {
+        let idx = net::if_index(&n.bridge).ok_or(sys::Error::NODEV)?;
+        match nl.request(&net::add_address(idx, n.gateway, n.prefix)) {
             Ok(()) | Err(sys::Error::EXIST) => {}
             Err(e) => return Err(e.into()),
         }
-        nl.request(&net::link_up(net::BRIDGE))?;
+        nl.request(&net::link_up(&n.bridge))?;
     }
-    let bridge_idx = net::if_index(net::BRIDGE).ok_or(sys::Error::NODEV)?;
+    let bridge_idx = net::if_index(&n.bridge).ok_or(sys::Error::NODEV)?;
 
     // The container's namespace, as a descriptor. The peer goes straight
     // into it, so its interface never appears on the host even briefly.
@@ -925,7 +1218,7 @@ fn plumb(pid: i32) -> Result<(), Error> {
     // internet has no route to RFC 1918 space, so the SYN-ACK is dropped
     // and the failure looks like "everything times out".
     let fw = firewall::detect().ok_or(firewall::Error::NoBackend)?;
-    fw.ensure_masquerade(net::GATEWAY, net::SUBNET_PREFIX, net::BRIDGE)?;
+    fw.ensure_masquerade(n.gateway, n.prefix, &n.bridge)?;
     // And the forward path. A FORWARD policy of DROP - set by Kubernetes,
     // libvirt, firewalld and most cloud images - silently blackholes every
     // container's egress, with a correct address, route and NAT rule in
@@ -935,10 +1228,22 @@ fn plumb(pid: i32) -> Result<(), Error> {
             "rustainer: this host has a FORWARD policy of DROP that something else set. \
              Accept rules for {} have been added to our own chain; if another ruleset \
              drops the packet first, containers will have no egress.",
-            net::BRIDGE
+            n.bridge
         );
     }
-    fw.ensure_forward(net::BRIDGE)?;
+    fw.ensure_forward(&n.bridge)?;
+
+    // Every bridge we know about, so the chain is correct as a whole
+    // rather than only for the network this container happens to be on.
+    // Rebuilt from empty each time, which is what makes a removed
+    // network stop being isolated against.
+    let mut bridges: Vec<String> = vec![net::BRIDGE.to_owned()];
+    bridges.extend(known_bridges());
+    bridges.sort();
+    bridges.dedup();
+    if bridges.len() > 1 {
+        fw.ensure_isolation(&bridges)?;
+    }
     Ok(())
 }
 
@@ -950,7 +1255,109 @@ fn plumb(pid: i32) -> Result<(), Error> {
 /// drops `SIGKILL` too when the sender is inside the namespace with
 /// `SIG_DFL`. Only a signal from an ancestor namespace gets through, which
 /// is why this runs here and not in the container.
+/// Rewrite the `/etc/hosts` of every container on a network so they can
+/// find each other by name.
+///
+/// # Why not DNS
+///
+/// Docker runs a resolver at 127.0.0.11 inside each container's network
+/// namespace. That needs a process living in that namespace, and this
+/// engine has no daemon to be one - a per-container resolver would be a
+/// second thing to supervise, and a crashed one is a container whose
+/// networking is silently half-broken.
+///
+/// The file is already bind-mounted from the state directory, so writing
+/// it again is all it takes: `std::fs::write` truncates the same inode
+/// and the container sees the new contents on its next lookup. glibc and
+/// musl both re-read `/etc/hosts` per lookup, so nothing has to be told.
+///
+/// The honest limit, stated rather than discovered: this resolves names,
+/// not records. No SRV, no round-robin over several addresses for one
+/// name, and a process that cached a lookup before a peer appeared keeps
+/// its answer. In exchange, `cat /etc/hosts` is the whole debugging
+/// story.
+pub fn refresh_network_hosts(paths: &Paths, network: &str) {
+    let mut members: Vec<(String, String, String)> = Vec::new();
+    for id in paths.list().unwrap_or_default() {
+        let Ok(cfg) = Config::load(paths, &id) else {
+            continue;
+        };
+        if !cfg.bridge {
+            continue;
+        }
+        let name = cfg
+            .network
+            .as_ref()
+            .map(|n| n.name.as_str())
+            .unwrap_or("bridge");
+        if name != network {
+            continue;
+        }
+        let running = State::load(paths, &id)
+            .map(|s| matches!(s.observed_status(), Status::Running | Status::Created))
+            .unwrap_or(false);
+        if !running {
+            continue;
+        }
+        if let Some(ip) = &cfg.ip {
+            members.push((id.clone(), cfg.hostname.clone(), ip.clone()));
+        }
+    }
+
+    for (id, _, _) in &members {
+        let Ok(cfg) = Config::load(paths, id) else {
+            continue;
+        };
+        let mut body =
+            String::from("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
+        if let Some(ip) = &cfg.ip {
+            body.push_str(&format!("{ip}\t{}\n", cfg.hostname));
+        }
+        for (peer_id, peer_host, peer_ip) in &members {
+            if peer_id == id {
+                continue;
+            }
+            // Both spellings: the container id, which is what `ps`
+            // shows, and the hostname, which is what a config file
+            // inside the container is likely to name.
+            body.push_str(&format!("{peer_ip}\t{peer_id}\n"));
+            if peer_host != peer_id {
+                body.push_str(&format!("{peer_ip}\t{peer_host}\n"));
+            }
+        }
+        // A stack's own peer list still applies, and is kept.
+        for (name, ip) in &cfg.peers {
+            body.push_str(&format!("{ip}\t{name}\n"));
+        }
+        let _ = std::fs::write(paths.dir(id).join("hosts"), body);
+    }
+}
+
+/// Where a requested stop is recorded.
+///
+/// A file of its own, and not a field in `state.json`, because the two
+/// writers are different processes. The supervisor rewrites the whole
+/// state file several times per restart from its own in-memory copy, so
+/// a flag set there by `stop` is overwritten within milliseconds - and
+/// the symptom is `--restart always` cheerfully undoing a stop, which is
+/// exactly the behaviour the flag exists to prevent.
+///
+/// Two writers, two files, no lock needed: existence is the whole value.
+fn stop_sentinel(paths: &Paths, id: &str) -> std::path::PathBuf {
+    paths.dir(id).join("stop-requested")
+}
+
+fn stop_was_requested(paths: &Paths, id: &str) -> bool {
+    stop_sentinel(paths, id).exists()
+}
+
 pub fn stop(paths: &Paths, id: &str, grace: std::time::Duration) -> Result<(), Error> {
+    // Recorded BEFORE the signal, not after. The supervisor reads it the
+    // moment its child dies, and between the signal and a later write
+    // there is a window in which it sees nothing and restarts the
+    // container that was just stopped.
+    let _ = std::fs::write(stop_sentinel(paths, id), b"");
+    crate::events::record(paths, "stop", id, serde_json::json!({}));
     let st = State::load(paths, id)?;
     if st.observed_status() != Status::Running && st.observed_status() != Status::Created {
         return Ok(());
@@ -995,6 +1402,14 @@ fn wait_for_supervisor(st: &State) -> Result<(), Error> {
 ///
 /// Refuses a running container rather than orphaning its supervisor.
 pub fn remove(paths: &Paths, id: &str, force: bool) -> Result<(), Error> {
+    crate::events::record(paths, "remove", id, serde_json::json!({ "force": force }));
+    // Before the lock, before the status check, before anything is
+    // deleted. A container in restart backoff is NOT running, so the
+    // `force` path below never calls `stop` for it and never records
+    // one - and its supervisor, waking up to a directory we are about
+    // to delete, would restart it. The sentinel goes with the
+    // directory, so the loop also checks that the directory is there.
+    let _ = std::fs::write(stop_sentinel(paths, id), b"");
     let _lock = Lock::acquire(&paths.lock_file(id))?;
     if let Ok(st) = State::load(paths, id) {
         let observed = st.observed_status();
@@ -1052,6 +1467,10 @@ mod tests {
             argv: vec!["sh".into()],
             envp: vec!["PATH=/bin".into()],
             hostname: "box".into(),
+            network: None,
+            restart: RestartPolicy::No,
+            restart_max: None,
+            tty: false,
             volumes: Vec::new(),
             peers: Vec::new(),
             stack: None,

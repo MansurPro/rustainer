@@ -42,6 +42,16 @@ pub enum Error {
          there, by the same name it accepts here."
     )]
     NoSuchImage { reference: String },
+    #[error(
+        "{reference:?} has no stored manifest, so there is nothing to push. It was \
+         pulled by a version that did not keep one; pull it again."
+    )]
+    NoManifest { reference: String },
+    #[error(
+        "the blob {digest} is not in the local store, so this image cannot be \
+         pushed whole. Pull it again to repopulate the store."
+    )]
+    MissingBlob { digest: String },
     #[error("{op} {path}: {source}")]
     Io {
         op: &'static str,
@@ -83,6 +93,14 @@ pub struct Materialised {
     /// each get a private writable upper, and what makes a second image
     /// sharing a base layer cost nothing.
     pub layers: Vec<PathBuf>,
+    /// The identity of each of those layers, in the same order.
+    ///
+    /// Carried rather than re-derived from the directory names: the
+    /// store strips the `sha256:` prefix when naming a directory, and a
+    /// caller that reads it back gets a string that looks like a diff_id
+    /// and is not one. A build that put those in an image config
+    /// produced a config no puller would accept.
+    pub diff_ids: Vec<String>,
     pub digest: String,
     pub env: Vec<String>,
     pub entrypoint: Vec<String>,
@@ -277,6 +295,203 @@ impl Store {
             .ok()
     }
 
+    /// Take ownership of layers built locally, and tag them as an image.
+    ///
+    /// The counterpart of `pull` for an image nobody fetched. Each layer
+    /// directory is MOVED into the store under its `diff_id`, which is
+    /// what makes a build's layers shareable with a pulled image's: both
+    /// are keyed by the hash of their uncompressed tar, so a `FROM
+    /// alpine` build adds only the layers it actually created.
+    ///
+    /// A rename, not a copy: the directories are already on the same
+    /// filesystem (the caller made them in the store's own tree), the
+    /// trees are large, and a copy would double the disk for no gain.
+    /// If one is already there, it is the same content by definition and
+    /// the new copy is simply dropped.
+    ///
+    /// The blobs are written too, so the image can later be pushed
+    /// without rebuilding it.
+    pub fn adopt(
+        &self,
+        base: &[registry::Descriptor],
+        layers: &[(String, PathBuf, Vec<u8>)],
+        config_bytes: &[u8],
+        reference: &str,
+    ) -> Result<String, Error> {
+        self.prepare()?;
+        let userxattr = Self::userxattr();
+        // The base image's layers come first and are already in the
+        // store; the manifest has to name them anyway, or a push
+        // uploads an image missing everything it was built on - and the
+        // puller gets a diff_id mismatch on layer 0, which is a long way
+        // from the cause.
+        let mut layer_descriptors: Vec<registry::Descriptor> = base.to_vec();
+        for (diff_id, dir, tar_bytes) in layers {
+            let dest = self.layer_dir(diff_id, userxattr);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(io("creating the layer store", parent))?;
+            }
+            if dest.exists() {
+                // Identical content under an identical name. Dropping the
+                // duplicate is the whole benefit of content addressing.
+                let _ = std::fs::remove_dir_all(dir);
+            } else {
+                std::fs::rename(dir, &dest).map_err(io("committing a built layer", &dest))?;
+            }
+            // Gzipped, because that is what a registry accepts and the
+            // digest in the manifest is of the compressed bytes.
+            let gz = {
+                use std::io::Write;
+                let mut e =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                e.write_all(tar_bytes)
+                    .map_err(io("compressing a layer", &dest))?;
+                e.finish().map_err(io("compressing a layer", &dest))?
+            };
+            // `sha256_hex` already returns a prefixed digest, and the
+            // blob store is keyed by the hex alone.
+            let d = registry::sha256_hex(&gz);
+            let blob = self
+                .root
+                .join("blobs/sha256")
+                .join(d.trim_start_matches("sha256:"));
+            if !blob.exists() {
+                std::fs::write(&blob, &gz).map_err(io("writing a layer blob", &blob))?;
+            }
+            layer_descriptors.push(registry::Descriptor {
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+                digest: d,
+                size: gz.len() as u64,
+                platform: None,
+            });
+        }
+
+        let digest = registry::sha256_hex(config_bytes);
+        let dir = self.image_dir(&digest);
+        std::fs::create_dir_all(&dir).map_err(io("creating the image directory", &dir))?;
+        let config_path = dir.join("config.json");
+        std::fs::write(&config_path, config_bytes)
+            .map_err(io("writing the config", &config_path))?;
+
+        // The config is a blob too, and a push needs it by digest.
+        let config_blob = self
+            .root
+            .join("blobs/sha256")
+            .join(digest.trim_start_matches("sha256:"));
+        std::fs::write(&config_blob, config_bytes)
+            .map_err(io("writing the config blob", &config_blob))?;
+
+        // A manifest describing what was just built, so `push` has the
+        // same thing to work from whether the image was pulled or made.
+        let manifest = registry::Manifest {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            config: registry::Descriptor {
+                media_type: "application/vnd.oci.image.config.v1+json".into(),
+                digest: digest.clone(),
+                size: config_bytes.len() as u64,
+                platform: None,
+            },
+            layers: layer_descriptors,
+        };
+        let manifest_path = dir.join("manifest.json");
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|source| {
+            Error::Registry(registry::Error::Parse {
+                what: "the manifest we just built".into(),
+                source,
+            })
+        })?;
+        std::fs::write(&manifest_path, &manifest_bytes)
+            .map_err(io("writing the manifest", &manifest_path))?;
+
+        let r = Reference::parse(reference).map_err(Error::Reference)?;
+        let tag = self.tag_path(&r.store_key());
+        std::fs::write(&tag, &digest).map_err(io("recording the tag", &tag))?;
+        Ok(digest)
+    }
+
+    /// The stored manifest for a local image, if there is one.
+    pub fn manifest_for(&self, reference: &str) -> Option<registry::Manifest> {
+        let r = Reference::parse(reference).ok()?;
+        let digest = std::fs::read_to_string(self.tag_path(&r.store_key())).ok()?;
+        let bytes = std::fs::read(self.image_dir(digest.trim()).join("manifest.json")).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Upload a local image to a registry.
+    ///
+    /// Strictly additive, as RND.md §19 predicted: it shares the
+    /// reference parsing, the transport and the token exchange that pull
+    /// already needed, and adds three requests.
+    ///
+    /// Order is the only thing here that is not obvious, and it is not
+    /// negotiable: **blobs first, manifest last**. A manifest naming
+    /// blobs the registry does not have is a tag that resolves to a
+    /// broken image, and not every registry checks.
+    ///
+    /// `source` is the image as it is known locally; `target` is where it
+    /// is going. They differ whenever you push under a new name, which is
+    /// most of the time.
+    pub fn push(
+        &self,
+        source: &str,
+        target: &str,
+        credentials: Option<String>,
+        mut progress: impl FnMut(&str),
+    ) -> Result<String, Error> {
+        let local = Reference::parse(source).map_err(Error::Reference)?;
+        let tag = self.tag_path(&local.store_key());
+        let image_digest = std::fs::read_to_string(&tag)
+            .map_err(|_| Error::NoSuchImage {
+                reference: source.to_owned(),
+            })?
+            .trim()
+            .to_owned();
+        let dir = self.image_dir(&image_digest);
+
+        let manifest_path = dir.join("manifest.json");
+        let manifest_bytes = std::fs::read(&manifest_path).map_err(|_| Error::NoManifest {
+            reference: source.to_owned(),
+        })?;
+        let manifest: registry::Manifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|source| registry::Error::Parse {
+                what: "the stored manifest".into(),
+                source,
+            })?;
+
+        let to = Reference::parse(target).map_err(Error::Reference)?;
+        let mut client = Client::new().with_credentials(credentials).for_push();
+
+        for d in manifest
+            .layers
+            .iter()
+            .chain(std::iter::once(&manifest.config))
+        {
+            let blob = self
+                .root
+                .join("blobs/sha256")
+                .join(d.digest.trim_start_matches("sha256:"));
+            let bytes = std::fs::read(&blob).map_err(|_| Error::MissingBlob {
+                digest: d.digest.clone(),
+            })?;
+            let short = &d.digest[..19.min(d.digest.len())];
+            if client.push_blob(&to, &d.digest, &bytes)? {
+                progress(&format!("uploaded {short} ({} bytes)", bytes.len()));
+            } else {
+                progress(&format!("{short} is already there"));
+            }
+        }
+
+        let media = if manifest.media_type.is_empty() {
+            "application/vnd.oci.image.manifest.v1+json"
+        } else {
+            &manifest.media_type
+        };
+        progress("uploading the manifest");
+        let digest = client.push_manifest(&to, media, &manifest_bytes)?;
+        Ok(digest)
+    }
+
     /// Pull if needed, then return what the runtime needs.
     pub fn pull(&self, reference: &str, force: bool) -> Result<Materialised, Error> {
         let r = Reference::parse(reference).map_err(Error::Reference)?;
@@ -380,6 +595,17 @@ impl Store {
         f.write_all(&config_bytes)
             .map_err(io("writing the config", &config_path))?;
 
+        // Kept so the image can be pushed, or built on and then pushed,
+        // without being fetched again. Re-serialised rather than stored
+        // verbatim: the bytes may have come from an index's platform
+        // manifest, which arrives parsed. The digest therefore changes,
+        // which is fine - a push PUTs the manifest and the registry
+        // digests what it receives.
+        let manifest_path = image_dir.join("manifest.json");
+        if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
+            let _ = std::fs::write(&manifest_path, bytes);
+        }
+
         let tag = self.tag_path(&r.store_key());
         std::fs::write(&tag, &manifest_digest).map_err(io("recording the tag", &tag))?;
 
@@ -396,6 +622,7 @@ impl Store {
         let c = config.config.clone().unwrap_or_default();
         Ok(Materialised {
             layers,
+            diff_ids: config.rootfs.diff_ids.clone(),
             digest: digest.to_owned(),
             env: c.env.unwrap_or_default(),
             entrypoint: c.entrypoint.unwrap_or_default(),
@@ -463,6 +690,7 @@ mod tests {
     fn entrypoint_and_cmd_compose_the_way_the_spec_says() {
         let m = Materialised {
             layers: vec![],
+            diff_ids: vec![],
             digest: "sha256:x".into(),
             env: vec![],
             entrypoint: vec!["/bin/sh".into(), "-c".into()],
@@ -478,6 +706,7 @@ mod tests {
     fn an_image_with_only_a_cmd_still_has_a_command() {
         let m = Materialised {
             layers: vec![],
+            diff_ids: vec![],
             digest: "sha256:x".into(),
             env: vec![],
             entrypoint: vec![],
