@@ -150,6 +150,50 @@ impl Stack {
     ///
     /// A cycle is named rather than reported as "a cycle exists", because
     /// the useful part of the message is which services are in it.
+    /// The same graph, grouped into levels: every service in a level is
+    /// independent of every other one in it.
+    ///
+    /// `start_order` flattens the graph into a single sequence and is
+    /// kept as it is, because the sequence it produces is the one `up`
+    /// has always used and a test pins it. This exists for `down`, where
+    /// the useful fact is not the order but the INDEPENDENCE: services
+    /// in one level have no reason to wait for each other, and stopping
+    /// them one at a time multiplies the grace period by their number.
+    /// Three services that ignore SIGTERM at a five second grace is
+    /// fifteen seconds of waiting for no reason.
+    pub fn start_levels(&self) -> Result<Vec<Vec<String>>> {
+        let mut levels: Vec<Vec<String>> = Vec::new();
+        let mut placed: BTreeSet<String> = BTreeSet::new();
+        while placed.len() < self.services.len() {
+            let ready: Vec<String> = self
+                .services
+                .iter()
+                .filter(|(n, s)| {
+                    !placed.contains(*n) && s.depends_on.iter().all(|d| placed.contains(d))
+                })
+                .map(|(n, _)| n.clone())
+                .collect();
+            if ready.is_empty() {
+                let stuck: Vec<&str> = self
+                    .services
+                    .keys()
+                    .filter(|n| !placed.contains(*n))
+                    .map(String::as_str)
+                    .collect();
+                bail!(
+                    "these services depend on each other in a cycle, so none of them can \
+                     be started first: {}. Break the cycle by removing a `depends_on`.",
+                    stuck.join(", ")
+                );
+            }
+            for n in &ready {
+                placed.insert(n.clone());
+            }
+            levels.push(ready);
+        }
+        Ok(levels)
+    }
+
     pub fn start_order(&self) -> Result<Vec<String>> {
         let mut done: Vec<String> = Vec::new();
         let mut placed: BTreeSet<String> = BTreeSet::new();
@@ -232,11 +276,50 @@ depends_on = ["db"]
 
     #[test]
     fn a_misspelled_key_is_refused_rather_than_ignored() {
-        // The single most expensive property of Compose's format: a
-        // misspelled key does nothing, silently, and the service starts
-        // without the setting you thought you gave it.
+        // A service that starts without the setting you thought you gave
+        // it is the most expensive kind of typo, so an unknown key is an
+        // error and the error names the key.
+        //
+        // Not a point of difference, though: measured against Compose
+        // v2.40 with scripts/stack-bench.sh, `docker compose` refuses an
+        // unknown service key too. An earlier version of this comment
+        // claimed otherwise. Parity, and worth knowing rather than
+        // assuming.
         let e = Stack::parse("name=\"x\"\n[services.a]\nimgae=\"alpine\"\n").unwrap_err();
         assert!(e.to_string().contains("imgae"), "{e}");
+    }
+
+    #[test]
+    fn independent_services_land_in_one_level() {
+        // What `down` relies on: services with no dependency between
+        // them are stopped at the same time, so the grace period is
+        // paid once rather than once per service.
+        let s = Stack::parse(
+            "name=\"x\"\n[services.a]\nimage=\"i\"\n[services.b]\nimage=\"i\"\n\
+             [services.c]\nimage=\"i\"\ndepends_on=[\"a\"]\n",
+        )
+        .unwrap();
+        let levels = s.start_levels().unwrap();
+        assert_eq!(levels, vec![vec!["a", "b"], vec!["c"]]);
+        // And every service appears exactly once, in a level after
+        // everything it depends on.
+        let flat: Vec<String> = levels.into_iter().flatten().collect();
+        assert_eq!(flat.len(), 3);
+        assert!(
+            flat.iter().position(|n| n == "a") < flat.iter().position(|n| n == "c"),
+            "{flat:?}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_refused_by_levels_too() {
+        let s = Stack::parse(
+            "name=\"x\"\n[services.a]\nimage=\"i\"\ndepends_on=[\"b\"]\n\
+             [services.b]\nimage=\"i\"\ndepends_on=[\"a\"]\n",
+        )
+        .unwrap();
+        let e = s.start_levels().unwrap_err();
+        assert!(e.to_string().contains("cycle"), "{e}");
     }
 
     #[test]

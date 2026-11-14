@@ -217,9 +217,144 @@ by owning them.
 
 ---
 
-## 6. Reproducing this
+## 6. Compatibility, as a rate
+
+`scripts/compat-matrix.sh`, twelve real images, both engines on one
+kernel. Docker is the reference: an image Docker itself cannot run is
+reported and excluded rather than counted against us.
+
+There is no "3x more compatible", and the question is worth answering
+precisely because the honest answer is a shape rather than a multiple.
+Compatibility is **parity** - the target is that an image behaves
+identically - so what follows is a rate, with the denominators.
+
+| | measured |
+|---|---|
+| images offered | 12 |
+| excluded (Docker could not run it) | 0 |
+| `id -u`, `id -g`, `pwd`, `$PATH` byte-identical | **12/12** |
+| exit status of the image's own ENTRYPOINT/CMD identical | **12/12** |
+
+alpine, debian, ubuntu, busybox, python, node, nginx, redis, postgres,
+httpd, memcached, golang. The interesting ones are `redis`, `postgres`
+and `memcached`, which set `USER` to a *name* that has to be resolved
+through the image's own `/etc/passwd`, and `nginx`, whose ENTRYPOINT is
+a script that runs other scripts.
+
+The same run timed one container start per image, which is the first
+time the speed claim has been measured on anything but alpine:
+
+| image | docker | rustainer | |
+|---|---|---|---|
+| alpine:3.21 | 87ms | 11ms | 7.5x |
+| debian:12-slim | 76ms | 10ms | 7.0x |
+| ubuntu:24.04 | 76ms | 10ms | 7.1x |
+| busybox:1.37 | 77ms | 10ms | 7.1x |
+| python:3.13-slim | 80ms | 10ms | 7.4x |
+| node:22-alpine | 77ms | 11ms | 6.6x |
+| nginx:1.27-alpine | 75ms | 11ms | 6.8x |
+| redis:7-alpine | 77ms | 10ms | 7.0x |
+| postgres:17-alpine | 77ms | 10ms | 7.2x |
+| httpd:2.4-alpine | 79ms | 10ms | 7.3x |
+| memcached:1.6-alpine | 80ms | 11ms | 6.9x |
+| golang:1.23-alpine | 87ms | 12ms | 6.9x |
+
+**6.6x to 7.5x, and the image barely matters.** That is the signature of
+a difference that is architectural rather than incidental: the work both
+engines skip for an image already in the store is the same work, so what
+is left is the path from the command to `clone`.
+
+---
+
+## 7. Stacks, against Docker Compose
+
+`scripts/stack-bench.sh`, the same three-service application written once
+as `compose.yaml` and once as `rustainer.toml`, against Compose v2.40.3.
+
+`up` is measured not to the command returning but to every service being
+able to reach every other **by name**, because a stack whose containers
+exist and cannot find each other is not up.
+
+| | docker compose | rustainer | |
+|---|---|---|---|
+| `up`, to mutually reachable by name | 209-361ms | 35-39ms | **6.0-9.3x** |
+| `down -t 1` | 1293ms | 1048ms | 1.2x |
+
+**Two things this measurement changed rather than confirmed**, which is
+the only reason it was worth running:
+
+- **`down` was 2.4x SLOWER** (3.1s against 1.3s) until it was measured.
+  `down` stopped one service at a time in reverse dependency order, and
+  nearly all of what `down` costs is the grace period, because PID 1 in
+  a new PID namespace ignores a SIGTERM it has no handler for. Three
+  services meant waiting three times. Services in one dependency level
+  are independent *by definition*, so they are now stopped together, and
+  `down` grew the `-t` Compose has always had. The first version of the
+  benchmark also gave Compose `-t 1` and us our own default, which
+  measured the flag rather than the engine.
+- **"Stricter about typos" did not survive the measurement.** A
+  misspelled service key is refused here - and `docker compose` refuses
+  it too. Parity. A comment in `crates/cli/src/stack.rs` claimed
+  otherwise and has been corrected.
+
+### What Compose has that these stacks do not
+
+profiles, `extends`, several `-f` files merged in order; `depends_on`
+with `condition: service_healthy` (there are no healthchecks here);
+`build:` for a service built as part of the stack; `deploy`/replicas,
+per-service `restart`, configs and secrets; `${VAR}` interpolation from
+the environment and `.env`; `watch`/`develop`; and `compose run` for a
+one-off container against the stack.
+
+---
+
+## 8. The page, against Docker Desktop
+
+Measured on one macOS machine with Docker Desktop running.
+
+| | Docker Desktop | rustainer |
+|---|---|---|
+| resident while you look at it | **718-745 MiB** across 8-9 processes | **3.9 MiB** (`rustainer serve`) |
+| on disk | 2.1 GB app bundle | 5.1 MB binary, UI included |
+| the UI itself | Electron | one 53 KB HTML file |
+| loaded from the network | — | **nothing**: no CDN, no font, no framework |
+| resident when you are not looking | dockerd + containerd, always | **0** - `serve` is a process you start and stop |
+
+That is roughly **190x** less resident memory, but the comparison needs
+a caveat stated plainly rather than buried: **a large part of what
+Docker Desktop's footprint buys is a Linux VM on a machine that does not
+have a Linux kernel.** rustainer does not do that at all - it requires a
+Linux host and has no macOS or Windows story. Against Docker Desktop
+*running on Linux* the gap would be smaller, and the honest claim is
+about the UI process, not about replacing the product.
+
+What the page does that is worth something:
+
+- **A real terminal into a container**, with a pty, from the browser.
+- **The commands it ran**, shown as CLI you could have typed. The page
+  teaches its own command line rather than hiding it.
+- **It says what it does not know.** A container's memory reads `-`,
+  not `0B`, when the memory controller is not enabled in that subtree,
+  and hovering says why. The summary tile sums only the containers whose
+  usage is actually known - it printed `0B` until this was measured,
+  which reads as "using nothing".
+
+### What Docker Desktop has that this does not
+
+Kubernetes, the extensions marketplace, Dev Environments, Docker Scout
+and image vulnerability scanning, multi-platform builds, a settings GUI
+for CPU/memory/disk allocation, sign-in and Hub integration, a volume
+file browser, log search, update management - and the VM.
+
+---
+
+## 9. Reproducing this
 
 ```sh
+# Sections 6 and 7 run on the same host as section 2:
+#   docker exec -e RUSTAINER_BIN=/w/rustainer-musl bench bash scripts/compat-matrix.sh
+#   docker exec -e RUSTAINER_BIN=/w/rustainer-musl bench bash scripts/stack-bench.sh
+
 # Build a static binary (any Linux host with a toolchain can skip the container)
 docker run --rm --platform linux/arm64 -v "$PWD":/w -w /w \
     -e CC_aarch64_unknown_linux_musl=musl-gcc rust:1.96-slim bash -c '

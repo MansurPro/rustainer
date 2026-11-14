@@ -102,6 +102,16 @@ for marker in "view-networks" "view-events" "terminal" "palette"; do
 done
 EXTERNAL=$(printf '%s' "$PAGE" | grep -coE '(src|href)="https?://|@import|fonts\.googleapis' || true)
 check "still nothing from the network" "$EXTERNAL" "0"
+# The terminal declares itself a key sink, and the page's shortcuts ask
+# about that rather than about tag names. The bug: "/" focuses the
+# filter box, and its guard excluded only INPUT and TEXTAREA - so a
+# terminal, which is a focusable div, lost focus the moment you typed an
+# absolute path. `cat /etc/hosts` put `cat ` in the terminal and
+# `etc/hosts` in the filter, which is every second command a person
+# types into a shell.
+contains "the terminal declares itself a key sink" "$PAGE" "keysink"
+check "and no shortcut guards on tag names alone" \
+    "$(printf '%s' "$PAGE" | grep -c 'tagName !== "INPUT"' || true)" "0"
 
 echo
 echo "2. Networks and events are served"
