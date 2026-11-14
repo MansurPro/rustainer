@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 HOST=${1:-}
 [ -n "$HOST" ] || { sed -n '2,16p' "$0" >&2; exit 2; }
 shift
-STAGES=${*:-1 2 3 4 5 6 7 8 9 10 11}
+STAGES=${*:-1 2 3 4 5 6 7 8 9 10 11 12}
 
 ARCH=$(ssh -o BatchMode=yes "$HOST" 'uname -m')
 case "$ARCH" in
@@ -55,7 +55,7 @@ docker run --rm --platform "$PLATFORM" -v "$PWD":/w -v "$OUT":/out -w /w \
 DIR=/tmp/rustainer-test
 ssh -o BatchMode=yes "$HOST" "rm -rf $DIR && mkdir -p $DIR/scripts"
 scp -q "$OUT/rustainer" "$OUT/unit-tests" "$HOST:$DIR/"
-scp -q scripts/stage*-success-test.sh "$HOST:$DIR/scripts/"
+scp -q scripts/stage*-success-test.sh scripts/remote-stage-runner.sh "$HOST:$DIR/scripts/"
 
 # A delegated cgroup scope when the host has a user systemd, so the resource
 # stages exercise real limits instead of only the refusal path. Without it
@@ -77,21 +77,13 @@ ssh -o BatchMode=yes "$HOST" "
     ./unit-tests 2>&1 | tail -3
     for s in \$STAGES_LIST; do
         echo; echo \"=== stage \$s ===\"
-        if [ \"\$s\" = 11 ]; then
-            # Stage 11 gets NO wrapper, and that is the whole point of it:
-            # the engine makes its own user namespace. Run inside `unshare`
-            # it would find CAP_SYS_ADMIN already present, never create one,
-            # and pass without testing anything.
-            \$SCOPE env RUSTAINER_BIN=$DIR/rustainer TMPDIR=$DIR/tmp \
-                bash scripts/stage11-success-test.sh 2>&1 | tail -n 10
-            continue
-        fi
-        # Unprivileged by design: a user namespace gives CAP_SYS_ADMIN in the
-        # namespace that owns our mount and pid namespaces, which is all these
-        # stages need. Expressing it this way is also what proves the rootless
-        # seam of RND.md 18.6 is holding.
-        \$SCOPE unshare --user --map-root-user \
-            env RUSTAINER_BIN=$DIR/rustainer bash scripts/stage\${s}-success-test.sh \
-            2>&1 | tail -n 8
+        # Unprivileged by design: a user namespace gives CAP_SYS_ADMIN in
+        # the namespace that owns our mount and pid namespaces, which is
+        # all these stages need. Expressing it this way is also what proves
+        # the rootless seam of RND.md 18.6 is holding. Stage 11 is the one
+        # exception, and the runner is told so rather than guessing.
+        WRAP=wrap; [ \"\$s\" = 11 ] && WRAP=nowrap
+        \$SCOPE bash $DIR/scripts/remote-stage-runner.sh $DIR \$s \$WRAP \
+            2>&1 | tail -n 10
     done
 "

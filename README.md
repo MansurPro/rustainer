@@ -54,13 +54,14 @@ is easier to reason about once the process model is not also in question.
 | 9 | Bridge, NAT and the outside world | **Done** |
 | 10 | Published ports | **Done** |
 | 11 | Single-ID rootless | **Done** |
+| 12 | `exec` — a second process in a live container | **Done** |
 
-The ladder is complete. What it deliberately never reaches — `exec` and
-`attach`, restart policies, `events`, volumes, `commit` and `build`, push, a
-daemon or HTTP API, Compose-shaped orchestration, checkpoint/restore, drop-in
-OCI runtime compatibility — is listed in `research/pass-2/RND.md` §19, with
-why each is additive given these eleven and why none belongs in a first
-implementation whose purpose is understanding the mechanisms.
+The eleven-stage ladder of `research/pass-2/RND.md` §17 is complete, and
+stage 12 begins the additive work §19 held back until the mechanisms were
+understood. What is still deliberately absent — `attach`, restart policies,
+`events`, volumes, `commit` and `build`, push, checkpoint/restore, drop-in
+OCI runtime compatibility — is listed there with why each is additive given
+the eleven.
 
 ### Building and testing
 
@@ -116,6 +117,7 @@ rustainer run -d --rootfs ./alpine-rootfs --hostname boxy \
     --user 1000:1000 --cap-drop ALL /bin/sh -c 'sleep 60'
 rustainer ps
 rustainer logs <id>
+rustainer exec -e TZ=UTC <id> /bin/sh -c 'ps -o pid,comm'
 rustainer stop -t 5 <id>
 rustainer rm <id>
 ```
@@ -262,6 +264,44 @@ check, because forwarding is something an operator can fix in one command
 and the missing capability is not. Reporting the fixable one first sends a
 rootless user off to run a `sysctl` that changes nothing about their
 problem.
+
+**`exec` is the only operation that joins namespaces instead of creating
+them**, and the asymmetry between those two verbs is the whole of it.
+`clone3` takes a flag word; `setns(2)` takes one descriptor at a time, so
+there is no atomic "join these six" and a half-joined process is a process
+that looks fine while running slightly outside the container. Who joins what
+is forced rather than chosen:
+
+- `setns(CLONE_NEWPID)` **does not move the caller**. It decides where the
+  caller's next child is created. Joining a pid namespace is therefore
+  `setns` *and then fork*, and the fork is not an implementation detail — it
+  is the join.
+- The **mount namespace is joined by the child, not the parent**, because
+  `setns(CLONE_NEWNS)` calls `set_fs_root` and `set_fs_pwd` on the caller.
+  Join it in the parent and `/proc` becomes the container's — mounted
+  against a pid namespace the parent is not in — so `/proc/self` resolves to
+  nothing and the single-thread check that `clone3` depends on fails
+  `ENOENT` while reporting a thread-count problem.
+- `setns` of a user or mount namespace **refuses a multi-threaded caller**.
+  The no-async rule adopted in stage 1 for `clone3`'s sake is what makes
+  `exec` possible at all; an engine with a thread pool would have had to
+  re-exec a helper here.
+
+The second process is placed in the container's cgroup at clone time by
+`CLONE_INTO_CGROUP`, so it is never outside the container's limits, not even
+briefly. The cgroup is found by reading `/proc/<init>/cgroup` rather than by
+rebuilding the path from the container id — `exec` may run from a different
+login session, and therefore a different slice, than the `run` that created
+it.
+
+The command is resolved through `/proc/<init>/root`, which is the only view
+that is correct: a container's root is an overlay mounted inside its own
+mount namespace, so searching the image's layers on disk would miss
+everything the container has written since it started.
+
+The stage 12 test asserts namespace *identity*, by inode, not behaviour — a
+freshly created namespace of the same kind passes every behavioural check
+and fails that one.
 
 ### The engine does not lie about what it does not know
 

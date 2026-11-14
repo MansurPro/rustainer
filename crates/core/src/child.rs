@@ -51,6 +51,7 @@ pub enum Step {
     WorkingDirectory = 10,
     Loopback = 11,
     Interface = 12,
+    JoinNamespace = 13,
 }
 
 impl Step {
@@ -68,6 +69,7 @@ impl Step {
             10 => Step::WorkingDirectory,
             11 => Step::Loopback,
             12 => Step::Interface,
+            13 => Step::JoinNamespace,
             _ => return None,
         })
     }
@@ -86,6 +88,7 @@ impl Step {
             Step::WorkingDirectory => "entering the image's working directory",
             Step::Loopback => "bringing up the loopback interface",
             Step::Interface => "configuring the container's network interface",
+            Step::JoinNamespace => "joining an existing container's namespaces",
         }
     }
 }
@@ -143,6 +146,16 @@ pub struct ChildPlan {
     hostname: Option<CString>,
     /// The image's `WorkingDir`, entered after the pivot.
     workdir: Option<CString>,
+    /// Namespaces to **join**, in order, before anything else (`exec`).
+    ///
+    /// Empty for a container being created. For `exec` this is where the
+    /// mount namespace is entered, and it is entered by the child rather
+    /// than the parent on purpose: `setns(CLONE_NEWNS)` repoints the
+    /// caller's root and cwd at the container, which would take
+    /// `/proc/self/stat` away from the parent - and that file is how
+    /// [`crate::spawn`] checks the single-thread invariant. The parent
+    /// would be checking an invariant it could no longer read.
+    join: Vec<OwnedFd>,
     /// Unshare the cgroup namespace once placement has happened.
     cgroup_ns: bool,
     /// Bring `lo` up, which a new network namespace does not do for us.
@@ -195,6 +208,7 @@ pub struct ChildSpec<'a> {
     pub hostname: Option<&'a OsStr>,
     pub workdir: Option<&'a OsStr>,
     pub mounts: Option<mount::MountPlan>,
+    pub join: Vec<OwnedFd>,
     pub cgroup_ns: bool,
     pub loopback: bool,
     pub net_messages: &'a [crate::net::Message],
@@ -225,6 +239,7 @@ impl ChildPlan {
             hostname,
             workdir,
             mounts,
+            join,
             cgroup_ns,
             loopback,
             net_messages,
@@ -292,6 +307,7 @@ impl ChildPlan {
             envp: envp_ptrs,
             hostname,
             workdir,
+            join,
             cgroup_ns,
             loopback,
             net_messages: net_messages.to_vec(),
@@ -332,6 +348,21 @@ pub unsafe fn child_main(plan: &ChildPlan) -> ! {
             Ok(_) => fail(plan, Step::AwaitParent, 0, Errno::PIPE),
             Err(Errno::INTR) => continue,
             Err(e) => fail(plan, Step::AwaitParent, 0, e),
+        }
+    }
+
+    // 1a. Join an existing container's namespaces (`exec` only).
+    //
+    // Before everything, because every step below is supposed to happen
+    // inside the container rather than beside it. The mount namespace goes
+    // last within this list: `setns(CLONE_NEWNS)` calls `set_fs_root` and
+    // `set_fs_pwd`, so the moment it succeeds this process's root and cwd
+    // are the container's - and the host paths it might still have wanted
+    // are gone. The kernel doing that for us is also why there is no
+    // lingering host-directory reference to close here.
+    for (i, fd) in plan.join.iter().enumerate() {
+        if let Err(e) = sys::setns(fd, 0) {
+            fail(plan, Step::JoinNamespace, i as u8, e);
         }
     }
 

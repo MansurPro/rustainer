@@ -179,10 +179,19 @@ echo
 echo "6. Where a facility is unavailable, it is NAMED - not quietly skipped"
 # This is half the stage. An engine that silently gives you no limits, or
 # a container with no network and no explanation, is the failure mode.
-OUT=$(timeout 60 "$B" run --network none -m 64m --layer "$BASE" /bin/true 2>&1)
-echo "$OUT" | grep -q 'cannot be enforced' && echo "$OUT" | grep -q 'Delegate=yes' \
-    && ok "a limit with no writable cgroup refuses and names the fix" \
-    || bad "the cgroup degradation was not named"
+# Which of the two outcomes is correct depends on the host, so the test
+# asks the host first. Asserting only the refusal would turn a *working*
+# delegated cgroup into a failure - which is what happened the day the test
+# harness learned to step out of its own scope.
+OUT=$(timeout 60 "$B" run --network none -m 64m --layer "$BASE" \
+        /bin/cat /sys/fs/cgroup/memory.max 2>&1)
+if echo "$OUT" | grep -q '^67108864$'; then
+    ok "a limit IS enforced here, and the container reads it back as 64m"
+elif echo "$OUT" | grep -q 'cannot be enforced' && echo "$OUT" | grep -q 'Delegate=yes'; then
+    ok "a limit with no writable cgroup refuses and names the fix"
+else
+    bad "a limit neither applied nor refused with a reason: $(echo "$OUT" | tail -1)"
+fi
 OUT=$(timeout 60 "$B" run --layer "$BASE" /bin/true 2>&1)
 echo "$OUT" | grep -q 'CAP_NET_ADMIN' && echo "$OUT" | grep -q 'network none' \
     && ok "bridged networking refuses and names what is degraded" \

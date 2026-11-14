@@ -73,6 +73,11 @@ jobs:
       # reachability.
       - name: Stage 10 success test
         run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage10-success-test.sh
+      # `exec` is the only operation in the engine that JOINS namespaces
+      # rather than creating them, and a half-joined process looks fine.
+      # This asserts namespace identity by inode, not by behaviour.
+      - name: Stage 12 success test
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/stage12-success-test.sh
       # In a delegated scope, so the resource stage exercises real limits
       # rather than only the refusal path, and so it never touches the
       # runner's own cgroup.
@@ -112,7 +117,7 @@ jobs:
             echo "::error::unprivileged user namespaces are unavailable on this runner"
             exit 1
           }
-          for s in 1 2 3 4 5 6 7 8 9 10; do
+          for s in 1 2 3 4 5 6 7 8 9 10 12; do
             systemd-run --user --scope -p Delegate=yes -q \
               unshare --user --map-root-user \
               env RUSTAINER_BIN="$PWD/target/release/rustainer" \

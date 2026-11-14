@@ -367,6 +367,20 @@ pub enum Error {
          it never ran the command"
     )]
     DiedBeforeStart,
+
+    #[error("container {id} is {status}, not running")]
+    NotRunning { id: String, status: &'static str },
+    #[error("joining the container's {ns} namespace: {source}")]
+    JoinNamespace {
+        ns: &'static str,
+        #[source]
+        source: sys::Error,
+    },
+    #[error(
+        "{cmd:?} is not in the container's PATH directories. Give an absolute path, \
+         or check the image actually contains it."
+    )]
+    NotFoundInContainer { cmd: String },
 }
 
 impl From<sys::Error> for Error {
@@ -477,10 +491,13 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
     let mut spawned = crate::spawn(
         &spec,
         mounts,
-        Some(config.security()?),
-        Some(stdio),
-        Some(fifo_opath),
-        cg.as_ref().map(|c| c.fd()),
+        crate::Attach {
+            security: Some(config.security()?),
+            stdio: Some(stdio),
+            exec_fifo: Some(fifo_opath),
+            cgroup_fd: cg.as_ref().map(|c| c.fd()),
+            ..Default::default()
+        },
     )?;
 
     // Our copies of the child's write ends must go, or the reads below can
