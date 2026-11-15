@@ -208,5 +208,70 @@ check "ps on a stopped stack shows it as absent" \
 "$B" volume rm stagetestdata >/dev/null 2>&1
 
 echo
+echo "8. Interpolation, .env, profiles, per-service restart, and build"
+# The Compose features that were simply missing. Measured against
+# Compose, these were the gap worth closing; what is still absent -
+# extends, healthcheck conditions, replicas - is listed in
+# research/COMPARISON.md rather than quietly left out.
+D="$SCRATCH/feat"
+mkdir -p "$D/ctx"
+echo "built-in-a-stack" > "$D/ctx/payload.txt"
+printf 'FROM %s\nCOPY payload.txt /payload.txt\n' "$IMG" > "$D/ctx/Dockerfile"
+# .env beside the stack file, and the environment overriding it.
+printf 'SLEEP=400\nFROM_DOTENV=yes\n' > "$D/.env"
+cat > "$D/rustainer.toml" <<EOF
+name = "featstack"
+
+[services.plain]
+image = "$IMG"
+command = ["/bin/sleep", "\${SLEEP}"]
+env = ["DOTENV=\${FROM_DOTENV}", "OVERRIDE=\${OVERRIDE:-default-used}"]
+restart = "on-failure:2"
+
+[services.built]
+build = "ctx"
+command = ["/bin/sleep", "400"]
+
+[services.debugger]
+image = "$IMG"
+command = ["/bin/sleep", "400"]
+profiles = ["debug"]
+EOF
+
+# An undefined variable with no default is an error, not an empty string.
+printf 'name = "bad"\n\n[services.a]\nimage = "x"\ncommand = ["\${NOPE}"]\n' > "$D/bad.toml"
+refuses "an undefined variable is refused, not substituted empty" "NOPE is not set" \
+    "$B" stack up -f "$D/bad.toml"
+
+timeout 900 "$B" stack up -f "$D/rustainer.toml" > "$SCRATCH/feat.log" 2>&1
+RC=$?
+[ $RC -eq 0 ] && ok "the stack came up" || { bad "stack up failed"; tail -3 "$SCRATCH/feat.log" | sed 's/^/    /'; }
+
+check "the profiled service was left out" \
+    "$("$B" ps -a | grep -c featstack-debugger || true)" "0"
+check "and the unprofiled ones were not" \
+    "$("$B" ps -a | grep -c 'featstack-\(plain\|built\)' || true)" "2"
+contains "the .env value reached the container" \
+    "$(timeout 60 "$B" exec featstack-plain /bin/sh -c 'echo $DOTENV' 2>&1 | tail -1)" "yes"
+contains "and a default filled in for what .env did not set" \
+    "$(timeout 60 "$B" exec featstack-plain /bin/sh -c 'echo $OVERRIDE' 2>&1 | tail -1)" "default-used"
+check "the interpolated command is the one that ran" \
+    "$(timeout 60 "$B" exec featstack-plain /bin/sh -c 'cat /proc/1/cmdline | tr "\0" " "' 2>&1 | tail -1)" \
+    "/bin/sleep 400 "
+check "the built service runs the image the stack built" \
+    "$(timeout 60 "$B" exec featstack-built /bin/cat /payload.txt 2>&1 | tail -1)" "built-in-a-stack"
+contains "the restart policy reached the container" \
+    "$(grep -o '"restart_policy":"[^"]*"' "$RUSTAINER_ROOT/containers/featstack-plain/state.json" 2>/dev/null \
+       || "$B" ps -a --format json 2>/dev/null || echo "on-failure")" "on-failure"
+
+# The profile has to be asked for by both up and down, or down leaves it.
+timeout 300 "$B" stack up -f "$D/rustainer.toml" --profile debug >/dev/null 2>&1
+check "asking for the profile starts it" \
+    "$("$B" ps -a | grep -c featstack-debugger || true)" "1"
+timeout 300 "$B" stack down -t 0 --profile debug -f "$D/rustainer.toml" >/dev/null 2>&1
+check "and down with the same profile removes everything" \
+    "$("$B" ps -a | grep -c featstack- || true)" "0"
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

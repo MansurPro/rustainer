@@ -297,14 +297,35 @@ the only reason it was worth running:
   it too. Parity. A comment in `crates/cli/src/stack.rs` claimed
   otherwise and has been corrected.
 
-### What Compose has that these stacks do not
+### Closed because this measurement made the gap concrete
 
-profiles, `extends`, several `-f` files merged in order; `depends_on`
-with `condition: service_healthy` (there are no healthchecks here);
-`build:` for a service built as part of the stack; `deploy`/replicas,
-per-service `restart`, configs and secrets; `${VAR}` interpolation from
-the environment and `.env`; `watch`/`develop`; and `compose run` for a
-one-off container against the stack.
+Four of the six things this section used to list are now implemented,
+which is the practical result of running the comparison at all:
+
+- **`profiles`** and `--profile`. A service with no profiles is always
+  in; one with them is in only when asked for. A kept service that
+  depends on an excluded one is **refused**, rather than started without
+  it or silently dragging it in.
+- **`${VAR}` interpolation with `.env`**, read from beside the *stack
+  file* rather than the working directory, with the environment winning
+  over the file. An **undefined variable with no default is an error** -
+  Compose substitutes empty and warns, which turns `${PORT}:80` into
+  `:80` and fails somewhere else entirely. `${VAR:-}` asks for empty on
+  purpose, and `$$` is a literal dollar.
+- **`build:`** - a service built from a Dockerfile as part of the stack,
+  with the context relative to the stack file. Everything that has to be
+  built is built **before any address is allocated or any container
+  starts**, because a stack that starts three services and then fails to
+  build the fourth leaves the operator worse off than one that refused.
+- **`restart`** per service, validated at parse time so a typo is caught
+  before half the stack is running.
+
+### What Compose still has that these stacks do not
+
+`extends` and several `-f` files merged in order; `depends_on` with
+`condition: service_healthy` (there are no healthchecks here);
+`deploy`/replicas; configs and secrets; `watch`/`develop`; and
+`compose run` for a one-off container against the stack.
 
 ---
 

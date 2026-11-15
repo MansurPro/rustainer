@@ -29,7 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -43,7 +43,30 @@ pub struct Stack {
 #[derive(Debug, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
+    /// The image to run. Optional only when `build` is given, in which
+    /// case it names the tag the build produces.
+    #[serde(default)]
     pub image: String,
+    /// Build this service's image from a Dockerfile before starting it.
+    ///
+    /// The value is a context directory, relative to the stack file -
+    /// not to the working directory - because a stack file that means
+    /// something different depending on where you ran it from is the
+    /// whole problem with relative paths in configuration.
+    #[serde(default)]
+    pub build: Option<String>,
+    /// `no` (the default), `always`, `unless-stopped`, `on-failure`, or
+    /// `on-failure:N`. The same strings `run --restart` takes.
+    #[serde(default)]
+    pub restart: Option<String>,
+    /// Profiles this service belongs to.
+    ///
+    /// A service with profiles is NOT started unless one of them is
+    /// named with `--profile`. A service with none always is, which is
+    /// the same rule Compose uses and the only one that keeps an
+    /// unprofiled file behaving as it did.
+    #[serde(default)]
+    pub profiles: Vec<String>,
     /// Overrides the image's own entrypoint and command.
     ///
     /// A LIST, always - `["/bin/sh", "-c", "echo hi; sleep 1"]` - and
@@ -115,8 +138,19 @@ impl Stack {
             bail!("the stack has no services, so there is nothing to start");
         }
         for (name, svc) in &stack.services {
-            if svc.image.trim().is_empty() {
-                bail!("service {name:?} has no image");
+            if svc.image.trim().is_empty() && svc.build.is_none() {
+                bail!(
+                    "service {name:?} has neither `image` nor `build`, so there is \
+                     nothing to run. Give it an image to pull, or a `build` context \
+                     to build one from."
+                );
+            }
+            if let Some(r) = &svc.restart {
+                // Parsed here rather than at start time: a stack file with
+                // a typo in it should be refused before half of it is
+                // running.
+                crate::supervise_restart_check(r)
+                    .with_context(|| format!("service {name:?}: `restart`"))?;
             }
             for dep in &svc.depends_on {
                 if !stack.services.contains_key(dep) {
@@ -134,6 +168,130 @@ impl Stack {
             }
         }
         Ok(stack)
+    }
+
+    /// Expand `${VAR}` and `${VAR:-default}` before the TOML is parsed.
+    ///
+    /// Values come from `vars` - which `read_stack` fills from a `.env`
+    /// beside the stack file and then from the process environment, so
+    /// the environment wins, as it does in Compose.
+    ///
+    /// **An undefined variable with no default is an error**, not an
+    /// empty string. Compose substitutes empty and warns; the result is
+    /// `ports = [":80"]` and a stack that fails somewhere else entirely.
+    /// `${VAR:-}` is how you ask for empty on purpose.
+    pub fn interpolate(text: &str, vars: &BTreeMap<String, String>) -> Result<String> {
+        let mut out = String::with_capacity(text.len());
+        let b = text.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            // `$$` is a literal `$`, so a password that contains ${ can
+            // still be written down.
+            if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'$' {
+                out.push('$');
+                i += 2;
+                continue;
+            }
+            if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
+                let Some(end) = text[i + 2..].find('}').map(|e| i + 2 + e) else {
+                    bail!("`${{` at byte {i} is never closed with `}}`");
+                };
+                let body = &text[i + 2..end];
+                let (name, default) = match body.split_once(":-") {
+                    Some((n, d)) => (n, Some(d)),
+                    None => (body, None),
+                };
+                let name = name.trim();
+                if name.is_empty() {
+                    bail!("`${{}}` has no variable name in it");
+                }
+                match vars.get(name) {
+                    Some(v) => out.push_str(v),
+                    None => match default {
+                        Some(d) => out.push_str(d),
+                        None => bail!(
+                            "{name} is not set, and `${{{name}}}` has no default. \
+                             Set it in the environment or in a .env file beside the \
+                             stack file, or write `${{{name}:-something}}`."
+                        ),
+                    },
+                }
+                i = end + 1;
+                continue;
+            }
+            let ch = text[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        Ok(out)
+    }
+
+    /// Parse a `.env` file: `KEY=value` per line, `#` comments, blanks
+    /// ignored. Deliberately not a shell: no `export`, no substitution,
+    /// no quoting rules to get wrong.
+    pub fn parse_dotenv(text: &str) -> Result<BTreeMap<String, String>> {
+        let mut out = BTreeMap::new();
+        for (n, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                bail!("line {} of the .env file is not KEY=value: {line:?}", n + 1);
+            };
+            // One layer of surrounding quotes is removed, because every
+            // .env file in the world has them and leaving them in makes
+            // a password that silently includes a quote character.
+            let v = v.trim();
+            let v = v
+                .strip_prefix('"')
+                .and_then(|r| r.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+                .unwrap_or(v);
+            out.insert(k.trim().to_owned(), v.to_owned());
+        }
+        Ok(out)
+    }
+
+    /// The services that `--profile` selects.
+    ///
+    /// A service with no profiles is always in. A service with profiles
+    /// is in only when one of them was asked for. Dependencies are NOT
+    /// pulled in implicitly: a service that is left out while something
+    /// that depends on it is kept is an error, because starting it
+    /// anyway would quietly ignore the profile and leaving it out would
+    /// break the dependant.
+    pub fn select_profiles(&mut self, enabled: &[String]) -> Result<()> {
+        let keep: BTreeSet<String> = self
+            .services
+            .iter()
+            .filter(|(_, s)| {
+                s.profiles.is_empty() || s.profiles.iter().any(|p| enabled.contains(p))
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        for (name, svc) in &self.services {
+            if !keep.contains(name) {
+                continue;
+            }
+            for dep in &svc.depends_on {
+                if !keep.contains(dep) {
+                    bail!(
+                        "service {name:?} is in this run but depends on {dep:?}, which \
+                         its profiles leave out. Add {dep:?} to a profile you asked \
+                         for, or give {name:?} the same profiles it has."
+                    );
+                }
+            }
+        }
+        self.services.retain(|n, _| keep.contains(n));
+        if self.services.is_empty() {
+            bail!(
+                "no service is in any of the profiles you asked for, so there is \
+                 nothing to start"
+            );
+        }
+        Ok(())
     }
 
     /// The container name for a service: `<stack>-<service>`.
@@ -309,6 +467,93 @@ depends_on = ["db"]
             flat.iter().position(|n| n == "a") < flat.iter().position(|n| n == "c"),
             "{flat:?}"
         );
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn interpolation_substitutes_defaults_and_refuses_the_undefined() {
+        let v = vars(&[("TAG", "3.21")]);
+        assert_eq!(
+            Stack::interpolate("image = \"alpine:${TAG}\"", &v).unwrap(),
+            "image = \"alpine:3.21\""
+        );
+        assert_eq!(
+            Stack::interpolate("x = \"${MISSING:-fallback}\"", &v).unwrap(),
+            "x = \"fallback\""
+        );
+        // Empty on purpose is spelled out, so it cannot happen by accident.
+        assert_eq!(
+            Stack::interpolate("x = \"${M:-}\"", &v).unwrap(),
+            "x = \"\""
+        );
+        // `$$` is a literal dollar.
+        assert_eq!(
+            Stack::interpolate("x = \"a$$b\"", &v).unwrap(),
+            "x = \"a$b\""
+        );
+
+        // The one that matters: Compose substitutes empty and warns, which
+        // turns `${PORT}:80` into `:80` and fails somewhere else entirely.
+        let e = Stack::interpolate("ports = [\"${PORT}:80\"]", &v).unwrap_err();
+        assert!(e.to_string().contains("PORT is not set"), "{e}");
+        let e = Stack::interpolate("x = \"${UNCLOSED\"", &v).unwrap_err();
+        assert!(e.to_string().contains("never closed"), "{e}");
+    }
+
+    #[test]
+    fn dotenv_is_not_a_shell() {
+        let m = Stack::parse_dotenv("# a comment\n\nTAG=3.21\nQUOTED=\"a b\"\n").unwrap();
+        assert_eq!(m.get("TAG").unwrap(), "3.21");
+        assert_eq!(m.get("QUOTED").unwrap(), "a b");
+        assert!(Stack::parse_dotenv("NOTKEYVALUE\n").is_err());
+    }
+
+    #[test]
+    fn profiles_select_services_and_catch_a_broken_dependency() {
+        let text = "name=\"x\"\n\
+                    [services.web]\nimage=\"i\"\n\
+                    [services.debugger]\nimage=\"i\"\nprofiles=[\"debug\"]\n";
+        // Unprofiled services are always in; profiled ones are not.
+        let mut s = Stack::parse(text).unwrap();
+        s.select_profiles(&[]).unwrap();
+        assert_eq!(s.services.keys().collect::<Vec<_>>(), vec!["web"]);
+
+        let mut s = Stack::parse(text).unwrap();
+        s.select_profiles(&["debug".into()]).unwrap();
+        assert_eq!(s.services.len(), 2);
+
+        // A kept service depending on an excluded one is refused rather
+        // than started without it.
+        let mut s = Stack::parse(
+            "name=\"x\"\n[services.web]\nimage=\"i\"\ndepends_on=[\"db\"]\n\
+             [services.db]\nimage=\"i\"\nprofiles=[\"extra\"]\n",
+        )
+        .unwrap();
+        let e = s.select_profiles(&[]).unwrap_err();
+        assert!(e.to_string().contains("profiles leave out"), "{e}");
+    }
+
+    #[test]
+    fn a_service_needs_an_image_or_a_build() {
+        let e = Stack::parse("name=\"x\"\n[services.a]\n").unwrap_err();
+        assert!(e.to_string().contains("neither `image` nor `build`"), "{e}");
+        // `build` alone is enough: the tag is derived from the names.
+        let s = Stack::parse("name=\"x\"\n[services.a]\nbuild=\".\"\n").unwrap();
+        assert_eq!(s.services["a"].build.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn a_bad_restart_policy_is_refused_at_parse_time() {
+        // Before anything starts, not when that one service does.
+        let e = Stack::parse("name=\"x\"\n[services.a]\nimage=\"i\"\nrestart=\"sometimes\"\n")
+            .unwrap_err();
+        assert!(e.to_string().contains("restart"), "{e}");
     }
 
     #[test]

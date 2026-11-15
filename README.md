@@ -597,6 +597,7 @@ rustainer stack up    -f examples/rustainer.toml
 rustainer stack ps    -f examples/rustainer.toml
 rustainer stack down  -f examples/rustainer.toml
 rustainer stack down  -t 1 -f examples/rustainer.toml   # a shorter grace
+rustainer stack up    --profile debug -f examples/rustainer.toml
 ```
 
 ```toml
@@ -632,6 +633,25 @@ stop a specific way of losing an afternoon:
   handed `"echo` as its whole script. There is no shell here to re-quote
   it, and inventing a quoting dialect for a config file is worse than
   requiring a list.
+
+**`profiles`, `${VAR}` with `.env`, `build:` and per-service `restart`**
+exist because measuring against Compose made the gap concrete rather
+than theoretical (`research/COMPARISON.md` §7). Three of them differ from
+Compose on purpose:
+
+- **An undefined variable is an error, not an empty string.** Compose
+  substitutes empty and warns, which turns `${PORT}:80` into `:80` and
+  fails somewhere else entirely. `${VAR:-}` asks for empty on purpose.
+- **`.env` is read from beside the stack file**, not the working
+  directory, so `-f ../other/rustainer.toml` means the same thing from
+  anywhere.
+- **Everything that has to be built is built before anything starts.** A
+  stack that starts three services and then fails to build the fourth
+  has left you worse off than one that refused at the start.
+
+A service kept by a profile that depends on one a profile excluded is
+**refused** — starting it anyway would ignore the profile, and leaving it
+out would break the dependant.
 
 **Services find each other through `/etc/hosts`, not DNS.** Every address
 is allocated *before anything starts*, so every container's hosts file can

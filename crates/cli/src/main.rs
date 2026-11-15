@@ -312,6 +312,13 @@ struct StackArgs {
     /// The stack file. `rustainer.toml` in the current directory by default.
     #[arg(short = 'f', long, default_value = "rustainer.toml")]
     file: PathBuf,
+
+    /// Include the services in this profile. Repeatable.
+    ///
+    /// A service with no `profiles` is always included; one with them is
+    /// included only when you name a profile it belongs to.
+    #[arg(long = "profile")]
+    profile: Vec<String>,
 }
 
 #[derive(Args)]
@@ -319,6 +326,10 @@ struct StackDownArgs {
     /// The stack file. `rustainer.toml` in the current directory by default.
     #[arg(short = 'f', long, default_value = "rustainer.toml")]
     file: PathBuf,
+
+    /// Include the services in this profile. Repeatable.
+    #[arg(long = "profile")]
+    profile: Vec<String>,
 
     /// Seconds to wait for each service to exit before killing it.
     ///
@@ -1632,26 +1643,86 @@ fn shellexpand_home(s: &str) -> String {
     }
 }
 
-fn read_stack(path: &Path) -> Result<stack::Stack> {
+/// Checked from the stack parser so a bad policy is refused before any
+/// of the stack is running, rather than when that one service starts.
+pub(crate) fn supervise_restart_check(spec: &str) -> Result<()> {
+    supervise::RestartPolicy::parse(spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+fn read_stack(path: &Path, profiles: &[String]) -> Result<stack::Stack> {
     let text = std::fs::read_to_string(path).with_context(|| {
         format!(
             "reading the stack file {}. Write one, or point at it with -f.",
             path.display()
         )
     })?;
-    stack::Stack::parse(&text).with_context(|| format!("in {}", path.display()))
+    // `.env` beside the STACK FILE, not beside the working directory:
+    // `-f ../other/rustainer.toml` must mean the same thing from
+    // anywhere, and a stack that picks up a different .env depending on
+    // where you ran it is the bug this ordering avoids.
+    let mut vars: std::collections::BTreeMap<String, String> = Default::default();
+    let dotenv = path.parent().unwrap_or(Path::new(".")).join(".env");
+    if let Ok(t) = std::fs::read_to_string(&dotenv) {
+        vars =
+            stack::Stack::parse_dotenv(&t).with_context(|| format!("in {}", dotenv.display()))?;
+    }
+    // The environment wins over .env, as it does in Compose: the file is
+    // the default, the environment is the override.
+    for (k, v) in std::env::vars() {
+        vars.insert(k, v);
+    }
+    let expanded = stack::Stack::interpolate(&text, &vars)
+        .with_context(|| format!("in {}", path.display()))?;
+    let mut st =
+        stack::Stack::parse(&expanded).with_context(|| format!("in {}", path.display()))?;
+    st.select_profiles(profiles)
+        .with_context(|| format!("in {}", path.display()))?;
+    Ok(st)
 }
 
 fn cmd_stack(paths: &Paths, cmd: StackCmd) -> Result<ExitCode> {
     match cmd {
-        StackCmd::Up(a) => stack_up(paths, &read_stack(&a.file)?),
-        StackCmd::Down(a) => stack_down(paths, &read_stack(&a.file)?, a.timeout),
-        StackCmd::Ps(a) => stack_ps(paths, &read_stack(&a.file)?),
+        StackCmd::Up(a) => stack_up(paths, &read_stack(&a.file, &a.profile)?, &a.file),
+        StackCmd::Down(a) => stack_down(paths, &read_stack(&a.file, &a.profile)?, a.timeout),
+        StackCmd::Ps(a) => stack_ps(paths, &read_stack(&a.file, &a.profile)?),
     }
 }
 
-fn stack_up(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
+fn stack_up(paths: &Paths, st: &stack::Stack, file: &Path) -> Result<ExitCode> {
     let order = st.start_order()?;
+
+    // Anything that has to be BUILT is built first, before a single
+    // address is allocated or a single container starts. A stack that
+    // starts three services and then fails to build the fourth has left
+    // the operator worse off than one that refused at the start.
+    for name in &order {
+        let svc = &st.services[name];
+        let Some(ctx) = &svc.build else { continue };
+        // Relative to the stack FILE, not the working directory.
+        let base = file.parent().unwrap_or(Path::new("."));
+        let context = base.join(ctx);
+        let tag = if svc.image.trim().is_empty() {
+            format!("{}-{name}:latest", st.name)
+        } else {
+            svc.image.clone()
+        };
+        println!("building {tag} from {}", context.display());
+        // The exit code is the CLI's and is success here; a build that
+        // failed comes back as an Err and is propagated. Discarded
+        // explicitly so it is clear that is why, as with `cmd_run`.
+        let _ = cmd_build(
+            paths,
+            BuildArgs {
+                tag: tag.clone(),
+                file: None,
+                build_args: Vec::new(),
+                network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
+                context,
+            },
+        )
+        .with_context(|| format!("building service {name:?}"))?;
+    }
 
     // Every address is allocated BEFORE anything starts, because every
     // container's /etc/hosts has to name every other one - including the
@@ -1691,7 +1762,12 @@ fn stack_up(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
         }
 
         let svc = &st.services[name];
-        let mut command: Vec<OsString> = vec![svc.image.clone().into()];
+        let image = if svc.image.trim().is_empty() {
+            format!("{}-{name}:latest", st.name)
+        } else {
+            svc.image.clone()
+        };
+        let mut command: Vec<OsString> = vec![image.into()];
         command.extend(svc.command.iter().map(OsString::from));
         let args = RunArgs {
             rootfs: None,
@@ -1716,6 +1792,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
             user: svc.user.clone(),
             env: svc.env.clone(),
             publish: svc.ports.clone(),
+            restart: svc.restart.clone().unwrap_or_else(|| "no".into()),
             command,
             ..Default::default()
         };
