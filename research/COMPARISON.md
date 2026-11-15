@@ -403,12 +403,33 @@ A fourth pass closed the last two that were worth closing:
   unhealthy is both of those things, and collapsing them loses the half
   the operator needs.
 
+And `watch`, in the two actions that can be honoured honestly:
+
+- **`rebuild`** builds the image again and replaces the container;
+  **`restart`** replaces it without building, which is what a changed
+  config file needs. **`sync` is refused by name**, because copying
+  files into a running container needs a way to write into its
+  filesystem from outside and this engine deliberately has no `cp`. A
+  `sync` that quietly rebuilt instead would be worse than not having it.
+- `rebuild` on a service with no `build` is refused while the file is
+  parsed, rather than discovered when a file changes at midnight.
+- It **polls mtimes** rather than subscribing to inotify. A watch that
+  misses an event is worse than one that notices a second late, and
+  inotify's queue overflows silently under a build that touches a
+  thousand files.
+
 ### What Compose still has that these stacks do not
 
-`watch`/`develop` - file-watching rebuilds - and the rest of `deploy`
-beyond replicas: placement constraints, resource reservations and
-rollback policy, which are orchestrator concepts this deliberately is
-not. That is the list, and it is now short enough to read.
+The parts of `deploy` beyond `replicas`: **placement constraints and
+rollback policy**, which are orchestrator concepts this deliberately is
+not - there is no scheduler to place anything and no rolling update to
+roll back. `deploy.resources` has no equivalent spelling because the
+limits themselves already do: `memory`, `cpus` and `pids_limit` are
+service keys here.
+
+And `watch`'s `sync` action, above.
+
+That is the list.
 
 ---
 
@@ -501,9 +522,14 @@ page cache the cgroup is charged for. So the cell is labelled `rss`, and
 hovering says exactly that. A number with its limits stated beats a dash.
 
 **The limits of this comparison, stated rather than implied.** Docker
-Desktop's window can be captured; its Electron UI cannot be driven from
-a script with the tools here - clicking its navigation by accessibility
-element and by screen coordinate both failed to change screens. So what
+Desktop's window can be captured and **keystrokes reach it** - its own
+⌘K search opens and takes typing - but its navigation cannot be driven
+from a script with the tools here. Four attempts: clicking by
+accessibility element, clicking by screen coordinate, navigating via its
+⌘K search (which searches Docker Hub and offers Pull/Run, rather than
+moving between screens - a difference from this page's palette, which is
+local), and setting `AXManualAccessibility`, which left the web content
+a single opaque `AXGroup`. So what
 is compared above is the Containers screen and the navigation, both read
 off the running application, and **nothing else**: not Images, not
 Volumes, and not the per-container detail pages, which in recent

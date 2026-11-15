@@ -131,6 +131,10 @@ pub struct Service {
     /// A command that decides whether this service is ready.
     #[serde(default)]
     pub healthcheck: Option<HealthCheck>,
+    /// Paths to watch while `stack watch` runs, and what to do when
+    /// they change.
+    #[serde(default)]
+    pub watch: Vec<Watch>,
     /// Configs this service wants, by name. Each arrives at `/<name>`.
     #[serde(default)]
     pub configs: Vec<String>,
@@ -207,6 +211,29 @@ impl DependsOn {
         }
         Ok(())
     }
+}
+
+/// One watched path.
+///
+/// Compose's `develop.watch` in the two actions that can be honoured
+/// honestly here. `sync` is not among them: copying files into a
+/// running container needs a way to write into its filesystem from
+/// outside, and this engine deliberately has no `cp`. Saying so beats
+/// a `sync` that silently rebuilds instead.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Watch {
+    /// Relative to the stack file, like everything else here.
+    pub path: String,
+    /// `rebuild` (the default) builds the image again and replaces the
+    /// container; `restart` replaces the container without rebuilding,
+    /// which is what a changed config file needs.
+    #[serde(default = "rebuild")]
+    pub action: String,
+}
+
+fn rebuild() -> String {
+    "rebuild".into()
 }
 
 /// What makes a service ready.
@@ -321,6 +348,25 @@ impl Stack {
                     bail!(
                         "service {name:?} wants secret {c:?}, which this stack does not \
                          define. Add `[secrets.{c}]` with a `file`."
+                    );
+                }
+            }
+            for w in &svc.watch {
+                if w.action != "rebuild" && w.action != "restart" {
+                    bail!(
+                        "service {name:?}: {:?} is not a watch action. Use \"rebuild\" \
+                         or \"restart\". Compose's \"sync\" is not implemented: \
+                         copying into a running container needs a way to write into \
+                         its filesystem from outside, and there is none here.",
+                        w.action
+                    );
+                }
+                if w.action == "rebuild" && svc.build.is_none() {
+                    bail!(
+                        "service {name:?} watches {:?} with action \"rebuild\", but the \
+                         service has no `build` to rebuild. Use \"restart\", or give \
+                         it a build context.",
+                        w.path
                     );
                 }
             }
@@ -1010,6 +1056,41 @@ depends_on = ["db"]
         assert_eq!(s.secrets["dbpass"].file, "secret.txt");
         assert_eq!(s.services["a"].configs, vec!["site"]);
         assert_eq!(s.services["a"].secrets, vec!["dbpass"]);
+    }
+
+    #[test]
+    fn watch_actions_are_checked_against_what_the_service_can_do() {
+        // "sync" is Compose's third action and is refused by name,
+        // rather than quietly rebuilding instead.
+        let e = Stack::parse(
+            "name=\"x\"\n[services.a]\nimage=\"i\"\n\
+             [[services.a.watch]]\npath=\"src\"\naction=\"sync\"\n",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("not a watch action"), "{e}");
+
+        // "rebuild" on a service with nothing to build is a file that
+        // cannot mean what it says.
+        let e = Stack::parse(
+            "name=\"x\"\n[services.a]\nimage=\"i\"\n\
+             [[services.a.watch]]\npath=\"src\"\n",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no `build` to rebuild"), "{e}");
+
+        // And the two that work.
+        let s = Stack::parse(
+            "name=\"x\"\n[services.a]\nimage=\"i\"\n\
+             [[services.a.watch]]\npath=\"conf\"\naction=\"restart\"\n",
+        )
+        .unwrap();
+        assert_eq!(s.services["a"].watch[0].action, "restart");
+        let s = Stack::parse(
+            "name=\"x\"\n[services.a]\nbuild=\".\"\n\
+             [[services.a.watch]]\npath=\"src\"\n",
+        )
+        .unwrap();
+        assert_eq!(s.services["a"].watch[0].action, "rebuild");
     }
 
     #[test]

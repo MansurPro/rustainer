@@ -479,5 +479,48 @@ done
 check "the watcher exits with its container" "$LEFT" "0"
 
 echo
+echo "13. watch rebuilds and replaces when the files change"
+W="$SCRATCH/watch"
+mkdir -p "$W/ctx"
+echo "first" > "$W/ctx/payload.txt"
+printf 'FROM %s\nCOPY payload.txt /payload.txt\n' "$IMG" > "$W/ctx/Dockerfile"
+cat > "$W/rustainer.toml" <<EOF
+name = "wstack"
+
+[services.app]
+build = "ctx"
+command = ["/bin/sleep", "300"]
+
+[[services.app.watch]]
+path = "ctx"
+action = "rebuild"
+EOF
+printf 'name = "nw"\n\n[services.a]\nimage = "%s"\ncommand = ["/bin/true"]\n\n[[services.a.watch]]\npath = "not-here"\naction = "restart"\n' "$IMG" > "$W/nowatch.toml"
+refuses "watching a path that is not there is refused by name" "which does not exist" \
+    timeout 60 "$B" stack watch -f "$W/nowatch.toml"
+printf 'name = "nw2"\n\n[services.a]\nimage = "%s"\ncommand = ["/bin/true"]\n' "$IMG" > "$W/nowatch2.toml"
+refuses "and a stack with no watch at all says so" "nothing to" \
+    timeout 60 "$B" stack watch -f "$W/nowatch2.toml"
+timeout 600 "$B" stack up -f "$W/rustainer.toml" >/dev/null 2>&1
+check "the first build is what runs" \
+    "$(timeout 60 "$B" exec wstack-app /bin/cat /payload.txt 2>&1 | tail -1)" "first"
+
+timeout 300 "$B" stack watch -f "$W/rustainer.toml" > "$SCRATCH/watch.log" 2>&1 &
+WPID=$!
+sleep 3
+echo "second" > "$W/ctx/payload.txt"
+# One rebuild of a one-layer image, plus the poll interval.
+for _ in $(seq 60); do
+    OUT=$(timeout 60 "$B" exec wstack-app /bin/cat /payload.txt 2>/dev/null | tail -1)
+    [ "$OUT" = "second" ] && break
+    sleep 1
+done
+check "a change rebuilds and replaces the container" "$OUT" "second"
+contains "and says which service changed" "$(cat "$SCRATCH/watch.log")" "app changed"
+kill "$WPID" 2>/dev/null
+wait "$WPID" 2>/dev/null
+timeout 300 "$B" stack down -t 0 -f "$W/rustainer.toml" >/dev/null 2>&1
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

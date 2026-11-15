@@ -332,6 +332,14 @@ enum StackCmd {
     Down(StackDownArgs),
     /// Show the stack's containers.
     Ps(StackArgs),
+    /// Rebuild or restart services when their files change.
+    ///
+    /// Compose's `develop.watch`, in the two actions that can be
+    /// honoured honestly: `rebuild` and `restart`. Polls mtimes rather
+    /// than subscribing to inotify - a watch that misses an event is
+    /// worse than one that notices a second late, and inotify's queue
+    /// overflows silently under a build that touches a thousand files.
+    Watch(StackArgs),
     /// Run a one-off container with a service's settings.
     ///
     /// The stack's `compose run`: same image, environment, volumes and
@@ -1763,9 +1771,114 @@ fn cmd_stack(paths: &Paths, cmd: StackCmd) -> Result<ExitCode> {
         StackCmd::Up(a) => stack_up(paths, &read_stack(&a.file, &a.profile)?, &a.file),
         StackCmd::Down(a) => stack_down(paths, &read_stack(&a.file, &a.profile)?, a.timeout),
         StackCmd::Ps(a) => stack_ps(paths, &read_stack(&a.file, &a.profile)?),
+        StackCmd::Watch(a) => stack_watch(paths, &read_stack(&a.file, &a.profile)?, &a.file),
         StackCmd::Run(a) => {
             let st = read_stack(&a.file, &a.profile)?;
             stack_run(paths, &st, &a)
+        }
+    }
+}
+
+/// A cheap fingerprint of a directory tree: how many files, and the
+/// newest modification time among them.
+///
+/// Not a hash. Hashing a build context on every poll is how a watch
+/// comes to cost more than the build it triggers, and the question
+/// being answered is "did anything change", which mtime answers for
+/// every editor anybody uses.
+fn tree_stamp(root: &Path) -> (u64, u64) {
+    fn walk(p: &Path, n: &mut u64, newest: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(p) else { return };
+        for e in rd.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                walk(&e.path(), n, newest);
+            } else {
+                *n += 1;
+                if let Ok(t) = md.modified()
+                    && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
+                {
+                    *newest = (*newest).max(d.as_secs());
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    let mut newest = 0;
+    if root.is_file() {
+        if let Ok(md) = std::fs::metadata(root)
+            && let Ok(t) = md.modified()
+            && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
+        {
+            return (1, d.as_secs());
+        }
+        return (1, 0);
+    }
+    walk(root, &mut n, &mut newest);
+    (n, newest)
+}
+
+/// Watch the declared paths and rebuild or restart when they change.
+///
+/// Runs until interrupted, like `compose watch`.
+fn stack_watch(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitCode> {
+    let base = files
+        .first()
+        .and_then(|f| f.parent())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let mut watched: Vec<(String, stack::Watch, PathBuf, (u64, u64))> = Vec::new();
+    for (name, svc) in &st.services {
+        for w in &svc.watch {
+            let p = base.join(&w.path);
+            if !p.exists() {
+                bail!(
+                    "service {name:?} watches {}, which does not exist",
+                    p.display()
+                );
+            }
+            let stamp = tree_stamp(&p);
+            println!("watching {} for {name} ({})", p.display(), w.action);
+            watched.push((name.clone(), w.clone(), p, stamp));
+        }
+    }
+    if watched.is_empty() {
+        bail!(
+            "no service in this stack declares a `watch`, so there is nothing to \
+             watch. Add `[[services.<name>.watch]]` with a `path`."
+        );
+    }
+    println!("watching. ^C to stop.");
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        // Collected first, acted on after: two services watching the
+        // same directory must not rebuild one at a time while the other
+        // sees a half-written tree.
+        let mut hit: Vec<(String, String)> = Vec::new();
+        for (name, w, path, stamp) in &mut watched {
+            let now = tree_stamp(path);
+            if now != *stamp {
+                *stamp = now;
+                hit.push((name.clone(), w.action.clone()));
+            }
+        }
+        hit.dedup();
+        for (name, action) in hit {
+            println!("{}: {name} changed", action);
+            for id in st.container_names(&name) {
+                if paths.dir(&id).exists() {
+                    let _ = supervise::stop(paths, &id, Duration::from_secs(5));
+                    let _ = supervise::remove(paths, &id, true);
+                }
+            }
+            // `up` rebuilds when the service has a `build`, and starts
+            // whatever is not running - which is exactly both actions,
+            // so neither one needs its own code path. `restart` differs
+            // only in that nothing was built, because nothing in the
+            // build context changed.
+            if let Err(e) = stack_up(paths, st, files) {
+                eprintln!("rustainer: {name}: {e:#}");
+            }
         }
     }
 }

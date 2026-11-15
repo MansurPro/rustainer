@@ -600,6 +600,7 @@ rustainer stack down  -t 1 -f examples/rustainer.toml   # a shorter grace
 rustainer stack up    --profile debug -f examples/rustainer.toml
 rustainer stack up    -f base.toml -f prod.toml   # later wins, key by key
 rustainer stack run   -f examples/rustainer.toml db /bin/sh   # one-off
+rustainer stack watch -f examples/rustainer.toml   # rebuild on change
 ```
 
 ```toml
@@ -727,6 +728,18 @@ not "unknown": reporting a container unhealthy in its first second is
 how healthchecks come to be ignored. The page shows it as a second pill
 beside the status, because a container that is running *and* unhealthy
 is both of those things.
+
+**`stack watch`** rebuilds or restarts a service when its files change,
+which is Compose's `develop.watch`. Two actions, and the third refused
+by name: `rebuild` builds the image again and replaces the container,
+`restart` replaces it without building — and **`sync` is not
+implemented**, because copying files into a running container needs a
+way to write into its filesystem from outside and there is deliberately
+no `cp` here. A `sync` that quietly rebuilt instead would be worse than
+not having one. It polls mtimes rather than using inotify: a watch that
+misses an event is worse than one that notices a second late, and
+inotify's queue overflows silently under a build that touches a thousand
+files.
 
 A stack is **not an orchestrator**. No reconciliation loop, no
 rescheduling, no health-gated rollout. `up` starts what is not running in
