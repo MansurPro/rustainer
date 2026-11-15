@@ -443,8 +443,13 @@ function renderSummary(list) {
   // "using nothing", which is the one thing this page is not allowed to
   // say: the memory controller is simply not enabled in this subtree,
   // and the column next to it already says so on hover.
-  const known = running.filter((c) => c._stats && c._stats.memory_current != null);
-  const mem = known.reduce((a, c) => a + c._stats.memory_current, 0);
+  const memOf = (c) => {
+    const s = c._stats;
+    if (!s) return null;
+    return s.memory_current != null ? s.memory_current : (s.memory_rss ?? null);
+  };
+  const known = running.filter((c) => memOf(c) != null);
+  const mem = known.reduce((a, c) => a + memOf(c), 0);
   const cpu = running.reduce((a, c) => a + (cpuPercent.get(c.id) || 0), 0);
   const stat = (label, value, alert) =>
     el("div", { className: "stat" + (alert ? " alert" : "") },
@@ -485,7 +490,15 @@ function renderContainers(list) {
     const pct = cpuPercent.get(c.id);
     const st = c._stats || {};
     const memMax = st.memory_max && st.memory_max !== "max" ? Number(st.memory_max) : null;
-    const memFrac = memMax && st.memory_current ? st.memory_current / memMax : null;
+    // The cgroup's own accounting when the controller is enabled, and
+    // otherwise the summed RSS of the processes in it. The second is not
+    // the same number - it double-counts pages two processes share and
+    // leaves out page cache the cgroup is charged for - so the cell says
+    // which one it is showing rather than printing both as if they were
+    // interchangeable.
+    const memVal = st.memory_current != null ? st.memory_current : st.memory_rss;
+    const memKind = st.memory_current != null ? "cgroup" : "rss";
+    const memFrac = memMax && memVal ? memVal / memMax : null;
 
     const tr = el("tr");
     tr.append(
@@ -499,9 +512,17 @@ function renderContainers(list) {
       el("td", { className: "mono dim nowrap hide-s" },
         (c.ip || "—") + (c.ports && c.ports.length ? "  " + c.ports.map((p) => p.host + "→" + p.container).join(" ") : "")),
       el("td", { className: "mono nowrap" }, running && pct != null ? pct.toFixed(1) + "%" : "—"),
-      el("td", { className: "nowrap" }, running && st.memory_current != null
-        ? el("span", { className: "mono" }, [
-            bytes(st.memory_current) + (memMax ? " / " + bytes(memMax) : ""),
+      el("td", { className: "nowrap" }, running && memVal != null
+        ? el("span", {
+            className: "mono",
+            title: memKind === "cgroup"
+              ? "memory.current, as the cgroup accounts it"
+              : "the summed RSS of the processes in this cgroup; the memory "
+                + "controller is not enabled here, so this double-counts shared "
+                + "pages and omits page cache",
+          }, [
+            bytes(memVal) + (memMax ? " / " + bytes(memMax) : "")
+              + (memKind === "rss" ? " rss" : ""),
             memFrac != null ? el("div", { className: "bar" },
               el("i", { className: memFrac > 0.9 ? "full" : memFrac > 0.7 ? "hot" : "",
                         style: `width:${Math.min(100, memFrac * 100).toFixed(1)}%` })) : "",
@@ -613,7 +634,8 @@ function inspectTable(c) {
     ["ports", (c.ports || []).map((p) => p.host + "→" + p.container).join(", ")],
     ["volumes", (c.volumes || []).map((v) => v.source + ":" + v.target + (v.read_only ? ":ro" : "")).join(", ")],
     ["memory limit", c.memory ? bytes(c.memory) : null], ["cpus", c.cpus],
-    ["memory now", st.memory_current != null ? bytes(st.memory_current) : null],
+    ["memory now", st.memory_current != null ? bytes(st.memory_current)
+       : st.memory_rss != null ? bytes(st.memory_rss) + " (summed rss)" : null],
     ["memory peak", st.memory_peak != null ? bytes(st.memory_peak) : null],
     ["pids", st.pids_current], ["exit code", c.exit_code], ["signal", c.signal],
     ["oom killed", c.oom_killed ? "yes" : null], ["error", c.error],

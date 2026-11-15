@@ -311,9 +311,36 @@ impl Server {
                 .find_map(|l| l.strip_prefix("usage_usec "))
                 .and_then(|v| v.trim().parse::<u64>().ok())
         });
+        // `memory.current` exists only where the memory controller is
+        // enabled in the parent's subtree_control, and this engine does
+        // not enable a controller it was not asked for - so on a host
+        // with no `--memory` anywhere, every container's memory read as
+        // "-" while Docker Desktop showed a number for the same
+        // container. Summing the RSS of the processes in the cgroup needs
+        // no controller and no accounting overhead: `cgroup.procs` is
+        // always there, and /proc/<pid>/status always has VmRSS.
+        //
+        // It is not the same number. It double-counts shared pages
+        // between processes and leaves out page cache the cgroup is
+        // charged for, so it is reported under its own name and the page
+        // says which one it is showing.
+        let memory_rss = read("cgroup.procs").map(|procs| {
+            procs
+                .lines()
+                .filter_map(|l| l.trim().parse::<i32>().ok())
+                .filter_map(|p| read_trimmed(format!("/proc/{p}/status")))
+                .filter_map(|s| {
+                    s.lines()
+                        .find_map(|l| l.strip_prefix("VmRSS:"))
+                        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+                })
+                .sum::<u64>()
+                * 1024
+        });
         json!({
             "running": true,
             "cgroup": true,
+            "memory_rss": memory_rss,
             "memory_current": read("memory.current").and_then(|s| s.parse::<u64>().ok()),
             "memory_max": read("memory.max"),
             "memory_peak": read("memory.peak").and_then(|s| s.parse::<u64>().ok()),
