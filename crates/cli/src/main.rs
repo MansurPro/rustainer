@@ -113,6 +113,33 @@ enum Command {
         #[arg(long)]
         to: String,
     },
+
+    /// Internal: keep running a container's healthcheck and record what
+    /// it says.
+    ///
+    /// A process of its own, started detached by `stack up`, and NOT
+    /// part of the supervisor. The supervisor has to be able to call
+    /// `clone3` to restart its container, `clone3` refuses a process
+    /// that has ever had a second thread, and a probe loop inside it
+    /// would be one more reason to be careful forever. This writes a
+    /// `health` file beside the container and exits when the container
+    /// does; nothing depends on it being alive.
+    #[command(hide = true)]
+    HealthWatch {
+        id: String,
+        #[arg(long)]
+        interval: u64,
+        #[arg(long)]
+        retries: u64,
+        /// The probe, after `--`.
+        ///
+        /// Trailing and hyphen-tolerant, because the overwhelmingly
+        /// common healthcheck is `/bin/sh -c '...'` and a repeated
+        /// `--test` option would read that `-c` as one of its own
+        /// flags. Found by running it rather than by reading it.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        test: Vec<String>,
+    },
 }
 
 // `Default` so a stack can build one field by field. clap fills every
@@ -550,6 +577,12 @@ fn real_main() -> Result<ExitCode> {
         Command::Stack(a) => cmd_stack(&paths, a),
         Command::Supervise { id } => cmd_supervise(&paths, &id),
         Command::Forward { fd, to } => cmd_forward(fd, &to),
+        Command::HealthWatch {
+            id,
+            interval,
+            retries,
+            test,
+        } => cmd_health_watch(&paths, &id, interval, retries, &test),
     }
 }
 
@@ -1785,7 +1818,27 @@ fn stack_run(paths: &Paths, st: &stack::Stack, args: &StackRunArgs) -> Result<Ex
         network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
         hostname: args.service.clone(),
         workdir: svc.workdir.clone(),
-        volumes: svc.volumes.clone(),
+        volumes: {
+            // A one-off gets the service's configs and secrets too: the
+            // whole point of it is to be the service, with a different
+            // command.
+            let base_dir = args
+                .file
+                .first()
+                .and_then(|f| f.parent())
+                .unwrap_or(Path::new("."));
+            let mut v = svc.volumes.clone();
+            for (list, store, dest) in [
+                (&svc.configs, &st.configs, ""),
+                (&svc.secrets, &st.secrets, "/run/secrets"),
+            ] {
+                for n in list {
+                    let src = base_dir.join(&store[n].file);
+                    v.push(format!("{}:{dest}/{n}:ro", src.display()));
+                }
+            }
+            v
+        },
         add_host,
         stack_name: Some(st.name.clone()),
         service_name: Some(args.service.clone()),
@@ -1880,6 +1933,38 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
         }
     }
 
+    // Relative to the stack file, like `build` and `.env`, so the same
+    // file means the same thing from any working directory.
+    let base_dir = files
+        .first()
+        .and_then(|f| f.parent())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    // Checked once, before anything starts. A secret in a file the whole
+    // machine can read is the most common way one leaks, and a tool that
+    // mounts it without comment has helped it happen.
+    for (name, src) in &st.secrets {
+        let path = base_dir.join(&src.file);
+        let md = std::fs::metadata(&path)
+            .with_context(|| format!("secret {name:?}: reading {}", path.display()))?;
+        let mode = std::os::unix::fs::PermissionsExt::mode(&md.permissions());
+        if mode & 0o077 != 0 {
+            bail!(
+                "secret {name:?} is {} with mode {:o}, which lets somebody other than \
+                 its owner read it. `chmod 600 {}` first.",
+                path.display(),
+                mode & 0o7777,
+                path.display()
+            );
+        }
+    }
+    for (name, src) in &st.configs {
+        let path = base_dir.join(&src.file);
+        if !path.exists() {
+            bail!("config {name:?}: {} does not exist", path.display());
+        }
+    }
+
     let mut started = 0usize;
     let mut wanted = 0usize;
     for name in &order {
@@ -1913,7 +1998,23 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
                 hostname: name.clone(),
                 workdir: svc.workdir.clone(),
-                volumes: svc.volumes.clone(),
+                volumes: {
+                    // Configs and secrets are read-only binds, which is
+                    // all they are anywhere - Compose mounts them the
+                    // same way outside swarm. What differs is where
+                    // they land and what is checked before they do.
+                    let mut v = svc.volumes.clone();
+                    for (list, store, dest) in [
+                        (&svc.configs, &st.configs, ""),
+                        (&svc.secrets, &st.secrets, "/run/secrets"),
+                    ] {
+                        for n in list {
+                            let src = base_dir.join(&store[n].file);
+                            v.push(format!("{}:{dest}/{n}:ro", src.display()));
+                        }
+                    }
+                    v
+                },
                 add_host: peers
                     .iter()
                     .filter(|(n, _)| n != name && *n != id)
@@ -1949,6 +2050,33 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 .any(|(_, other)| other.depends_on.wants_healthy(name));
             if waited_on && let Some(h) = &svc.healthcheck {
                 wait_until_healthy(paths, &id, name, h)?;
+            }
+            // And then a watcher, for every service that defines a
+            // healthcheck rather than only those something waits on.
+            // The wait above answers "may the next service start"; this
+            // answers "is it still well", which is the question an
+            // operator asks of a page at three in the morning.
+            if let Some(h) = &svc.healthcheck {
+                let mut w = std::process::Command::new("/proc/self/exe");
+                w.arg("--root")
+                    .arg(paths_root(paths))
+                    .arg("health-watch")
+                    .arg(&id)
+                    .arg("--interval")
+                    .arg(h.interval.to_string())
+                    .arg("--retries")
+                    .arg(h.retries.to_string());
+                w.arg("--");
+                for t in &h.test {
+                    w.arg(t);
+                }
+                // Detached on purpose: it outlives `stack up`, and it
+                // exits by itself once the container is gone.
+                let _ = w
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
             }
         }
     }
@@ -2135,6 +2263,75 @@ fn stack_ps(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Where a container's current health is written.
+///
+/// A file beside the container, like the stop sentinel, and for the
+/// same reason: two processes write the container's state and the
+/// supervisor rewrites `state.json` wholesale from its own copy, so a
+/// field there would be erased within milliseconds.
+pub(crate) fn health_file(paths: &Paths, id: &str) -> PathBuf {
+    paths.dir(id).join("health")
+}
+
+/// Run a container's healthcheck until the container goes away.
+///
+/// `starting` until the first pass, then `healthy` or `unhealthy`,
+/// which is the same vocabulary Docker uses and means the same thing:
+/// `starting` is "has not passed yet and has not run out of attempts",
+/// not "unknown".
+fn cmd_health_watch(
+    paths: &Paths,
+    id: &str,
+    interval: u64,
+    retries: u64,
+    test: &[String],
+) -> Result<ExitCode> {
+    let _ = sys::set_process_name("rustainer-hc");
+    let file = health_file(paths, id);
+    let mut failures = 0u64;
+    let mut state = "starting";
+    let _ = std::fs::write(&file, "starting");
+    loop {
+        // The container's directory going away is the signal to stop.
+        // Nothing has to tell this process anything: `rm` deletes the
+        // directory, and a watcher writing into a directory that no
+        // longer exists would recreate it.
+        if !paths.dir(id).exists() {
+            return Ok(ExitCode::SUCCESS);
+        }
+        match State::load(paths, id) {
+            Ok(st) if matches!(st.observed_status(), Status::Running | Status::Created) => {}
+            _ => {
+                let _ = std::fs::remove_file(&file);
+                return Ok(ExitCode::SUCCESS);
+            }
+        }
+        let next = match health_probe(paths, id, test) {
+            Ok(0) => {
+                failures = 0;
+                "healthy"
+            }
+            _ => {
+                failures += 1;
+                // `starting` only until the attempts run out: a probe
+                // that has never passed is not the same as one that has
+                // started failing, and reporting a container unhealthy
+                // in its first second is how healthchecks get ignored.
+                if state == "starting" && failures < retries {
+                    "starting"
+                } else {
+                    "unhealthy"
+                }
+            }
+        };
+        if next != state {
+            state = next;
+            let _ = std::fs::write(&file, state);
+        }
+        std::thread::sleep(Duration::from_secs(interval.max(1)));
+    }
 }
 
 fn cmd_forward(fd: i32, to: &str) -> Result<ExitCode> {

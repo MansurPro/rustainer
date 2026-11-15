@@ -243,13 +243,13 @@ echo "  rustainer, 3 replicas:       ${R_R}ms, $R_N containers"
 echo
 echo "== What Compose has that these stacks do not =="
 cat <<'EOF'
-  configs and secrets; watch/develop
-  the rest of deploy beyond replicas (placement, resources, rollback)
-  a healthcheck that keeps running after startup, not just during `up`
+  watch/develop - file-watching rebuilds
+  the rest of deploy beyond replicas (placement, resources, rollback),
+  which are orchestrator concepts this deliberately is not
 
   Closed since this list was first written, because measuring against
   Compose is what made the gap concrete: profiles, ${VAR} interpolation
   with .env, build:, restart on a service, several -f files merged,
-  extends, healthcheck with depends_on conditions, replicas, and
-  `stack run`.
+  extends, healthcheck with depends_on conditions, replicas, `stack
+  run`, configs, secrets, and a healthcheck that keeps running.
 EOF

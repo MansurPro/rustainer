@@ -38,6 +38,30 @@ pub struct Stack {
     /// Prefixes every container name, so one host can run two stacks.
     pub name: String,
     pub services: BTreeMap<String, Service>,
+    /// Files to put inside containers that ask for them.
+    ///
+    /// `configs.<name>.file` is a path, relative to the stack file.
+    /// A service lists the names it wants and gets each one at
+    /// `/<name>`, read-only.
+    #[serde(default)]
+    pub configs: BTreeMap<String, FileSource>,
+    /// The same, mounted under `/run/secrets/` and refused if the
+    /// source file is readable by anyone but its owner.
+    ///
+    /// That check is the entire difference between the two, and it is
+    /// the one worth having: a secret in a world-readable file in the
+    /// repository is the most common way one leaks, and a tool that
+    /// mounts it without comment has helped.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, FileSource>,
+}
+
+/// Where a config or secret comes from.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FileSource {
+    /// A path, relative to the stack file.
+    pub file: String,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Default)]
@@ -107,6 +131,12 @@ pub struct Service {
     /// A command that decides whether this service is ready.
     #[serde(default)]
     pub healthcheck: Option<HealthCheck>,
+    /// Configs this service wants, by name. Each arrives at `/<name>`.
+    #[serde(default)]
+    pub configs: Vec<String>,
+    /// Secrets this service wants. Each arrives at `/run/secrets/<name>`.
+    #[serde(default)]
+    pub secrets: Vec<String>,
     /// How many containers to run for this service.
     ///
     /// One by default, and one keeps the plain `<stack>-<service>`
@@ -277,6 +307,22 @@ impl Stack {
                 && h.test.is_empty()
             {
                 bail!("service {name:?} has a `healthcheck` with no `test` command");
+            }
+            for c in &svc.configs {
+                if !stack.configs.contains_key(c) {
+                    bail!(
+                        "service {name:?} wants config {c:?}, which this stack does not \
+                         define. Add `[configs.{c}]` with a `file`."
+                    );
+                }
+            }
+            for c in &svc.secrets {
+                if !stack.secrets.contains_key(c) {
+                    bail!(
+                        "service {name:?} wants secret {c:?}, which this stack does not \
+                         define. Add `[secrets.{c}]` with a `file`."
+                    );
+                }
             }
             if svc.replicas == 0 {
                 bail!(
@@ -940,6 +986,30 @@ depends_on = ["db"]
     fn zero_replicas_is_refused_rather_than_silently_nothing() {
         let e = Stack::parse("name=\"x\"\n[services.web]\nimage=\"i\"\nreplicas=0\n").unwrap_err();
         assert!(e.to_string().contains("0 replicas"), "{e}");
+    }
+
+    #[test]
+    fn a_service_cannot_ask_for_a_config_the_stack_does_not_define() {
+        let e = Stack::parse("name=\"x\"\n[services.a]\nimage=\"i\"\nconfigs=[\"nginx\"]\n")
+            .unwrap_err();
+        assert!(e.to_string().contains("wants config"), "{e}");
+        let e =
+            Stack::parse("name=\"x\"\n[services.a]\nimage=\"i\"\nsecrets=[\"db\"]\n").unwrap_err();
+        assert!(e.to_string().contains("wants secret"), "{e}");
+    }
+
+    #[test]
+    fn configs_and_secrets_parse_and_attach() {
+        let s = Stack::parse(
+            "name=\"x\"\n[configs.site]\nfile=\"nginx.conf\"\n\
+             [secrets.dbpass]\nfile=\"secret.txt\"\n\
+             [services.a]\nimage=\"i\"\nconfigs=[\"site\"]\nsecrets=[\"dbpass\"]\n",
+        )
+        .unwrap();
+        assert_eq!(s.configs["site"].file, "nginx.conf");
+        assert_eq!(s.secrets["dbpass"].file, "secret.txt");
+        assert_eq!(s.services["a"].configs, vec!["site"]);
+        assert_eq!(s.services["a"].secrets, vec!["dbpass"]);
     }
 
     #[test]

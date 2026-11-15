@@ -379,12 +379,36 @@ And a third pass closed two more:
   starting half a stack as a side effect of a one-off command is how you
   end up with two copies of a database.
 
+A fourth pass closed the last two that were worth closing:
+
+- **`configs` and `secrets`.** Both are read-only bind mounts, which is
+  what they are in Compose outside swarm too; a config lands at
+  `/<name>` and a secret at `/run/secrets/<name>`. The difference
+  between the two keywords here is a check, and it is the one worth
+  having: **a secret whose file is readable by anyone but its owner is
+  refused**, before anything starts, with the `chmod` to run. A secret
+  in a world-readable file in a repository is the most common way one
+  leaks, and a tool that mounts it without comment has helped.
+- **A healthcheck that keeps running.** A watcher process beside each
+  container with a healthcheck - not inside the supervisor, which has
+  to stay able to call `clone3` - writes `starting`, `healthy` or
+  `unhealthy` to a file that `ps`, the API and the page read. It exits
+  when its container does; it is not a daemon and the test asserts that.
+  `starting` means "has not passed yet and has not run out of
+  attempts", not "unknown", because reporting a container unhealthy in
+  its first second is how healthchecks come to be ignored.
+
+  The page shows health as a **second pill** beside the status, not as a
+  different colour on the first: a container that is running and
+  unhealthy is both of those things, and collapsing them loses the half
+  the operator needs.
+
 ### What Compose still has that these stacks do not
 
-`configs` and `secrets`; `watch`/`develop`; the rest of `deploy` beyond
-replicas (placement, resources, rollback); and **a healthcheck that keeps
-running after startup** - the probe here answers "may the next service
-start", and nothing reacts to a container going unhealthy later.
+`watch`/`develop` - file-watching rebuilds - and the rest of `deploy`
+beyond replicas: placement constraints, resource reservations and
+rollback policy, which are orchestrator concepts this deliberately is
+not. That is the list, and it is now short enough to read.
 
 ---
 

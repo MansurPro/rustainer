@@ -710,6 +710,24 @@ nothing left behind. It does *not* start the service's dependencies —
 starting half a stack as a side effect of a one-off command is how you
 end up with two copies of a database.
 
+**`configs` and `secrets`** are read-only bind mounts — which is what
+they are in Compose outside swarm as well. A config lands at `/<name>`,
+a secret at `/run/secrets/<name>`. The whole difference between the two
+keywords here is one check, and it is the one worth having: **a secret
+whose file anyone but its owner can read is refused**, before anything
+starts, with the `chmod` to run. A secret in a world-readable file in a
+repository is the most common way one leaks.
+
+**A healthcheck keeps running after `up`.** A watcher process beside
+each container — not inside the supervisor, which must stay able to call
+`clone3` — writes `starting`, `healthy` or `unhealthy` where `ps`, the
+API and the page can read it, and exits when its container does.
+`starting` means "has not passed yet and has not run out of attempts",
+not "unknown": reporting a container unhealthy in its first second is
+how healthchecks come to be ignored. The page shows it as a second pill
+beside the status, because a container that is running *and* unhealthy
+is both of those things.
+
 A stack is **not an orchestrator**. No reconciliation loop, no
 rescheduling, no health-gated rollout. `up` starts what is not running in
 dependency order and leaves the rest alone; `down` stops in reverse, and

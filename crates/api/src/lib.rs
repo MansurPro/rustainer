@@ -266,6 +266,10 @@ impl Server {
             "exit_code": st.exit_code,
             "signal": st.signal,
             "oom_killed": st.oom_killed,
+            // Written by a watcher process, not by the supervisor, so
+            // it is simply absent when nothing is watching - which is
+            // the honest answer for a container with no healthcheck.
+            "health": read_trimmed(self.paths.dir(id).join("health")),
             "error": st.error,
             "ip": cfg.as_ref().and_then(|c| c.ip.clone()),
             "ports": cfg.as_ref().map(|c| {
