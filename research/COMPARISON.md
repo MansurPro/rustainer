@@ -310,43 +310,68 @@ one-off container against the stack.
 
 ## 8. The page, against Docker Desktop
 
-Measured on one macOS machine with Docker Desktop running.
+Measured and observed on one macOS machine (Apple Silicon) with Docker
+Desktop 4.x running and `docker info` answering.
+
+### What it costs to have open
 
 | | Docker Desktop | rustainer |
 |---|---|---|
-| resident while you look at it | **718-745 MiB** across 8-9 processes | **3.9 MiB** (`rustainer serve`) |
-| on disk | 2.1 GB app bundle | 5.1 MB binary, UI included |
-| the UI itself | Electron | one 53 KB HTML file |
+| macOS helper processes | **718-1041 MiB** across 8-9 processes | — |
+| the Linux VM | **3.82 GiB allocated, 8 CPUs** (`docker info`), of which its own status bar reports ~2.19 GB in use | — |
+| the UI process | part of the above (Electron) | **3.9 MiB** (`rustainer serve`) |
+| on disk | 2.1 GB app bundle | 5.1 MB binary, page included |
+| the page itself | Electron | one **53 KB** HTML file |
 | loaded from the network | — | **nothing**: no CDN, no font, no framework |
-| resident when you are not looking | dockerd + containerd, always | **0** - `serve` is a process you start and stop |
+| resident when you are not looking | dockerd + containerd + the VM, always | **0** - `serve` is a process you start and stop |
 
-That is roughly **190x** less resident memory, but the comparison needs
-a caveat stated plainly rather than buried: **a large part of what
-Docker Desktop's footprint buys is a Linux VM on a machine that does not
-have a Linux kernel.** rustainer does not do that at all - it requires a
-Linux host and has no macOS or Windows story. Against Docker Desktop
-*running on Linux* the gap would be smaller, and the honest claim is
-about the UI process, not about replacing the product.
+An earlier version of this section said 718-745 MiB and stopped there.
+That was only the macOS-side helpers; **the VM sits on top of it**, and
+the figure understated Docker Desktop. Corrected rather than left
+flattering.
 
-What the page does that is worth something:
+**The caveat belongs next to the number, not under it.** Most of that
+footprint buys a Linux VM on a machine with no Linux kernel. rustainer
+does not do that at all: it **requires a Linux host and has no macOS or
+Windows story**. On Linux, Docker needs no VM and the gap is the daemon
+alone. The honest claim is about the UI process and the engine, not
+about replacing the product.
 
-- **A real terminal into a container**, with a pty, from the browser.
-- **The commands it ran**, shown as CLI you could have typed. The page
-  teaches its own command line rather than hiding it.
-- **It says what it does not know.** A container's memory reads `-`,
-  not `0B`, when the memory controller is not enabled in that subtree,
-  and hovering says why. The summary tile sums only the containers whose
-  usage is actually known - it printed `0B` until this was measured,
-  which reads as "using nothing".
+### What each one puts in front of you
 
-### What Docker Desktop has that this does not
+Docker Desktop's navigation, as observed: Gordon, Containers, Images,
+Volumes, Kubernetes, Builds, Models, MCP Toolkit, Docker Hub, Logs,
+Settings, Extensions. A status bar carries engine state, RAM, CPU and
+disk; container CPU is shown against the machine's total (`1.61% / 800%`
+on 8 CPUs).
 
-Kubernetes, the extensions marketplace, Dev Environments, Docker Scout
-and image vulnerability scanning, multi-platform builds, a settings GUI
-for CPU/memory/disk allocation, sign-in and Hub integration, a volume
-file browser, log search, update management - and the VM.
+rustainer's: Containers, Stacks, Networks, Events, Images, Volumes.
 
----
+| | Docker Desktop | rustainer |
+|---|---|---|
+| Containers, Images, Volumes | yes | yes |
+| Builds | a view of its own | a build dialog |
+| **Networks** | **not in the navigation** - the CLI | **a view**, with subnet, bridge and member count |
+| **Events** | **not in the navigation** | **a view**, colour-coded by kind |
+| **Stacks** | Compose projects group inside Containers | **a view of its own** |
+| Kubernetes, Models, MCP Toolkit, Docker Hub, Extensions, Gordon | yes | no, and not planned |
+| Settings for CPU/memory/disk | yes - it owns a VM | nothing to allocate |
+
+**What was not compared**: Docker Desktop's per-container detail pages.
+Recent versions have an exec terminal, a file browser and per-container
+stats there, and this comparison never opened them, so it says nothing
+about them. Only the top-level navigation above was observed.
+
+### What the page does that is worth something
+
+- **A real terminal into a container**, over a pty, from the browser.
+- **The commands it ran**, shown as CLI you could have typed. It teaches
+  its own command line instead of hiding it.
+- **It says what it does not know.** A container's memory reads `-`, not
+  `0B`, when the memory controller is not enabled in that subtree, and
+  hovering says why. The summary tile sums only containers whose usage
+  is actually known - it printed `0B` until this was looked at, which
+  reads as "using nothing".
 
 ## 9. Reproducing this
 

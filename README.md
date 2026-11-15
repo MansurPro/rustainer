@@ -522,12 +522,19 @@ you what is running is useless exactly when you need it, and this engine
 is specifically built to work offline.
 
 Measured against Docker Desktop on one macOS machine
-(`research/COMPARISON.md` §8): **3.9 MiB resident against 718-745 MiB**
-across eight or nine processes, a 53 KB page against a 2.1 GB app bundle,
-and nothing resident at all once you close it. With the caveat that
-belongs next to the number rather than under it: much of what Docker
-Desktop's footprint buys is a Linux VM on a machine with no Linux kernel,
-and this has no macOS or Windows story at all.
+(`research/COMPARISON.md` §8): **3.9 MiB resident** against 718–1041 MiB
+of macOS helper processes *plus* a VM with 3.82 GiB allocated; a 53 KB
+page against a 2.1 GB app bundle; and nothing resident at all once you
+close it. With the caveat that belongs next to the number rather than
+under it: most of what Docker Desktop's footprint buys is a Linux VM on a
+machine with no Linux kernel, and this has no macOS or Windows story at
+all — it requires a Linux host.
+
+Where the page is genuinely ahead is what it puts in front of you:
+**Networks and Events are views here and are not in Docker Desktop's
+navigation at all.** Where it is behind is everything §8 lists —
+Kubernetes, extensions, Hub integration, and per-container detail pages
+this comparison did not open.
 
 Two properties matter more than the endpoint list, and both are asserted
 rather than described:
