@@ -168,12 +168,13 @@ fi
 echo
 echo "== What Compose has that these stacks do not =="
 cat <<'EOF'
-  deploy/replicas, configs and secrets
-  watch/develop, and `compose run` for a one-off against the stack
+  configs and secrets; watch/develop
+  the rest of deploy beyond replicas (placement, resources, rollback)
   a healthcheck that keeps running after startup, not just during `up`
 
   Closed since this list was first written, because measuring against
   Compose is what made the gap concrete: profiles, ${VAR} interpolation
   with .env, build:, restart on a service, several -f files merged,
-  extends, and healthcheck with depends_on conditions.
+  extends, healthcheck with depends_on conditions, replicas, and
+  `stack run`.
 EOF

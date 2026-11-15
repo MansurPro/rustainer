@@ -67,6 +67,15 @@
   nav button:hover { color: var(--text); background: var(--panel-2); }
   nav button[aria-current="true"] { color: var(--text); background: var(--panel-2); border-color: var(--line); }
   .spacer { flex: 1; }
+  .toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
+            font-weight: 400; color: var(--dim); cursor: pointer; user-select: none; }
+  .toggle input { accent-color: var(--accent); margin: 0; cursor: pointer; }
+  #column-picker { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 8px 12px;
+                   border-bottom: 1px solid var(--line); font-size: 12px; }
+  /* A sparkline: the last N samples the page already keeps for the CPU
+     percentage, drawn small enough to live inside a table cell. */
+  .spark { display: inline-block; vertical-align: middle; margin-left: 6px; }
+  .spark path { fill: none; stroke: var(--accent); stroke-width: 1.2; }
   .sys { color: var(--dim); font-family: var(--mono); font-size: 11.5px; display: flex; gap: 14px; flex-wrap: wrap; }
   .sys b { color: var(--text); font-weight: 500; }
 
@@ -237,8 +246,13 @@
         Containers
         <span class="spacer"></span>
         <input id="filter" placeholder="filter  ( / )" style="width: 180px; padding: 3px 8px; font-size: 12px;">
+        <label class="toggle" title="Hide containers that are not running">
+          <input type="checkbox" id="only-running"> running only
+        </label>
+        <button class="act" id="columns-btn" title="Choose which columns to show">columns</button>
         <button class="act" id="new-container">Run a container</button>
       </h2>
+      <div id="column-picker" hidden></div>
       <div id="containers"></div>
     </div>
     <!-- Outside the table on purpose. Rebuilding this every two seconds
@@ -375,6 +389,49 @@ let openRow = null;           // container id whose detail panel is open
 let detailTab = "logs";
 const cpuSamples = new Map(); // id -> {usec, at} for turning a counter into a rate
 const cpuPercent = new Map();
+const cpuHistory = new Map();
+const SPARK_N = 30;
+
+// Which columns are shown. Kept in localStorage because it is a
+// per-viewer convenience and nothing else: it must never be the reason
+// two people disagree about what the engine is doing, and a browser
+// that refuses storage has to render exactly the same page.
+const COLUMNS = [
+  { key: "stack", label: "Stack" }, { key: "command", label: "Command" },
+  { key: "address", label: "Address" }, { key: "cpu", label: "CPU" },
+  { key: "memory", label: "Memory" }, { key: "age", label: "Age" },
+];
+let hidden = new Set();
+try {
+  const raw = localStorage.getItem("rustainer.hiddenColumns");
+  if (raw) hidden = new Set(JSON.parse(raw));
+} catch (_) { /* private window, blocked storage: defaults are fine */ }
+const saveColumns = () => {
+  try {
+    localStorage.setItem("rustainer.hiddenColumns", JSON.stringify([...hidden]));
+  } catch (_) { /* nothing to do, and nothing to tell the operator */ }
+};
+let onlyRunning = false;
+
+/// A sparkline of the last samples, or nothing when there is no history
+/// worth drawing. Inline SVG: no library, and it scales with the text.
+function spark(values) {
+  if (!values || values.length < 3) return "";
+  const w = 46, h = 12, max = Math.max(1, ...values);
+  const step = w / (values.length - 1);
+  const d = values
+    .map((v, i) => `${i ? "L" : "M"}${(i * step).toFixed(1)},${(h - (v / max) * h).toFixed(1)}`)
+    .join(" ");
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "spark");
+  svg.setAttribute("width", String(w));
+  svg.setAttribute("height", String(h));
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", d);
+  svg.append(path);
+  return svg;
+}
 const execOutput = new Map();  // id -> last output, so a refresh cannot eat it
 let execCommand = "ps -o pid,comm";
 
@@ -387,6 +444,25 @@ for (const b of document.querySelectorAll("nav button")) {
   };
 }
 $("#filter").oninput = (e) => { filter = e.target.value.toLowerCase(); renderContainers(lastContainers); };
+$("#only-running").onchange = (e) => {
+  onlyRunning = e.target.checked;
+  renderContainers(lastContainers);
+};
+$("#columns-btn").onclick = () => {
+  const box = $("#column-picker");
+  box.hidden = !box.hidden;
+  if (box.hidden) return;
+  box.replaceChildren(...COLUMNS.map((col) => {
+    const cb = el("input", { type: "checkbox" });
+    cb.checked = !hidden.has(col.key);
+    cb.onchange = () => {
+      if (cb.checked) hidden.delete(col.key); else hidden.add(col.key);
+      saveColumns();
+      renderContainers(lastContainers);
+    };
+    return el("label", { className: "toggle" }, [cb, col.label]);
+  }));
+};
 // Is the keystroke already spoken for? A text field, a contenteditable,
 // or anything that declared itself a key sink - the terminal does.
 // Checked by capability rather than by tag name, because the thing that
@@ -467,21 +543,32 @@ function renderContainers(list) {
   lastContainers = list;
   renderSummary(list);
   const box = $("#containers");
-  const rows = list.filter((c) =>
-    !filter || (c.id + " " + (c.command || "") + " " + (c.hostname || "")).toLowerCase().includes(filter));
+  const rows = list
+    .filter((c) => !onlyRunning || c.status === "running")
+    .filter((c) =>
+      !filter || (c.id + " " + (c.command || "") + " " + (c.hostname || "")).toLowerCase().includes(filter));
 
   if (!rows.length) {
     box.replaceChildren(el("div", { className: "empty" },
-      list.length ? "Nothing matches that filter." : "No containers yet. Run one."));
+      !list.length ? "No containers yet. Run one."
+        : onlyRunning && !list.some((c) => c.status === "running")
+          ? "Nothing is running. Untick \u201crunning only\u201d to see the rest."
+          : "Nothing matches that filter."));
     return;
   }
 
+  const show = (k) => !hidden.has(k);
   const t = el("table");
   t.append(el("thead", {}, el("tr", {}, [
-    el("th", {}, "ID"), el("th", { className: "hide-s" }, "Stack"),
-    el("th", {}, "Status"), el("th", { className: "hide-s" }, "Command"),
-    el("th", { className: "hide-s" }, "Address"), el("th", {}, "CPU"), el("th", {}, "Memory"),
-    el("th", { className: "hide-s" }, "Age"), el("th", {}, ""),
+    el("th", {}, "ID"),
+    show("stack") ? el("th", { className: "hide-s" }, "Stack") : "",
+    el("th", {}, "Status"),
+    show("command") ? el("th", { className: "hide-s" }, "Command") : "",
+    show("address") ? el("th", { className: "hide-s" }, "Address") : "",
+    show("cpu") ? el("th", {}, "CPU") : "",
+    show("memory") ? el("th", {}, "Memory") : "",
+    show("age") ? el("th", { className: "hide-s" }, "Age") : "",
+    el("th", {}, ""),
   ])));
   const body = el("tbody");
 
@@ -503,16 +590,19 @@ function renderContainers(list) {
     const tr = el("tr");
     tr.append(
       el("td", { className: "mono nowrap" }, c.id),
-      el("td", { className: "dim nowrap hide-s" }, c.stack || "—"),
+      show("stack") ? el("td", { className: "dim nowrap hide-s" }, c.stack || "—") : "",
       el("td", { className: "nowrap" }, [
         statusPill(c),
         c.error ? el("div", { className: "why", title: esc(c.error) }, esc(c.error)) : "",
       ]),
-      el("td", { className: "mono dim truncate hide-s", title: esc(c.command) }, esc(c.command)),
-      el("td", { className: "mono dim nowrap hide-s" },
-        (c.ip || "—") + (c.ports && c.ports.length ? "  " + c.ports.map((p) => p.host + "→" + p.container).join(" ") : "")),
-      el("td", { className: "mono nowrap" }, running && pct != null ? pct.toFixed(1) + "%" : "—"),
-      el("td", { className: "nowrap" }, running && memVal != null
+      show("command")
+        ? el("td", { className: "mono dim truncate hide-s", title: esc(c.command) }, esc(c.command))
+        : "",
+      show("address") ? el("td", { className: "mono dim nowrap hide-s" },
+        (c.ip || "—") + (c.ports && c.ports.length ? "  " + c.ports.map((p) => p.host + "→" + p.container).join(" ") : "")) : "",
+      show("cpu") ? el("td", { className: "mono nowrap" }, running && pct != null
+        ? [pct.toFixed(1) + "%", spark(cpuHistory.get(c.id))] : "—") : "",
+      show("memory") ? el("td", { className: "nowrap" }, running && memVal != null
         ? el("span", {
             className: "mono",
             title: memKind === "cgroup"
@@ -532,8 +622,10 @@ function renderContainers(list) {
             title: running && st.cgroup === false
               ? "no cgroup for this container, so nothing is accounted"
               : "the memory controller is not enabled in this subtree",
-          }, "—")),
-      el("td", { className: "dim nowrap mono hide-s" }, ago(c.started_at || c.created_at)),
+          }, "—")) : "",
+      show("age")
+        ? el("td", { className: "dim nowrap mono hide-s" }, ago(c.started_at || c.created_at))
+        : "",
     );
 
     const acts = el("div", { className: "actions" });
@@ -1272,7 +1364,17 @@ async function refresh() {
         const prev = cpuSamples.get(c.id);
         if (prev && s.sampled_at_usec > prev.at) {
           const pct = ((s.cpu_usec - prev.usec) / (s.sampled_at_usec - prev.at)) * 100;
-          if (pct >= 0 && pct < 10000) cpuPercent.set(c.id, pct);
+          if (pct >= 0 && pct < 10000) {
+            cpuPercent.set(c.id, pct);
+            // A short history, for the sparkline. Bounded: a page left
+            // open all day must not grow a list per container until the
+            // tab dies, which is the usual way a "small" chart becomes
+            // the page's memory problem.
+            const h = cpuHistory.get(c.id) || [];
+            h.push(pct);
+            while (h.length > SPARK_N) h.shift();
+            cpuHistory.set(c.id, h);
+          }
         }
         cpuSamples.set(c.id, { usec: s.cpu_usec, at: s.sampled_at_usec });
       }

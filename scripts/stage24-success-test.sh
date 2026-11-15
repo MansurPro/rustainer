@@ -97,6 +97,11 @@ print('' if d is None else d)" "$1"; }
 echo
 echo "1. The page carries the new views, and still loads nothing"
 PAGE=$(curl -fsS "$URL/")
+# The three Docker Desktop has and this did not, found by putting the
+# two Containers screens side by side rather than by guessing.
+for marker in "only-running" "column-picker" "spark"; do
+    contains "the page has $marker" "$PAGE" "$marker"
+done
 for marker in "view-networks" "view-events" "terminal" "palette"; do
     contains "the page has $marker" "$PAGE" "$marker"
 done

@@ -599,6 +599,7 @@ rustainer stack down  -f examples/rustainer.toml
 rustainer stack down  -t 1 -f examples/rustainer.toml   # a shorter grace
 rustainer stack up    --profile debug -f examples/rustainer.toml
 rustainer stack up    -f base.toml -f prod.toml   # later wins, key by key
+rustainer stack run   -f examples/rustainer.toml db /bin/sh   # one-off
 ```
 
 ```toml
@@ -692,6 +693,22 @@ Stopping three such services one at a time means waiting three times, and
 measuring against `docker compose down` is how that was found: 3.1s
 against 1.3s, for no reason but queueing. Now 1.0s, and `-t` sets the
 grace.
+
+**`replicas` runs a service as N containers**, `<stack>-<service>-1` and
+so on; a service with one replica keeps its unsuffixed name, because
+renaming every existing stack's containers for a feature they do not use
+is not a trade worth making. Replicas are where `/etc/hosts` runs out,
+and the limit is stated rather than left to be discovered under load: a
+name can appear more than once in that file, but **every resolver takes
+the first match**, so the service name reaches replica 1 and nothing
+round-robins. Each replica answers to its own name. Load balancing needs
+a resolver, and there is no daemon here to be one.
+
+**`stack run`** is `compose run`: a one-off container with the service's
+image, environment, volumes and network, a command of your choosing, and
+nothing left behind. It does *not* start the service's dependencies —
+starting half a stack as a side effect of a one-off command is how you
+end up with two copies of a database.
 
 A stack is **not an orchestrator**. No reconciliation loop, no
 rescheduling, no health-gated rollout. `up` starts what is not running in

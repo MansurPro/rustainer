@@ -348,11 +348,31 @@ previous one's namespaces and failed with ENOENT for paths that plainly
 existed. The probe is now a child process, which is the same rule the
 API server follows for the same reason.
 
+And a third pass closed two more:
+
+- **`replicas`** - a service becomes N containers, `<stack>-<service>-1`
+  and so on, while a service with one replica keeps its unsuffixed name
+  so no existing stack's containers get renamed for a feature it is not
+  using. `0` is refused rather than quietly running nothing.
+
+  Replicas are where `/etc/hosts` runs out, and the limit is stated
+  rather than discovered under load: a name may appear more than once in
+  that file but every resolver takes the first match, so the *service*
+  name reaches replica 1 and **nothing round-robins**. Each replica is
+  reachable by its own name. Load balancing needs a resolver, and there
+  is no daemon here to be one.
+- **`stack run`** - `compose run`: a one-off with the service's image,
+  environment, volumes and network, a command of your choosing, removed
+  when it exits. It does **not** start the service's dependencies:
+  starting half a stack as a side effect of a one-off command is how you
+  end up with two copies of a database.
+
 ### What Compose still has that these stacks do not
 
-`deploy`/replicas; configs and secrets; `watch`/`develop`; `compose run`
-for a one-off container against the stack; and a healthcheck that keeps
-running after startup.
+`configs` and `secrets`; `watch`/`develop`; the rest of `deploy` beyond
+replicas (placement, resources, rollback); and **a healthcheck that keeps
+running after startup** - the probe here answers "may the next service
+start", and nothing reacts to a container going unhealthy later.
 
 ---
 
@@ -415,13 +435,21 @@ MEMORY, AGE with details / stop / remove.
 | **which stack a container belongs to** | expandable grouping | **a column, and a Stacks view** |
 | **Networks** | **not in the navigation** - CLI only | **a view**: subnet, bridge, members |
 | **Events** | **not in the navigation** | **a view**, colour-coded |
-| only-show-running toggle, column chooser, charts | yes | no |
+| only-show-running toggle | yes | **yes** — added because of this comparison |
+| column chooser | yes | **yes** — added because of this comparison |
+| per-container CPU history | full charts | a sparkline in the row |
 | Image and Port(s) columns | yes | ports fold into ADDRESS |
 | Kubernetes, Models, MCP Toolkit, Hub, Extensions, Gordon, Sign in | yes | no, and not planned |
 | Settings for CPU/memory/disk | yes - it owns a VM | nothing to allocate |
 
-**Where Docker Desktop was better, and what was done about it.** Its
-Containers screen reports `Container memory usage 350.91MB / 3.73GB` on
+**Where Docker Desktop was better, and what was done about it.** Three
+things, all found by looking at the two screens rather than by
+reasoning about them: an only-show-running toggle, a column chooser,
+and per-container CPU history. All three now exist here - the history
+as a sparkline in the row rather than a chart panel, because the page
+already keeps the samples it needs and a 46-pixel SVG costs nothing.
+
+The fourth was the one that mattered. Its Containers screen reports `Container memory usage 350.91MB / 3.73GB` on
 a host where nothing asked for a memory limit. Ours printed `-` for
 every container, because `memory.current` exists only where the memory
 controller is enabled in the parent's `subtree_control`, and this engine
@@ -436,9 +464,16 @@ the same number**: it double-counts pages two processes share and omits
 page cache the cgroup is charged for. So the cell is labelled `rss`, and
 hovering says exactly that. A number with its limits stated beats a dash.
 
-**What was not compared**: Docker Desktop's per-container detail pages.
-Recent versions have an exec terminal and a file browser there, and this
-comparison never opened them, so it says nothing about them.
+**The limits of this comparison, stated rather than implied.** Docker
+Desktop's window can be captured; its Electron UI cannot be driven from
+a script with the tools here - clicking its navigation by accessibility
+element and by screen coordinate both failed to change screens. So what
+is compared above is the Containers screen and the navigation, both read
+off the running application, and **nothing else**: not Images, not
+Volumes, and not the per-container detail pages, which in recent
+versions carry an exec terminal and a file browser. Those may well be
+better than anything here. This document does not say otherwise, because
+it did not look.
 
 ### What the page does that is worth something
 

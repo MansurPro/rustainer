@@ -107,6 +107,14 @@ pub struct Service {
     /// A command that decides whether this service is ready.
     #[serde(default)]
     pub healthcheck: Option<HealthCheck>,
+    /// How many containers to run for this service.
+    ///
+    /// One by default, and one keeps the plain `<stack>-<service>`
+    /// name: a file that never mentions replicas must not have its
+    /// container names change underneath it. Above one they are
+    /// `<stack>-<service>-1`, `-2`, and so on.
+    #[serde(default = "one_replica")]
+    pub replicas: u32,
     #[serde(default)]
     pub memory: Option<String>,
     #[serde(default)]
@@ -198,6 +206,9 @@ pub struct HealthCheck {
 fn one() -> u64 {
     1
 }
+fn one_replica() -> u32 {
+    1
+}
 fn thirty() -> u64 {
     30
 }
@@ -266,6 +277,12 @@ impl Stack {
                 && h.test.is_empty()
             {
                 bail!("service {name:?} has a `healthcheck` with no `test` command");
+            }
+            if svc.replicas == 0 {
+                bail!(
+                    "service {name:?} asks for 0 replicas. Remove the service, or \
+                     put it behind a profile, rather than defining one that never runs."
+                );
             }
             for dep in svc.depends_on.names() {
                 if svc.depends_on.wants_healthy(dep)
@@ -541,6 +558,24 @@ impl Stack {
     /// without knowing a stack exists.
     pub fn container_name(&self, service: &str) -> String {
         format!("{}-{}", self.name, service)
+    }
+
+    /// Every container name for a service, which is one name unless it
+    /// asked for replicas.
+    ///
+    /// A single replica keeps the unsuffixed name on purpose: adding
+    /// `-1` to every existing stack's containers would rename things
+    /// people have in scripts, for the benefit of a feature they are
+    /// not using.
+    pub fn container_names(&self, service: &str) -> Vec<String> {
+        let n = self.services.get(service).map(|s| s.replicas).unwrap_or(1);
+        if n <= 1 {
+            vec![self.container_name(service)]
+        } else {
+            (1..=n)
+                .map(|i| format!("{}-{}-{}", self.name, service, i))
+                .collect()
+        }
     }
 
     /// Start order: dependencies first, ties broken alphabetically so the
@@ -884,6 +919,25 @@ depends_on = ["db"]
         // `{:#}`, not `{}`: anyhow's Display shows only the outermost
         // context, and the sentence worth asserting on is the innermost.
         assert!(format!("{e:#}").contains("is not a condition"), "{e:#}");
+    }
+
+    #[test]
+    fn one_replica_keeps_the_plain_name() {
+        // Adding `-1` to every existing stack's containers would rename
+        // things people have in scripts, for a feature they are not
+        // using.
+        let s = Stack::parse("name=\"x\"\n[services.web]\nimage=\"i\"\n").unwrap();
+        assert_eq!(s.container_names("web"), vec!["x-web"]);
+
+        let s = Stack::parse("name=\"x\"\n[services.web]\nimage=\"i\"\nreplicas=3\n").unwrap();
+        assert_eq!(s.container_names("web"), vec!["x-web-1", "x-web-2", "x-web-3"]);
+    }
+
+    #[test]
+    fn zero_replicas_is_refused_rather_than_silently_nothing() {
+        let e = Stack::parse("name=\"x\"\n[services.web]\nimage=\"i\"\nreplicas=0\n")
+            .unwrap_err();
+        assert!(e.to_string().contains("0 replicas"), "{e}");
     }
 
     #[test]

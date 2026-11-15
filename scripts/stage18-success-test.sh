@@ -139,12 +139,17 @@ echo
 echo "2. Up starts everything, in dependency order"
 UP=$(timeout 300 "$B" stack up -f "$F" 2>&1)
 echo "$UP" | tail -1
-check "it reports three services started" \
-    "$(echo "$UP" | grep -c 'service(s) started')" "1"
+# "container(s)", not "service(s)": a service with `replicas` is several
+# containers, and a count that says "3 services" while starting seven of
+# them is the kind of number people stop reading.
+check "it reports three containers started" \
+    "$(echo "$UP" | grep -c 'container(s) started')" "1"
 # The order is the contract: `ps` prints it, and it must put a service
-# after everything it depends on.
+# after everything it depends on. Printed by CONTAINER name for the same
+# reason - a table that prints one service's name three times is not a
+# table.
 ORDER=$("$B" stack ps -f "$F" | tail -n +2 | awk '{print $1}' | tr '\n' ' ')
-check "the order is dependencies first" "$ORDER" "db api web "
+check "the order is dependencies first" "$ORDER" "stagetest-db stagetest-api stagetest-web "
 sleep 1.5
 check "all three are running" \
     "$("$B" stack ps -f "$F" | tail -n +2 | awk '$2 == "running"' | grep -c .)" "3"
@@ -345,6 +350,51 @@ check "the dependant started only after the dependency was healthy" \
     "$("$B" ps -a | grep -c mergestack-web || true)" "1"
 contains "the wait is reported" "$(cat "$SCRATCH/merge.log")" "healthy after"
 timeout 300 "$B" stack down -t 0 -f "$M/base.toml" -f "$M/prod.toml" >/dev/null 2>&1
+
+echo
+echo "10. Replicas, and a one-off against the stack"
+R="$SCRATCH/rep"
+mkdir -p "$R"
+cat > "$R/rustainer.toml" <<EOF
+name = "repstack"
+
+[services.worker]
+image = "$IMG"
+command = ["/bin/sleep", "300"]
+replicas = 3
+env = ["ROLE=worker"]
+
+[services.solo]
+image = "$IMG"
+command = ["/bin/sleep", "300"]
+EOF
+timeout 300 "$B" stack up -f "$R/rustainer.toml" >/dev/null 2>&1
+check "three replicas got three containers" \
+    "$("$B" ps -a | grep -cE 'repstack-worker-[123]' || true)" "3"
+check "and the single service kept its unsuffixed name" \
+    "$("$B" ps -a | grep -c 'repstack-solo' || true)" "1"
+check "stack ps lists every replica by container name" \
+    "$(timeout 60 "$B" stack ps -f "$R/rustainer.toml" | grep -cE 'repstack-worker-[123]' || true)" "3"
+# Each replica is reachable by its own name; the service name reaches
+# the first, because /etc/hosts has no round robin and we do not pretend.
+contains "a replica is in its peers' hosts file" \
+    "$(timeout 60 "$B" exec repstack-solo /bin/cat /etc/hosts 2>&1 | tr '\n' ' ')" "repstack-worker-2"
+check "and is reachable by that name" \
+    "$(timeout 60 "$B" exec repstack-solo /bin/sh -c 'ping -c1 -W2 repstack-worker-2 >/dev/null 2>&1 && echo ok || echo failed' 2>&1 | tail -1)" \
+    "ok"
+
+# A one-off borrows the service's settings and leaves nothing behind.
+OUT=$(timeout 300 "$B" stack run -f "$R/rustainer.toml" solo /bin/sh -c 'echo $ROLE; echo one-off-ran' 2>&1)
+contains "the one-off ran our command" "$OUT" "one-off-ran"
+OUT2=$(timeout 300 "$B" stack run -f "$R/rustainer.toml" worker /bin/sh -c 'echo $ROLE' 2>&1)
+contains "and borrowed the service's environment" "$OUT2" "worker"
+check "it left no container behind" \
+    "$("$B" ps -a | grep -c -- '-run-' || true)" "0"
+refuses "a service that is not in the stack is named, not guessed at" "no service called" \
+    "$B" stack run -f "$R/rustainer.toml" nosuch /bin/true
+timeout 300 "$B" stack down -t 0 -f "$R/rustainer.toml" >/dev/null 2>&1
+check "down removed every replica" \
+    "$("$B" ps -a | grep -c repstack- || true)" "0"
 
 echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
