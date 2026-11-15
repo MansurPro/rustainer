@@ -230,39 +230,77 @@ identically - so what follows is a rate, with the denominators.
 
 | | measured |
 |---|---|
-| images offered | 12 |
-| excluded (Docker could not run it) | 0 |
-| `id -u`, `id -g`, `pwd`, `$PATH` byte-identical | **12/12** |
-| exit status of the image's own ENTRYPOINT/CMD identical | **12/12** |
+| images offered | 30 |
+| excluded (Docker could not pull it) | 2 |
+| `id -u`, `id -g`, `pwd`, `$PATH` byte-identical | **28/28** |
+| exit status of the image's own ENTRYPOINT/CMD identical | **28/28** |
 
-alpine, debian, ubuntu, busybox, python, node, nginx, redis, postgres,
-httpd, memcached, golang. The interesting ones are `redis`, `postgres`
-and `memcached`, which set `USER` to a *name* that has to be resolved
-through the image's own `/etc/passwd`, and `nginx`, whose ENTRYPOINT is
-a script that runs other scripts.
+alpine ×2, debian ×2, ubuntu, busybox, fedora, almalinux, python ×2,
+node ×2, ruby, php, golang, rust, eclipse-temurin, nginx ×2, httpd,
+caddy, traefik, redis ×2, postgres, mariadb, memcached, mongo. glibc and
+musl, four distribution families, six language runtimes, and six
+servers. The interesting ones are `redis`, `postgres` and `memcached`,
+which set `USER` to a *name* that has to be resolved through the image's
+own `/etc/passwd`, and `nginx` and `mongo`, whose entrypoints are
+scripts that run other scripts and then drop privileges.
 
-The same run timed one container start per image, which is the first
-time the speed claim has been measured on anything but alpine:
+**Widening this list from twelve images to thirty found a real bug**,
+which is the only reason to widen it. At twelve it was 12/12; at thirty
+it was 27/28, and the one that differed was `mongo:7` - exit 48 against
+Docker's 0, with `setup bind :: caused by :: Permission denied` in its
+log.
+
+`mkdirat` masks its mode argument with the process **umask**. A layer
+declaring `/tmp` as `1777` got `1755`, so mongod - whose entrypoint
+drops to uid 999 - could not create its socket there. Nothing in the
+engine looked wrong because nothing was: the kernel applied the umask to
+a number that had been computed correctly. A directory that already
+existed was worse, because `mkdirat` returns `EEXIST` without touching
+the mode at all.
+
+Directory modes are now applied in a final pass, deepest first, through
+the pinned parent with `O_NOFOLLOW` and `fchmod` on the descriptor - no
+second path resolution, which is the hole that module exists to close.
+GNU tar calls the same thing `--delay-directory-restore`. The regression
+test runs under `umask 022` on purpose, so it fails if the pass is ever
+removed.
+
+The same run timed one container start per image, across all thirty:
 
 | image | docker | rustainer | |
 |---|---|---|---|
-| alpine:3.21 | 87ms | 11ms | 7.5x |
-| debian:12-slim | 76ms | 10ms | 7.0x |
-| ubuntu:24.04 | 76ms | 10ms | 7.1x |
-| busybox:1.37 | 77ms | 10ms | 7.1x |
-| python:3.13-slim | 80ms | 10ms | 7.4x |
-| node:22-alpine | 77ms | 11ms | 6.6x |
-| nginx:1.27-alpine | 75ms | 11ms | 6.8x |
-| redis:7-alpine | 77ms | 10ms | 7.0x |
-| postgres:17-alpine | 77ms | 10ms | 7.2x |
-| httpd:2.4-alpine | 79ms | 10ms | 7.3x |
-| memcached:1.6-alpine | 80ms | 11ms | 6.9x |
-| golang:1.23-alpine | 87ms | 12ms | 6.9x |
+| alpine:3.21 | 85ms | 13ms | 6.4x |
+| debian:12-slim | 96ms | 18ms | 5.2x |
+| ubuntu:22.04 | 85ms | 13ms | 6.3x |
+| busybox:1.37 | 83ms | 13ms | 6.4x |
+| fedora:41 | 84ms | 12ms | 6.6x |
+| almalinux:9 | 77ms | 12ms | 6.2x |
+| python:3.13-alpine | 83ms | 11ms | 7.0x |
+| node:22-slim | 77ms | 12ms | 6.5x |
+| ruby:3.3-alpine | 82ms | 16ms | 5.1x |
+| php:8.3-cli-alpine | 81ms | 11ms | 6.8x |
+| golang:1.23-alpine | 82ms | 12ms | 6.7x |
+| rust:1-slim | 86ms | 14ms | 6.0x |
+| eclipse-temurin:21-jre-alpine | 84ms | 12ms | 6.5x |
+| nginx:1.27 | 84ms | 12ms | 6.5x |
+| caddy:2-alpine | 78ms | 12ms | 6.5x |
+| traefik:v3.2 | 117ms | 12ms | 9.7x |
+| redis:7 | 84ms | 12ms | 6.6x |
+| postgres:17-alpine | 83ms | 12ms | 6.8x |
+| mariadb:11 | 78ms | 12ms | 6.4x |
+| mongo:7 | 92ms | 13ms | 6.7x |
 
-**6.6x to 7.5x, and the image barely matters.** That is the signature of
-a difference that is architectural rather than incidental: the work both
-engines skip for an image already in the store is the same work, so what
-is left is the path from the command to `clone`.
+(Twenty of the thirty, trimmed for width; the rest sit in the same band.
+An earlier, quieter run of twelve images measured 6.6-7.5x, which is the
+same result with less contention on the host.)
+
+**5.1x to 9.7x across thirty images, clustered near 6.5x, and the image
+barely matters.** That is the signature of a difference that is
+architectural rather than incidental: the work both engines skip for an
+image already in the store is the same work, so what is left is the path
+from the command to `clone`. The outlier in our favour is `traefik`,
+where Docker took 117ms; the two nearest the bottom, `ruby` and
+`debian-slim`, are ours being slower rather than Docker being faster.
 
 ---
 

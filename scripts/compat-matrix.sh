@@ -45,7 +45,18 @@ else
     MOUNTED=no
 fi
 export RUSTAINER_ROOT="$WORK/state"
-export RUSTAINER_IMAGE_ROOT="${RUSTAINER_COMPAT_STORE:-$WORK/images}"
+# The image store on the tmpfs is fine for a dozen images and not for
+# thirty: tmpfs is RAM, and the benchmark VM has less of it than thirty
+# images need - which is how this script came to report fourteen
+# consecutive "PULL-FAIL"s that were ENOSPC.
+#
+# Point RUSTAINER_COMPAT_STORE at a REAL filesystem for a long list. Not
+# a path inside a container's own root, which is overlayfs: an overlay
+# cannot be assembled from lowerdirs that are themselves on overlayfs,
+# and the symptom is every container exiting 127 because its root
+# filesystem came out empty. In the docker-in-docker benchmark host,
+# /var/lib/docker is the real disk.
+export RUSTAINER_IMAGE_ROOT="${RUSTAINER_COMPAT_STORE:-${RUSTAINER_IMAGE_DIR:-$WORK/images}}"
 mkdir -p "$RUSTAINER_IMAGE_ROOT"
 cleanup() {
     "$B" ps -a 2>/dev/null | tail -n +2 | awk '{print $1}' \
@@ -58,9 +69,14 @@ trap cleanup EXIT
 # A spread of shapes rather than a spread of names: musl and glibc, an
 # image with no shell, images whose ENTRYPOINT is a script, images that
 # set USER to a name, and images that are mostly a compiler.
-DEFAULT_IMAGES="alpine:3.21 debian:12-slim ubuntu:24.04 busybox:1.37 \
-python:3.13-slim node:22-alpine nginx:1.27-alpine redis:7-alpine \
-postgres:17-alpine httpd:2.4-alpine memcached:1.6-alpine golang:1.23-alpine"
+DEFAULT_IMAGES="alpine:3.21 alpine:3.19 debian:12-slim debian:11-slim \
+ubuntu:24.04 ubuntu:22.04 busybox:1.37 fedora:41 almalinux:9 \
+python:3.13-slim python:3.13-alpine node:22-alpine node:22-slim \
+ruby:3.3-alpine php:8.3-cli-alpine golang:1.23-alpine rust:1-slim \
+eclipse-temurin:21-jre-alpine nginx:1.27-alpine nginx:1.27 \
+httpd:2.4-alpine caddy:2-alpine haproxy:3-alpine traefik:v3.2 \
+redis:7-alpine redis:7 postgres:17-alpine mariadb:11 \
+memcached:1.6-alpine mongo:7"
 IMAGES=${*:-$DEFAULT_IMAGES}
 
 # Docker Hub rate-limits anonymous pulls hard enough that this script
@@ -86,8 +102,12 @@ for img in $IMAGES; do
         echo "  $img: docker could not pull it; excluded"
         SKIPPED=$((SKIPPED + 1)); continue
     fi
-    if ! timeout 600 "$B" pull "$ref" >/dev/null 2>&1; then
-        printf '%-22s %-10s\n' "$img" "PULL-FAIL"
+    # The error, not just the fact. A run of these turned out to be the
+    # 4g tmpfs this script mounts filling up - tmpfs is RAM, and the
+    # benchmark VM has less of it than thirty images need - and the
+    # discarded message said so all along.
+    if ! PERR=$(timeout 600 "$B" pull "$ref" 2>&1 >/dev/null); then
+        printf '%-22s %-10s %s\n' "$img" "PULL-FAIL" "$(echo "$PERR" | tail -1 | cut -c1-70)"
         FAILED="$FAILED $img(pull)"; continue
     fi
 

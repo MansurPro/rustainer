@@ -90,7 +90,11 @@ pub struct Report {
     pub ownership_skipped: u64,
     pub whiteouts: u64,
     pub opaque_dirs: u64,
-    /// Directories whose mode was widened so extraction could continue.
+    /// Directories whose mode had to be widened *while* extracting.
+    ///
+    /// Temporarily: the mode the layer asked for is restored in a final
+    /// pass. This counts the ones that needed the owner's search bit
+    /// forced on to be writable in the meantime.
     pub modes_relaxed: u64,
     /// Entries naming the archive's own root (`./`), which carry a mode for
     /// a directory that already exists and nothing to extract.
@@ -473,6 +477,12 @@ pub fn apply_layer<R: Read>(
     archive.set_preserve_permissions(false);
     archive.set_unpack_xattrs(false);
 
+    // Directory modes, applied after every entry is in place. GNU tar
+    // calls this --delay-directory-restore and needs it for the same
+    // reason: a directory has to be traversable while its own contents
+    // are being written, whatever mode it is supposed to end up with.
+    let mut deferred_modes: Vec<(PathBuf, u32)> = Vec::new();
+
     let entries = archive.entries().map_err(Error::Archive)?;
     for entry in entries {
         let mut entry = entry.map_err(Error::Archive)?;
@@ -525,12 +535,27 @@ pub fn apply_layer<R: Read>(
                 // can be created inside it and the rest of the layer fails
                 // with EACCES. Recorded rather than silently applied,
                 // because it is a deviation from what the layer asked for.
-                let wanted = Mode::from_bits_truncate(mode);
                 let effective = mode | 0o700;
                 if effective != mode {
                     report.modes_relaxed += 1;
                 }
-                let _ = wanted;
+                // The mode the layer asked for is applied at the END, not
+                // here. Two reasons, and the first one was a real bug:
+                //
+                // `mkdirat` masks its mode argument with the process
+                // UMASK, so a layer's 1777 /tmp became 1755 and every
+                // image whose entrypoint drops to a non-root user could
+                // not write there. mongo:7 failed exactly this way -
+                // "setup bind :: Permission denied" - while the same
+                // image under Docker was fine, and nothing in the engine
+                // looked wrong because nothing in the engine was: the
+                // umask was applied by the kernel, silently, to a number
+                // we had computed correctly.
+                //
+                // And a directory that already exists keeps whatever mode
+                // an earlier layer gave it, because mkdirat returns EEXIST
+                // without touching it.
+                deferred_modes.push((rel.clone(), mode));
                 match rustix::fs::mkdirat(
                     &dir,
                     name.as_c_str(),
@@ -704,6 +729,33 @@ pub fn apply_layer<R: Read>(
                 }
             }
         }
+    }
+
+    // Deepest first, so a directory is never made unsearchable before the
+    // ones inside it have been dealt with.
+    deferred_modes.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
+    for (rel, mode) in &deferred_modes {
+        let dir = root.parent_dir(rel)?;
+        let name = file_name_c(rel)?;
+        // Opened through the pinned parent with O_NOFOLLOW, then fchmod
+        // on the descriptor: the mode lands on the directory we just
+        // created and not on whatever a symlink of the same name might
+        // point at by now. A path-based chmod here would be a second
+        // resolution, which is the hole this whole module is built to
+        // close.
+        let fd = match rustix::fs::openat(
+            &dir,
+            name.as_c_str(),
+            OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            // Gone, or replaced by something that is not a directory,
+            // between creation and now. Not worth failing the layer: the
+            // entry that replaced it won.
+            Err(_) => continue,
+        };
+        let _ = rustix::fs::fchmod(&fd, Mode::from_bits_truncate(*mode));
     }
     Ok(())
 }
@@ -1149,5 +1201,43 @@ mod tests {
         let mut f = std::fs::File::create(d.join("x")).unwrap();
         f.write_all(b"ok").unwrap();
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_directory_keeps_the_mode_the_layer_asked_for() {
+        // The bug: `mkdirat` masks its mode with the process UMASK, so a
+        // layer's 1777 /tmp arrived as 1755, and every image whose
+        // entrypoint drops to a non-root user could not write there.
+        // mongo:7 failed exactly this way - "setup bind :: Permission
+        // denied" - while the same image under Docker was fine, and
+        // nothing in the engine looked wrong because nothing was: the
+        // kernel applied the umask to a number we had computed correctly.
+        //
+        // Run under a umask that WOULD mask those bits off, so this test
+        // fails if the deferred pass is ever removed.
+        let old = unsafe { libc::umask(0o022) };
+
+        let d = staging("dirmodes");
+        let mut outer = header("tmp/", tar::EntryType::Directory, 0);
+        outer.set_mode(0o1777);
+        // Nested, to prove deepest-first ordering does not leave an outer
+        // directory unsearchable before the inner one is set.
+        let mut inner = header("tmp/inner/", tar::EntryType::Directory, 0);
+        inner.set_mode(0o0700);
+        let t = tar_with(vec![(outer, Vec::new()), (inner, Vec::new())]);
+
+        let root = SafeRoot::open(&d).unwrap();
+        let mut r = Report::default();
+        apply_layer(&root, &t[..], Limits::default(), USERXATTR, &mut r).unwrap();
+
+        let mode = |p: &str| std::fs::metadata(d.join(p)).unwrap().mode() & 0o7777;
+        assert_eq!(
+            mode("tmp"),
+            0o1777,
+            "the sticky world-writable bit survived"
+        );
+        assert_eq!(mode("tmp/inner"), 0o0700);
+
+        unsafe { libc::umask(old) };
     }
 }
