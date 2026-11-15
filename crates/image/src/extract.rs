@@ -949,7 +949,26 @@ mod tests {
         ]);
         let r = run(&d, t).expect("a 0644 directory must not stop extraction");
         assert_eq!(r.modes_relaxed, 1, "the widening must be reported");
-        assert!(d.join("locked/inside").exists());
+
+        // The widening is TEMPORARY. Once the layer is extracted the
+        // directory gets the mode the layer declared, because that is
+        // what the image means and what tar does - so `locked` is 0644
+        // again and nothing but root can look inside it.
+        //
+        // This assertion used to be `locked/inside".exists()`, which
+        // passed for the wrong reason: the suite was being run as root,
+        // and root ignores permission bits. CI runs it as an ordinary
+        // user and caught it.
+        assert_eq!(
+            std::fs::metadata(d.join("locked")).unwrap().mode() & 0o7777,
+            0o644,
+            "the declared mode is restored, not the widened one"
+        );
+        std::fs::set_permissions(d.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            d.join("locked/inside").exists(),
+            "the file was written while the directory was widened"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
