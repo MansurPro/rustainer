@@ -930,13 +930,15 @@ depends_on = ["db"]
         assert_eq!(s.container_names("web"), vec!["x-web"]);
 
         let s = Stack::parse("name=\"x\"\n[services.web]\nimage=\"i\"\nreplicas=3\n").unwrap();
-        assert_eq!(s.container_names("web"), vec!["x-web-1", "x-web-2", "x-web-3"]);
+        assert_eq!(
+            s.container_names("web"),
+            vec!["x-web-1", "x-web-2", "x-web-3"]
+        );
     }
 
     #[test]
     fn zero_replicas_is_refused_rather_than_silently_nothing() {
-        let e = Stack::parse("name=\"x\"\n[services.web]\nimage=\"i\"\nreplicas=0\n")
-            .unwrap_err();
+        let e = Stack::parse("name=\"x\"\n[services.web]\nimage=\"i\"\nreplicas=0\n").unwrap_err();
         assert!(e.to_string().contains("0 replicas"), "{e}");
     }
 
