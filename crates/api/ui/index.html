@@ -387,8 +387,19 @@ for (const b of document.querySelectorAll("nav button")) {
   };
 }
 $("#filter").oninput = (e) => { filter = e.target.value.toLowerCase(); renderContainers(lastContainers); };
+// Is the keystroke already spoken for? A text field, a contenteditable,
+// or anything that declared itself a key sink - the terminal does.
+// Checked by capability rather than by tag name, because the thing that
+// broke was precisely an element that is none of INPUT or TEXTAREA and
+// still wants every key.
+function typingSomewhere() {
+  const a = document.activeElement;
+  if (!a) return false;
+  return a.tagName === "INPUT" || a.tagName === "TEXTAREA"
+    || a.isContentEditable || a.dataset.keysink === "1";
+}
 document.addEventListener("keydown", (e) => {
-  if (e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "TEXTAREA") {
+  if (e.key === "/" && !typingSomewhere()) {
     e.preventDefault(); $("#filter").focus();
   }
   if (e.key === "Escape" && $("#dlg").open) $("#dlg").close();
@@ -426,7 +437,14 @@ function statusPill(c) {
 function renderSummary(list) {
   const running = list.filter((c) => c.status === "running");
   const broken = list.filter((c) => c.status === "unknown" || c.error);
-  const mem = running.reduce((a, c) => a + ((c._stats && c._stats.memory_current) || 0), 0);
+  // Summed only over the containers whose usage is actually KNOWN, and
+  // shown as "-" when that is none of them. Treating an unknown as a
+  // zero and adding it up prints "0B" under a heading that reads as
+  // "using nothing", which is the one thing this page is not allowed to
+  // say: the memory controller is simply not enabled in this subtree,
+  // and the column next to it already says so on hover.
+  const known = running.filter((c) => c._stats && c._stats.memory_current != null);
+  const mem = known.reduce((a, c) => a + c._stats.memory_current, 0);
   const cpu = running.reduce((a, c) => a + (cpuPercent.get(c.id) || 0), 0);
   const stat = (label, value, alert) =>
     el("div", { className: "stat" + (alert ? " alert" : "") },
@@ -435,7 +453,7 @@ function renderSummary(list) {
     stat("running", running.length),
     stat("total", list.length),
     stat("cpu", cpu.toFixed(0) + "%"),
-    stat("memory", bytes(mem)),
+    stat("memory", known.length ? bytes(mem) : "—"),
     ...(broken.length ? [stat("need attention", broken.length, true)] : []),
   );
 }
@@ -705,7 +723,13 @@ let termOffset = 0;
 function terminalPane(c) {
   const wrap = el("div");
   const scr = makeScreen();
+  // A key sink: every keystroke belongs to the shell, not to the page.
+  // Without this the "/" shortcut below moves focus to the filter box
+  // the moment you type an absolute path - `cat /etc/hosts` puts `cat `
+  // in the terminal and `etc/hosts` in the filter - which makes the
+  // terminal useless for exactly the commands people type into one.
   const view = el("div", { className: "term", tabIndex: 0 });
+  view.dataset.keysink = "1";
   const paint = () => {
     const text = render(scr);
     view.replaceChildren();

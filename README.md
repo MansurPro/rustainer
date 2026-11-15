@@ -521,6 +521,21 @@ asserts, because a dashboard that fetches a framework before it can tell
 you what is running is useless exactly when you need it, and this engine
 is specifically built to work offline.
 
+Measured against Docker Desktop on one macOS machine
+(`research/COMPARISON.md` §8): **3.9 MiB resident** against 718–1041 MiB
+of macOS helper processes *plus* a VM with 3.82 GiB allocated; a 53 KB
+page against a 2.1 GB app bundle; and nothing resident at all once you
+close it. With the caveat that belongs next to the number rather than
+under it: most of what Docker Desktop's footprint buys is a Linux VM on a
+machine with no Linux kernel, and this has no macOS or Windows story at
+all — it requires a Linux host.
+
+Where the page is genuinely ahead is what it puts in front of you:
+**Networks and Events are views here and are not in Docker Desktop's
+navigation at all.** Where it is behind is everything §8 lists —
+Kubernetes, extensions, Hub integration, and per-container detail pages
+this comparison did not open.
+
 Two properties matter more than the endpoint list, and both are asserted
 rather than described:
 
@@ -581,6 +596,8 @@ tried to display it:
 rustainer stack up    -f examples/rustainer.toml
 rustainer stack ps    -f examples/rustainer.toml
 rustainer stack down  -f examples/rustainer.toml
+rustainer stack down  -t 1 -f examples/rustainer.toml   # a shorter grace
+rustainer stack up    --profile debug -f examples/rustainer.toml
 ```
 
 ```toml
@@ -604,15 +621,37 @@ stop a specific way of losing an afternoon:
   surprise you. `ports: - 8080:80` is a sexagesimal number in YAML 1.1,
   `no` is a boolean, and whether two spaces or four are correct depends on
   what the line above did.
-- **An unknown key is an error.** A misspelled key in a Compose file does
-  nothing at all, silently, and the service starts without the setting you
-  thought you gave it. Here, `imgae = "alpine"` is a refusal that names it.
+- **An unknown key is an error.** `imgae = "alpine"` is a refusal that
+  names the key, rather than a service that starts without the setting you
+  thought you gave it. This was written up as a difference from Compose,
+  and measuring it (`scripts/stack-bench.sh`) showed it is not one:
+  `docker compose` v2 refuses an unknown service key too. Parity, and
+  worth stating that way.
 - **`command` is a list, never a string.** Compose accepts both, and the
   string form is split on spaces — so the quotes in
   `sh -c "echo hi; sleep 1"` become part of the arguments and the shell is
   handed `"echo` as its whole script. There is no shell here to re-quote
   it, and inventing a quoting dialect for a config file is worse than
   requiring a list.
+
+**`profiles`, `${VAR}` with `.env`, `build:` and per-service `restart`**
+exist because measuring against Compose made the gap concrete rather
+than theoretical (`research/COMPARISON.md` §7). Three of them differ from
+Compose on purpose:
+
+- **An undefined variable is an error, not an empty string.** Compose
+  substitutes empty and warns, which turns `${PORT}:80` into `:80` and
+  fails somewhere else entirely. `${VAR:-}` asks for empty on purpose.
+- **`.env` is read from beside the stack file**, not the working
+  directory, so `-f ../other/rustainer.toml` means the same thing from
+  anywhere.
+- **Everything that has to be built is built before anything starts.** A
+  stack that starts three services and then fails to build the fourth
+  has left you worse off than one that refused at the start.
+
+A service kept by a profile that depends on one a profile excluded is
+**refused** — starting it anyway would ignore the profile, and leaving it
+out would break the dependant.
 
 **Services find each other through `/etc/hosts`, not DNS.** Every address
 is allocated *before anything starts*, so every container's hosts file can
@@ -621,6 +660,15 @@ test asserts the case a naive implementation misses: the service that
 starts **first** must be able to reach the one that starts **last**. A
 resolver in each namespace would be a second service to run, to supervise
 and to get wrong; this way `cat /etc/hosts` is the whole debugging story.
+
+**`down` stops a dependency level all at once.** Services in one level
+are independent by definition, and nearly all of what `down` costs is the
+grace period — PID 1 in a new PID namespace ignores a SIGTERM it has no
+handler for, so a service that installs none waits the whole thing out.
+Stopping three such services one at a time means waiting three times, and
+measuring against `docker compose down` is how that was found: 3.1s
+against 1.3s, for no reason but queueing. Now 1.0s, and `-t` sets the
+grace.
 
 A stack is **not an orchestrator**. No reconciliation loop, no
 rescheduling, no health-gated rollout. `up` starts what is not running in
