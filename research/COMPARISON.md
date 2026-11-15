@@ -320,12 +320,39 @@ which is the practical result of running the comparison at all:
 - **`restart`** per service, validated at parse time so a typo is caught
   before half the stack is running.
 
+Then three more, on a second pass:
+
+- **Several `-f` files merged in order**, and **`extends`**. One
+  mechanism serves both, because both are "take that table and override
+  parts of it": tables merge key by key, and **a list replaces rather
+  than appends**. Appending looks friendlier and is a trap - an override
+  that sets `command` would append to the base command and run something
+  nobody wrote. `extends` in a circle names the loop.
+- **`healthcheck` and `depends_on = { db = "healthy" }`.** The probe is
+  `exec` in the container, so a healthcheck that passes here passes when
+  a person runs the same command by hand. `up` waits before starting the
+  dependant, and **a service that exits while being waited on fails the
+  `up` immediately** rather than burning through thirty retries. Waiting
+  on a service that has no healthcheck is refused at parse time - in
+  Compose that waits forever.
+
+  It is **not** a probe loop running for the life of the container:
+  nothing here reacts to a container becoming unhealthy later. The half
+  that is implemented is the half `depends_on` needs.
+
+**That work found a real bug, and it was not in the stacks code.**
+Running the probe in-process left `stack up` attached to the probed
+container's namespaces, because `setns` does not move the caller - it
+moves the caller's next *child*. The next service started inside the
+previous one's namespaces and failed with ENOENT for paths that plainly
+existed. The probe is now a child process, which is the same rule the
+API server follows for the same reason.
+
 ### What Compose still has that these stacks do not
 
-`extends` and several `-f` files merged in order; `depends_on` with
-`condition: service_healthy` (there are no healthchecks here);
-`deploy`/replicas; configs and secrets; `watch`/`develop`; and
-`compose run` for a one-off container against the stack.
+`deploy`/replicas; configs and secrets; `watch`/`develop`; `compose run`
+for a one-off container against the stack; and a healthcheck that keeps
+running after startup.
 
 ---
 

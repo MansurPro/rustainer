@@ -309,9 +309,13 @@ enum StackCmd {
 
 #[derive(Args)]
 struct StackArgs {
-    /// The stack file. `rustainer.toml` in the current directory by default.
+    /// The stack file. `rustainer.toml` in the current directory by
+    /// default. Repeatable: later files override earlier ones key by
+    /// key, which is what `-f base.toml -f prod.toml` means everywhere
+    /// else. A list REPLACES rather than appends - appending would make
+    /// an override that sets `command` run something nobody wrote.
     #[arg(short = 'f', long, default_value = "rustainer.toml")]
-    file: PathBuf,
+    file: Vec<PathBuf>,
 
     /// Include the services in this profile. Repeatable.
     ///
@@ -323,9 +327,9 @@ struct StackArgs {
 
 #[derive(Args)]
 struct StackDownArgs {
-    /// The stack file. `rustainer.toml` in the current directory by default.
+    /// The stack file(s). Repeatable, later over earlier, as with `up`.
     #[arg(short = 'f', long, default_value = "rustainer.toml")]
-    file: PathBuf,
+    file: Vec<PathBuf>,
 
     /// Include the services in this profile. Repeatable.
     #[arg(long = "profile")]
@@ -1650,19 +1654,15 @@ pub(crate) fn supervise_restart_check(spec: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_stack(path: &Path, profiles: &[String]) -> Result<stack::Stack> {
-    let text = std::fs::read_to_string(path).with_context(|| {
-        format!(
-            "reading the stack file {}. Write one, or point at it with -f.",
-            path.display()
-        )
-    })?;
-    // `.env` beside the STACK FILE, not beside the working directory:
-    // `-f ../other/rustainer.toml` must mean the same thing from
-    // anywhere, and a stack that picks up a different .env depending on
-    // where you ran it is the bug this ordering avoids.
+fn read_stack(files: &[PathBuf], profiles: &[String]) -> Result<stack::Stack> {
+    let fallback = PathBuf::from("rustainer.toml");
+    let first = files.first().unwrap_or(&fallback);
+    // `.env` beside the FIRST STACK FILE, not beside the working
+    // directory: `-f ../other/rustainer.toml` must mean the same thing
+    // from anywhere, and a stack that picks up a different .env
+    // depending on where you ran it is the bug this ordering avoids.
     let mut vars: std::collections::BTreeMap<String, String> = Default::default();
-    let dotenv = path.parent().unwrap_or(Path::new(".")).join(".env");
+    let dotenv = first.parent().unwrap_or(Path::new(".")).join(".env");
     if let Ok(t) = std::fs::read_to_string(&dotenv) {
         vars =
             stack::Stack::parse_dotenv(&t).with_context(|| format!("in {}", dotenv.display()))?;
@@ -1672,12 +1672,29 @@ fn read_stack(path: &Path, profiles: &[String]) -> Result<stack::Stack> {
     for (k, v) in std::env::vars() {
         vars.insert(k, v);
     }
-    let expanded = stack::Stack::interpolate(&text, &vars)
-        .with_context(|| format!("in {}", path.display()))?;
-    let mut st =
-        stack::Stack::parse(&expanded).with_context(|| format!("in {}", path.display()))?;
+    // Each file is interpolated on its own and the results are merged.
+    // The other order would let a value substituted into one file be
+    // read as TOML structure when another is merged over it.
+    let mut texts: Vec<String> = Vec::with_capacity(files.len());
+    for f in files {
+        let t = std::fs::read_to_string(f).with_context(|| {
+            format!(
+                "reading the stack file {}. Write one, or point at it with -f.",
+                f.display()
+            )
+        })?;
+        texts.push(
+            stack::Stack::interpolate(&t, &vars).with_context(|| format!("in {}", f.display()))?,
+        );
+    }
+    let where_ = files
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let mut st = stack::Stack::parse_many(&texts).with_context(|| format!("in {where_}"))?;
     st.select_profiles(profiles)
-        .with_context(|| format!("in {}", path.display()))?;
+        .with_context(|| format!("in {where_}"))?;
     Ok(st)
 }
 
@@ -1689,7 +1706,7 @@ fn cmd_stack(paths: &Paths, cmd: StackCmd) -> Result<ExitCode> {
     }
 }
 
-fn stack_up(paths: &Paths, st: &stack::Stack, file: &Path) -> Result<ExitCode> {
+fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitCode> {
     let order = st.start_order()?;
 
     // Anything that has to be BUILT is built first, before a single
@@ -1700,7 +1717,10 @@ fn stack_up(paths: &Paths, st: &stack::Stack, file: &Path) -> Result<ExitCode> {
         let svc = &st.services[name];
         let Some(ctx) = &svc.build else { continue };
         // Relative to the stack FILE, not the working directory.
-        let base = file.parent().unwrap_or(Path::new("."));
+        let base = files
+            .first()
+            .and_then(|f| f.parent())
+            .unwrap_or(Path::new("."));
         let context = base.join(ctx);
         let tag = if svc.image.trim().is_empty() {
             format!("{}-{name}:latest", st.name)
@@ -1801,6 +1821,19 @@ fn stack_up(paths: &Paths, st: &stack::Stack, file: &Path) -> Result<ExitCode> {
         // propagated. Discarded explicitly so it is clear that is why.
         let _ = cmd_run(paths, args).with_context(|| format!("starting {id}"))?;
         started += 1;
+
+        // If anything downstream waits for THIS service to be healthy,
+        // the wait happens here, before the next service is started.
+        // Checked against the services that depend on it rather than
+        // against its own healthcheck, so a service that defines one
+        // nobody waits on does not slow the stack down.
+        let waited_on = st
+            .services
+            .iter()
+            .any(|(_, other)| other.depends_on.wants_healthy(name));
+        if waited_on && let Some(h) = &svc.healthcheck {
+            wait_until_healthy(paths, &id, name, h)?;
+        }
     }
     println!(
         "{} service(s) started, {} already running",
@@ -1808,6 +1841,93 @@ fn stack_up(paths: &Paths, st: &stack::Stack, file: &Path) -> Result<ExitCode> {
         order.len() - started
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// One run of a healthcheck command inside the container.
+///
+/// Run as a CHILD PROCESS - `/proc/self/exe exec …` - and not by
+/// calling `exec::exec` here. That is not a style choice. `exec` joins
+/// the container's user and pid namespaces with `setns`, and `setns`
+/// never moves the caller: it moves the caller's next CHILD. So an
+/// in-process probe leaves `stack up` permanently attached to the
+/// namespaces of whichever container it probed, and the next service it
+/// starts is created inside them. The symptom is the next container
+/// failing with ENOENT for paths that plainly exist, long after the
+/// probe that caused it.
+///
+/// This is the same rule the API server follows for the same reason:
+/// the process that supervises must be one that has done nothing to
+/// itself first.
+///
+/// Output goes to /dev/null: a probe runs up to `retries` times and a
+/// chatty one would bury the operator in the same three lines. What it
+/// printed is reachable by running the command itself, which is in the
+/// stack file.
+fn health_probe(paths: &Paths, id: &str, argv: &[String]) -> Result<i32> {
+    let status = std::process::Command::new("/proc/self/exe")
+        .arg("--root")
+        .arg(paths_root(paths))
+        .arg("exec")
+        .arg(id)
+        .args(argv)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("running the healthcheck")?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+/// Run a service's healthcheck until it passes, or give up and say so.
+///
+/// The probe is `exec` in the container, which is the same mechanism a
+/// person would use by hand - so a healthcheck that passes here passes
+/// when they try it, and a failing one can be debugged with the command
+/// in the file and nothing else.
+fn wait_until_healthy(
+    paths: &Paths,
+    id: &str,
+    service: &str,
+    h: &stack::HealthCheck,
+) -> Result<()> {
+    if h.start_period > 0 {
+        std::thread::sleep(Duration::from_secs(h.start_period));
+    }
+    let mut last: Option<String> = None;
+    for attempt in 1..=h.retries {
+        // A container that has died is never going to become healthy,
+        // and waiting out thirty retries to say so wastes the operator's
+        // time at exactly the moment they are watching.
+        if let Ok(state) = State::load(paths, id)
+            && !matches!(state.observed_status(), Status::Running | Status::Created)
+        {
+            bail!(
+                "service {service:?} exited while its healthcheck was being waited on \
+                 (status {}). `rustainer logs {id}` has its output.",
+                state.observed_status()
+            );
+        }
+        match health_probe(paths, id, &h.test) {
+            Ok(0) => {
+                if attempt > 1 {
+                    println!("{id}  healthy after {attempt} attempts");
+                }
+                return Ok(());
+            }
+            Ok(code) => last = Some(format!("exit status {code}")),
+            Err(e) => last = Some(e.to_string()),
+        }
+        std::thread::sleep(Duration::from_secs(h.interval));
+    }
+    bail!(
+        "service {service:?} never became healthy: {} attempts of {:?}, {} every {}s. \
+         Last: {}",
+        h.retries,
+        h.test,
+        "retried",
+        h.interval,
+        last.unwrap_or_else(|| "no attempt ran".into())
+    )
 }
 
 fn stack_down(paths: &Paths, st: &stack::Stack, timeout: u64) -> Result<ExitCode> {

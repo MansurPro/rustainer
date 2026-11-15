@@ -273,5 +273,79 @@ check "and down with the same profile removes everything" \
     "$("$B" ps -a | grep -c featstack- || true)" "0"
 
 echo
+echo "9. Several -f files, extends, and waiting for healthy"
+M="$SCRATCH/merge"
+mkdir -p "$M"
+cat > "$M/base.toml" <<EOF
+name = "mergestack"
+
+[services.common]
+image = "$IMG"
+command = ["/bin/sleep", "300"]
+env = ["FROM_BASE=yes"]
+
+[services.db]
+extends = "common"
+env = ["FROM_BASE=yes", "ROLE=db"]
+
+[services.db.healthcheck]
+test = ["/bin/sh", "-c", "test -f /tmp/ready"]
+interval = 1
+retries = 20
+
+[services.web]
+extends = "common"
+depends_on = { db = "healthy" }
+EOF
+# The override file: later wins, key by key.
+cat > "$M/prod.toml" <<EOF
+[services.web]
+env = ["FROM_BASE=yes", "TIER=prod"]
+EOF
+
+# A healthcheck that cannot pass must fail the up rather than hang.
+cat > "$M/never.toml" <<EOF
+name = "neverstack"
+
+[services.db]
+image = "$IMG"
+command = ["/bin/sleep", "60"]
+
+[services.db.healthcheck]
+test = ["/bin/false"]
+interval = 1
+retries = 2
+
+[services.web]
+image = "$IMG"
+command = ["/bin/sleep", "60"]
+depends_on = { db = "healthy" }
+EOF
+refuses "a healthcheck that never passes fails the up, and says so" "never became healthy" \
+    timeout 300 "$B" stack up -f "$M/never.toml"
+timeout 120 "$B" stack down -t 0 -f "$M/never.toml" >/dev/null 2>&1
+
+# The real one: db becomes healthy only once the file appears, and web
+# must not exist before that.
+( sleep 4; timeout 60 "$B" exec mergestack-db /bin/touch /tmp/ready >/dev/null 2>&1 ) &
+TOUCHER=$!
+timeout 300 "$B" stack up -f "$M/base.toml" -f "$M/prod.toml" > "$SCRATCH/merge.log" 2>&1
+RC=$?
+wait $TOUCHER 2>/dev/null
+[ $RC -eq 0 ] && ok "the merged stack came up" \
+    || { bad "merged up failed"; tail -3 "$SCRATCH/merge.log" | sed 's/^/    /'; }
+
+contains "extends brought the base image down" \
+    "$(timeout 60 "$B" exec mergestack-db /bin/echo ok 2>&1 | tail -1)" "ok"
+contains "and the base env with it" \
+    "$(timeout 60 "$B" exec mergestack-web /bin/sh -c 'echo $FROM_BASE' 2>&1 | tail -1)" "yes"
+contains "the second -f file overrode what it mentioned" \
+    "$(timeout 60 "$B" exec mergestack-web /bin/sh -c 'echo $TIER' 2>&1 | tail -1)" "prod"
+check "the dependant started only after the dependency was healthy" \
+    "$("$B" ps -a | grep -c mergestack-web || true)" "1"
+contains "the wait is reported" "$(cat "$SCRATCH/merge.log")" "healthy after"
+timeout 300 "$B" stack down -t 0 -f "$M/base.toml" -f "$M/prod.toml" >/dev/null 2>&1
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

@@ -598,6 +598,7 @@ rustainer stack ps    -f examples/rustainer.toml
 rustainer stack down  -f examples/rustainer.toml
 rustainer stack down  -t 1 -f examples/rustainer.toml   # a shorter grace
 rustainer stack up    --profile debug -f examples/rustainer.toml
+rustainer stack up    -f base.toml -f prod.toml   # later wins, key by key
 ```
 
 ```toml
@@ -652,6 +653,28 @@ Compose on purpose:
 A service kept by a profile that depends on one a profile excluded is
 **refused** — starting it anyway would ignore the profile, and leaving it
 out would break the dependant.
+
+**`extends`, several `-f` files, and `depends_on = { db = "healthy" }`**
+came next. One merge rule serves the first two, because both are "take
+that table and override parts of it" — and **a list replaces rather than
+appends**, since an override that sets `command` must not append to the
+base command and run something nobody wrote.
+
+A `healthcheck` is a command run with `exec`, so one that passes here
+passes when you run it by hand. `up` waits for it before starting the
+dependant, and a service that *exits* while being waited on fails the
+`up` at once instead of burning thirty retries. Waiting on a service
+with no healthcheck is refused while the file is parsed — in Compose
+that waits forever. It is not a probe loop for the life of the
+container: nothing reacts to a container going unhealthy later.
+
+Finding that out cost a real bug, and not in the stacks code. Running
+the probe in-process left `stack up` attached to the probed container's
+namespaces, because **`setns` does not move the caller — it moves the
+caller's next child**. The service started next was created inside the
+previous one's namespaces and failed with `ENOENT` for paths that
+plainly existed. The probe is a child process now, which is the rule the
+API server already follows for the same reason.
 
 **Services find each other through `/etc/hosts`, not DNS.** Every address
 is allocated *before anything starts*, so every container's hosts file can
