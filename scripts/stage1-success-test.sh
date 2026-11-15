@@ -81,6 +81,19 @@ HOST_HN=$(hostname)
 # container's parent - a supervisor is - so walking children of the CLI
 # would find the supervisor, not init.
 init_pid() { "$B" ps | awk 'NR>1 && $2 == "running" {print $3; exit}'; }
+# Polled, not slept at. A flat `sleep 0.8` is long enough on an idle
+# machine and not on a loaded CI runner, and the failure it produces -
+# "could not find the container's init process" - looks like a real
+# defect in the engine rather than a test that did not wait. Cost one
+# red build to learn.
+wait_for_init() {
+    for _ in $(seq 60); do
+        C=$(init_pid)
+        [ -n "$C" ] && { echo "$C"; return 0; }
+        sleep 0.1
+    done
+    return 1
+}
 
 echo
 echo "1. The container is in namespaces of its own"
@@ -103,7 +116,7 @@ echo
 echo "3. Signal death is reported as signal death, not as an exit code"
 # The signal must come from an ancestor namespace. See test 4 for why.
 "$B" run --rootfs / --network host /bin/sleep 20 >/dev/null 2>&1 & RP=$!
-sleep 0.8; C=$(init_pid)
+C=$(wait_for_init)
 if [ -n "$C" ]; then
     kill -KILL "$C"; wait "$RP"; check "SIGKILL from an ancestor -> 128+9" "$?" "137"
 else
@@ -117,7 +130,7 @@ echo "4. PID 1 semantics - the part that surprises people"
 # namespace. `stop` therefore cannot assume that signalling means leaving,
 # which is why stage 3's grace period is real rather than decorative.
 "$B" run --rootfs / --network host /bin/sleep 20 >/dev/null 2>&1 & RP=$!
-sleep 0.8; C=$(init_pid)
+C=$(wait_for_init)
 if [ -n "$C" ]; then
     kill -TERM "$C"; sleep 0.5
     if kill -0 "$C" 2>/dev/null; then

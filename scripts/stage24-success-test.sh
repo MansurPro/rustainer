@@ -97,6 +97,11 @@ print('' if d is None else d)" "$1"; }
 echo
 echo "1. The page carries the new views, and still loads nothing"
 PAGE=$(curl -fsS "$URL/")
+# The three Docker Desktop has and this did not, found by putting the
+# two Containers screens side by side rather than by guessing.
+for marker in "only-running" "column-picker" "spark"; do
+    contains "the page has $marker" "$PAGE" "$marker"
+done
 for marker in "view-networks" "view-events" "terminal" "palette"; do
     contains "the page has $marker" "$PAGE" "$marker"
 done
@@ -110,8 +115,26 @@ check "still nothing from the network" "$EXTERNAL" "0"
 # `etc/hosts` in the filter, which is every second command a person
 # types into a shell.
 contains "the terminal declares itself a key sink" "$PAGE" "keysink"
+# Docker Desktop reports container memory on a host where nothing asked
+# for a limit; this reported "-", because `memory.current` only exists
+# where the memory controller is enabled and the engine enables no
+# controller it was not asked for. Summed RSS needs neither.
+contains "memory falls back to summed rss" "$PAGE" "memory_rss"
 check "and no shortcut guards on tag names alone" \
     "$(printf '%s' "$PAGE" | grep -c 'tagName !== "INPUT"' || true)" "0"
+
+echo
+echo "1b. A running container reports memory even with no controller"
+# The number is not memory.current and is not claimed to be: it
+# double-counts shared pages and omits page cache. It is a number
+# instead of a dash, which is the part that was missing.
+MSTATS=$(curl -fsS "$URL/api/containers/$ID/stats")
+MRSS=$(echo "$MSTATS" | jget memory_rss)
+case "$MRSS" in
+    ""|0) bad "no memory figure for a running container (got '$MRSS')" ;;
+    *) [ "$MRSS" -gt 0 ] 2>/dev/null && ok "summed rss is reported ($MRSS bytes)" \
+         || bad "memory_rss is not a number: '$MRSS'" ;;
+esac
 
 echo
 echo "2. Networks and events are served"

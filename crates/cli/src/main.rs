@@ -113,6 +113,33 @@ enum Command {
         #[arg(long)]
         to: String,
     },
+
+    /// Internal: keep running a container's healthcheck and record what
+    /// it says.
+    ///
+    /// A process of its own, started detached by `stack up`, and NOT
+    /// part of the supervisor. The supervisor has to be able to call
+    /// `clone3` to restart its container, `clone3` refuses a process
+    /// that has ever had a second thread, and a probe loop inside it
+    /// would be one more reason to be careful forever. This writes a
+    /// `health` file beside the container and exits when the container
+    /// does; nothing depends on it being alive.
+    #[command(hide = true)]
+    HealthWatch {
+        id: String,
+        #[arg(long)]
+        interval: u64,
+        #[arg(long)]
+        retries: u64,
+        /// The probe, after `--`.
+        ///
+        /// Trailing and hyphen-tolerant, because the overwhelmingly
+        /// common healthcheck is `/bin/sh -c '...'` and a repeated
+        /// `--test` option would read that `-c` as one of its own
+        /// flags. Found by running it rather than by reading it.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        test: Vec<String>,
+    },
 }
 
 // `Default` so a stack can build one field by field. clap fills every
@@ -305,13 +332,26 @@ enum StackCmd {
     Down(StackDownArgs),
     /// Show the stack's containers.
     Ps(StackArgs),
+    /// Run a one-off container with a service's settings.
+    ///
+    /// The stack's `compose run`: same image, environment, volumes and
+    /// network as the service, a command of your choosing, in the
+    /// foreground, removed when it exits. It does NOT start the
+    /// service's dependencies - they are either up or they are not, and
+    /// starting half a stack as a side effect of a one-off command is
+    /// how you end up with two copies of a database.
+    Run(StackRunArgs),
 }
 
 #[derive(Args)]
 struct StackArgs {
-    /// The stack file. `rustainer.toml` in the current directory by default.
+    /// The stack file. `rustainer.toml` in the current directory by
+    /// default. Repeatable: later files override earlier ones key by
+    /// key, which is what `-f base.toml -f prod.toml` means everywhere
+    /// else. A list REPLACES rather than appends - appending would make
+    /// an override that sets `command` run something nobody wrote.
     #[arg(short = 'f', long, default_value = "rustainer.toml")]
-    file: PathBuf,
+    file: Vec<PathBuf>,
 
     /// Include the services in this profile. Repeatable.
     ///
@@ -322,10 +362,28 @@ struct StackArgs {
 }
 
 #[derive(Args)]
-struct StackDownArgs {
-    /// The stack file. `rustainer.toml` in the current directory by default.
+struct StackRunArgs {
+    /// The stack file(s). Repeatable, later over earlier.
     #[arg(short = 'f', long, default_value = "rustainer.toml")]
-    file: PathBuf,
+    file: Vec<PathBuf>,
+
+    /// Include the services in this profile. Repeatable.
+    #[arg(long = "profile")]
+    profile: Vec<String>,
+
+    /// The service whose settings to borrow.
+    service: String,
+
+    /// The command to run instead of the service's own. Optional.
+    #[arg(trailing_var_arg = true)]
+    command: Vec<OsString>,
+}
+
+#[derive(Args)]
+struct StackDownArgs {
+    /// The stack file(s). Repeatable, later over earlier, as with `up`.
+    #[arg(short = 'f', long, default_value = "rustainer.toml")]
+    file: Vec<PathBuf>,
 
     /// Include the services in this profile. Repeatable.
     #[arg(long = "profile")]
@@ -519,6 +577,12 @@ fn real_main() -> Result<ExitCode> {
         Command::Stack(a) => cmd_stack(&paths, a),
         Command::Supervise { id } => cmd_supervise(&paths, &id),
         Command::Forward { fd, to } => cmd_forward(fd, &to),
+        Command::HealthWatch {
+            id,
+            interval,
+            retries,
+            test,
+        } => cmd_health_watch(&paths, &id, interval, retries, &test),
     }
 }
 
@@ -1650,19 +1714,15 @@ pub(crate) fn supervise_restart_check(spec: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_stack(path: &Path, profiles: &[String]) -> Result<stack::Stack> {
-    let text = std::fs::read_to_string(path).with_context(|| {
-        format!(
-            "reading the stack file {}. Write one, or point at it with -f.",
-            path.display()
-        )
-    })?;
-    // `.env` beside the STACK FILE, not beside the working directory:
-    // `-f ../other/rustainer.toml` must mean the same thing from
-    // anywhere, and a stack that picks up a different .env depending on
-    // where you ran it is the bug this ordering avoids.
+fn read_stack(files: &[PathBuf], profiles: &[String]) -> Result<stack::Stack> {
+    let fallback = PathBuf::from("rustainer.toml");
+    let first = files.first().unwrap_or(&fallback);
+    // `.env` beside the FIRST STACK FILE, not beside the working
+    // directory: `-f ../other/rustainer.toml` must mean the same thing
+    // from anywhere, and a stack that picks up a different .env
+    // depending on where you ran it is the bug this ordering avoids.
     let mut vars: std::collections::BTreeMap<String, String> = Default::default();
-    let dotenv = path.parent().unwrap_or(Path::new(".")).join(".env");
+    let dotenv = first.parent().unwrap_or(Path::new(".")).join(".env");
     if let Ok(t) = std::fs::read_to_string(&dotenv) {
         vars =
             stack::Stack::parse_dotenv(&t).with_context(|| format!("in {}", dotenv.display()))?;
@@ -1672,12 +1732,29 @@ fn read_stack(path: &Path, profiles: &[String]) -> Result<stack::Stack> {
     for (k, v) in std::env::vars() {
         vars.insert(k, v);
     }
-    let expanded = stack::Stack::interpolate(&text, &vars)
-        .with_context(|| format!("in {}", path.display()))?;
-    let mut st =
-        stack::Stack::parse(&expanded).with_context(|| format!("in {}", path.display()))?;
+    // Each file is interpolated on its own and the results are merged.
+    // The other order would let a value substituted into one file be
+    // read as TOML structure when another is merged over it.
+    let mut texts: Vec<String> = Vec::with_capacity(files.len());
+    for f in files {
+        let t = std::fs::read_to_string(f).with_context(|| {
+            format!(
+                "reading the stack file {}. Write one, or point at it with -f.",
+                f.display()
+            )
+        })?;
+        texts.push(
+            stack::Stack::interpolate(&t, &vars).with_context(|| format!("in {}", f.display()))?,
+        );
+    }
+    let where_ = files
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let mut st = stack::Stack::parse_many(&texts).with_context(|| format!("in {where_}"))?;
     st.select_profiles(profiles)
-        .with_context(|| format!("in {}", path.display()))?;
+        .with_context(|| format!("in {where_}"))?;
     Ok(st)
 }
 
@@ -1686,10 +1763,104 @@ fn cmd_stack(paths: &Paths, cmd: StackCmd) -> Result<ExitCode> {
         StackCmd::Up(a) => stack_up(paths, &read_stack(&a.file, &a.profile)?, &a.file),
         StackCmd::Down(a) => stack_down(paths, &read_stack(&a.file, &a.profile)?, a.timeout),
         StackCmd::Ps(a) => stack_ps(paths, &read_stack(&a.file, &a.profile)?),
+        StackCmd::Run(a) => {
+            let st = read_stack(&a.file, &a.profile)?;
+            stack_run(paths, &st, &a)
+        }
     }
 }
 
-fn stack_up(paths: &Paths, st: &stack::Stack, file: &Path) -> Result<ExitCode> {
+/// `compose run`: a one-off container with a service's settings.
+///
+/// Peers come from the containers that are ALREADY RUNNING, read from
+/// their recorded addresses, rather than from a fresh allocation for
+/// the whole stack. A one-off that invented new addresses for services
+/// that are already up would be unable to reach any of them, which is
+/// the only thing anybody runs one for.
+fn stack_run(paths: &Paths, st: &stack::Stack, args: &StackRunArgs) -> Result<ExitCode> {
+    let Some(svc) = st.services.get(&args.service) else {
+        bail!(
+            "this stack has no service called {:?}. It defines: {}",
+            args.service,
+            st.services.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    };
+    let mut add_host: Vec<String> = Vec::new();
+    for other in st.services.keys() {
+        for (n, id) in st.container_names(other).into_iter().enumerate() {
+            let Ok(cfg) = Config::load(paths, &id) else {
+                continue;
+            };
+            let Some(ip) = cfg.ip.clone() else { continue };
+            if n == 0 {
+                add_host.push(format!("{other}:{ip}"));
+            }
+            add_host.push(format!("{id}:{ip}"));
+        }
+    }
+    // A name of its own, so it cannot collide with the service's own
+    // container and `ps` shows plainly what it is.
+    let id = format!("{}-{}-run-{}", st.name, args.service, new_id()?);
+    let image = if svc.image.trim().is_empty() {
+        format!("{}-{}:latest", st.name, args.service)
+    } else {
+        svc.image.clone()
+    };
+    let mut command: Vec<OsString> = vec![image.into()];
+    if args.command.is_empty() {
+        command.extend(svc.command.iter().map(OsString::from));
+    } else {
+        command.extend(args.command.iter().cloned());
+    }
+    let run = RunArgs {
+        name: Some(id.clone()),
+        detach: false,
+        network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
+        hostname: args.service.clone(),
+        workdir: svc.workdir.clone(),
+        volumes: {
+            // A one-off gets the service's configs and secrets too: the
+            // whole point of it is to be the service, with a different
+            // command.
+            let base_dir = args
+                .file
+                .first()
+                .and_then(|f| f.parent())
+                .unwrap_or(Path::new("."));
+            let mut v = svc.volumes.clone();
+            for (list, store, dest) in [
+                (&svc.configs, &st.configs, ""),
+                (&svc.secrets, &st.secrets, "/run/secrets"),
+            ] {
+                for n in list {
+                    let src = base_dir.join(&store[n].file);
+                    v.push(format!("{}:{dest}/{n}:ro", src.display()));
+                }
+            }
+            v
+        },
+        add_host,
+        stack_name: Some(st.name.clone()),
+        service_name: Some(args.service.clone()),
+        memory: svc.memory.clone(),
+        cpus: svc.cpus,
+        pids_limit: svc.pids_limit,
+        user: svc.user.clone(),
+        env: svc.env.clone(),
+        command,
+        ..Default::default()
+    };
+    let code = cmd_run(paths, run).with_context(|| {
+        // The container is removed below whether or not it ran, so a
+        // failure here does not leave a stopped one-off lying around
+        // with a name nobody will recognise tomorrow.
+        format!("running a one-off {:?}", args.service)
+    });
+    let _ = supervise::remove(paths, &id, true);
+    code
+}
+
+fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitCode> {
     let order = st.start_order()?;
 
     // Anything that has to be BUILT is built first, before a single
@@ -1700,7 +1871,10 @@ fn stack_up(paths: &Paths, st: &stack::Stack, file: &Path) -> Result<ExitCode> {
         let svc = &st.services[name];
         let Some(ctx) = &svc.build else { continue };
         // Relative to the stack FILE, not the working directory.
-        let base = file.parent().unwrap_or(Path::new("."));
+        let base = files
+            .first()
+            .and_then(|f| f.parent())
+            .unwrap_or(Path::new("."));
         let context = base.join(ctx);
         let tag = if svc.image.trim().is_empty() {
             format!("{}-{name}:latest", st.name)
@@ -1735,79 +1909,270 @@ fn stack_up(paths: &Paths, st: &stack::Stack, file: &Path) -> Result<ExitCode> {
         if svc.network.as_deref().unwrap_or("bridge") != "bridge" {
             continue;
         }
-        let lease = rustainer_core::net::allocate(&paths_root(paths))
-            .with_context(|| format!("allocating an address for {name}"))?;
-        let ip = lease.ip.to_string();
-        // Both names resolve: the service's own short name, which is what
-        // a config file inside the container will say, and the container
-        // name, which is what `ps` shows.
-        peers.push((name.clone(), ip.clone()));
-        peers.push((st.container_name(name), ip.clone()));
-        address.insert(name.clone(), ip);
+        for (n, id) in st.container_names(name).into_iter().enumerate() {
+            let lease = rustainer_core::net::allocate(&paths_root(paths))
+                .with_context(|| format!("allocating an address for {id}"))?;
+            let ip = lease.ip.to_string();
+            // Both names resolve: the container name, which is what `ps`
+            // shows, and - for the FIRST replica - the service's own
+            // short name, which is what a config file inside a container
+            // will say.
+            //
+            // Replicas are where /etc/hosts runs out. A name can appear
+            // more than once in that file, but every resolver takes the
+            // first match, so the service name reaches replica 1 and
+            // nothing round-robins. Each replica is reachable by its own
+            // name; load balancing needs a resolver, and there is no
+            // daemon here to be one. Said plainly in the README rather
+            // than left for somebody to discover under load.
+            if n == 0 {
+                peers.push((name.clone(), ip.clone()));
+            }
+            peers.push((id.clone(), ip.clone()));
+            address.insert(id, ip);
+        }
+    }
+
+    // Relative to the stack file, like `build` and `.env`, so the same
+    // file means the same thing from any working directory.
+    let base_dir = files
+        .first()
+        .and_then(|f| f.parent())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    // Checked once, before anything starts. A secret in a file the whole
+    // machine can read is the most common way one leaks, and a tool that
+    // mounts it without comment has helped it happen.
+    for (name, src) in &st.secrets {
+        let path = base_dir.join(&src.file);
+        let md = std::fs::metadata(&path)
+            .with_context(|| format!("secret {name:?}: reading {}", path.display()))?;
+        let mode = std::os::unix::fs::PermissionsExt::mode(&md.permissions());
+        if mode & 0o077 != 0 {
+            bail!(
+                "secret {name:?} is {} with mode {:o}, which lets somebody other than \
+                 its owner read it. `chmod 600 {}` first.",
+                path.display(),
+                mode & 0o7777,
+                path.display()
+            );
+        }
+    }
+    for (name, src) in &st.configs {
+        let path = base_dir.join(&src.file);
+        if !path.exists() {
+            bail!("config {name:?}: {} does not exist", path.display());
+        }
     }
 
     let mut started = 0usize;
+    let mut wanted = 0usize;
     for name in &order {
-        let id = st.container_name(name);
-        if let Ok(state) = State::load(paths, &id)
-            && matches!(state.observed_status(), Status::Running | Status::Created)
-        {
-            println!("{id}  already running");
-            continue;
-        }
-        // A previous run's remains. Removed rather than refused: `up` is
-        // the command people run after `down` failed half way.
-        if paths.dir(&id).exists() {
-            let _ = supervise::remove(paths, &id, true);
-        }
+        for id in st.container_names(name) {
+            wanted += 1;
+            if let Ok(state) = State::load(paths, &id)
+                && matches!(state.observed_status(), Status::Running | Status::Created)
+            {
+                println!("{id}  already running");
+                continue;
+            }
+            // A previous run's remains. Removed rather than refused: `up` is
+            // the command people run after `down` failed half way.
+            if paths.dir(&id).exists() {
+                let _ = supervise::remove(paths, &id, true);
+            }
 
-        let svc = &st.services[name];
-        let image = if svc.image.trim().is_empty() {
-            format!("{}-{name}:latest", st.name)
-        } else {
-            svc.image.clone()
-        };
-        let mut command: Vec<OsString> = vec![image.into()];
-        command.extend(svc.command.iter().map(OsString::from));
-        let args = RunArgs {
-            rootfs: None,
-            pull: false,
-            detach: true,
-            name: Some(id.clone()),
-            network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
-            hostname: name.clone(),
-            workdir: svc.workdir.clone(),
-            volumes: svc.volumes.clone(),
-            add_host: peers
+            let svc = &st.services[name];
+            let image = if svc.image.trim().is_empty() {
+                format!("{}-{name}:latest", st.name)
+            } else {
+                svc.image.clone()
+            };
+            let mut command: Vec<OsString> = vec![image.into()];
+            command.extend(svc.command.iter().map(OsString::from));
+            let args = RunArgs {
+                rootfs: None,
+                pull: false,
+                detach: true,
+                name: Some(id.clone()),
+                network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
+                hostname: name.clone(),
+                workdir: svc.workdir.clone(),
+                volumes: {
+                    // Configs and secrets are read-only binds, which is
+                    // all they are anywhere - Compose mounts them the
+                    // same way outside swarm. What differs is where
+                    // they land and what is checked before they do.
+                    let mut v = svc.volumes.clone();
+                    for (list, store, dest) in [
+                        (&svc.configs, &st.configs, ""),
+                        (&svc.secrets, &st.secrets, "/run/secrets"),
+                    ] {
+                        for n in list {
+                            let src = base_dir.join(&store[n].file);
+                            v.push(format!("{}:{dest}/{n}:ro", src.display()));
+                        }
+                    }
+                    v
+                },
+                add_host: peers
+                    .iter()
+                    .filter(|(n, _)| n != name && *n != id)
+                    .map(|(n, ip)| format!("{n}:{ip}"))
+                    .collect(),
+                ip: address.get(&id).cloned(),
+                stack_name: Some(st.name.clone()),
+                service_name: Some(name.clone()),
+                memory: svc.memory.clone(),
+                cpus: svc.cpus,
+                pids_limit: svc.pids_limit,
+                user: svc.user.clone(),
+                env: svc.env.clone(),
+                publish: svc.ports.clone(),
+                restart: svc.restart.clone().unwrap_or_else(|| "no".into()),
+                command,
+                ..Default::default()
+            };
+            // The exit code is the CLI's, and for a detached run it is always
+            // success - the interesting failure comes back as an Err and is
+            // propagated. Discarded explicitly so it is clear that is why.
+            let _ = cmd_run(paths, args).with_context(|| format!("starting {id}"))?;
+            started += 1;
+
+            // If anything downstream waits for THIS service to be healthy,
+            // the wait happens here, before the next service is started.
+            // Checked against the services that depend on it rather than
+            // against its own healthcheck, so a service that defines one
+            // nobody waits on does not slow the stack down.
+            let waited_on = st
+                .services
                 .iter()
-                .filter(|(n, _)| n != name && *n != id)
-                .map(|(n, ip)| format!("{n}:{ip}"))
-                .collect(),
-            ip: address.get(name).cloned(),
-            stack_name: Some(st.name.clone()),
-            service_name: Some(name.clone()),
-            memory: svc.memory.clone(),
-            cpus: svc.cpus,
-            pids_limit: svc.pids_limit,
-            user: svc.user.clone(),
-            env: svc.env.clone(),
-            publish: svc.ports.clone(),
-            restart: svc.restart.clone().unwrap_or_else(|| "no".into()),
-            command,
-            ..Default::default()
-        };
-        // The exit code is the CLI's, and for a detached run it is always
-        // success - the interesting failure comes back as an Err and is
-        // propagated. Discarded explicitly so it is clear that is why.
-        let _ = cmd_run(paths, args).with_context(|| format!("starting {id}"))?;
-        started += 1;
+                .any(|(_, other)| other.depends_on.wants_healthy(name));
+            if waited_on && let Some(h) = &svc.healthcheck {
+                wait_until_healthy(paths, &id, name, h)?;
+            }
+            // And then a watcher, for every service that defines a
+            // healthcheck rather than only those something waits on.
+            // The wait above answers "may the next service start"; this
+            // answers "is it still well", which is the question an
+            // operator asks of a page at three in the morning.
+            if let Some(h) = &svc.healthcheck {
+                let mut w = std::process::Command::new("/proc/self/exe");
+                w.arg("--root")
+                    .arg(paths_root(paths))
+                    .arg("health-watch")
+                    .arg(&id)
+                    .arg("--interval")
+                    .arg(h.interval.to_string())
+                    .arg("--retries")
+                    .arg(h.retries.to_string());
+                w.arg("--");
+                for t in &h.test {
+                    w.arg(t);
+                }
+                // Detached on purpose: it outlives `stack up`, and it
+                // exits by itself once the container is gone.
+                let _ = w
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+        }
     }
     println!(
-        "{} service(s) started, {} already running",
+        "{} container(s) started, {} already running",
         started,
-        order.len() - started
+        wanted - started
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// One run of a healthcheck command inside the container.
+///
+/// Run as a CHILD PROCESS - `/proc/self/exe exec …` - and not by
+/// calling `exec::exec` here. That is not a style choice. `exec` joins
+/// the container's user and pid namespaces with `setns`, and `setns`
+/// never moves the caller: it moves the caller's next CHILD. So an
+/// in-process probe leaves `stack up` permanently attached to the
+/// namespaces of whichever container it probed, and the next service it
+/// starts is created inside them. The symptom is the next container
+/// failing with ENOENT for paths that plainly exist, long after the
+/// probe that caused it.
+///
+/// This is the same rule the API server follows for the same reason:
+/// the process that supervises must be one that has done nothing to
+/// itself first.
+///
+/// Output goes to /dev/null: a probe runs up to `retries` times and a
+/// chatty one would bury the operator in the same three lines. What it
+/// printed is reachable by running the command itself, which is in the
+/// stack file.
+fn health_probe(paths: &Paths, id: &str, argv: &[String]) -> Result<i32> {
+    let status = std::process::Command::new("/proc/self/exe")
+        .arg("--root")
+        .arg(paths_root(paths))
+        .arg("exec")
+        .arg(id)
+        .args(argv)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("running the healthcheck")?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+/// Run a service's healthcheck until it passes, or give up and say so.
+///
+/// The probe is `exec` in the container, which is the same mechanism a
+/// person would use by hand - so a healthcheck that passes here passes
+/// when they try it, and a failing one can be debugged with the command
+/// in the file and nothing else.
+fn wait_until_healthy(
+    paths: &Paths,
+    id: &str,
+    service: &str,
+    h: &stack::HealthCheck,
+) -> Result<()> {
+    if h.start_period > 0 {
+        std::thread::sleep(Duration::from_secs(h.start_period));
+    }
+    let mut last: Option<String> = None;
+    for attempt in 1..=h.retries {
+        // A container that has died is never going to become healthy,
+        // and waiting out thirty retries to say so wastes the operator's
+        // time at exactly the moment they are watching.
+        if let Ok(state) = State::load(paths, id)
+            && !matches!(state.observed_status(), Status::Running | Status::Created)
+        {
+            bail!(
+                "service {service:?} exited while its healthcheck was being waited on \
+                 (status {}). `rustainer logs {id}` has its output.",
+                state.observed_status()
+            );
+        }
+        match health_probe(paths, id, &h.test) {
+            Ok(0) => {
+                if attempt > 1 {
+                    println!("{id}  healthy after {attempt} attempts");
+                }
+                return Ok(());
+            }
+            Ok(code) => last = Some(format!("exit status {code}")),
+            Err(e) => last = Some(e.to_string()),
+        }
+        std::thread::sleep(Duration::from_secs(h.interval));
+    }
+    bail!(
+        "service {service:?} never became healthy: {} attempts of {:?}, {} every {}s. \
+         Last: {}",
+        h.retries,
+        h.test,
+        "retried",
+        h.interval,
+        last.unwrap_or_else(|| "no attempt ran".into())
+    )
 }
 
 fn stack_down(paths: &Paths, st: &stack::Stack, timeout: u64) -> Result<ExitCode> {
@@ -1828,7 +2193,7 @@ fn stack_down(paths: &Paths, st: &stack::Stack, timeout: u64) -> Result<ExitCode
     for level in levels {
         let ids: Vec<String> = level
             .iter()
-            .map(|n| st.container_name(n))
+            .flat_map(|n| st.container_names(n))
             .filter(|id| paths.dir(id).exists())
             .collect();
         // Results are collected and printed after the level finishes:
@@ -1863,36 +2228,110 @@ fn stack_down(paths: &Paths, st: &stack::Stack, timeout: u64) -> Result<ExitCode
 fn stack_ps(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
     println!(
         "{:<24} {:<9} {:<8} {:<15} COMMAND",
-        "SERVICE", "STATUS", "PID", "ADDRESS"
+        "CONTAINER", "STATUS", "PID", "ADDRESS"
     );
     for name in st.start_order()? {
-        let id = st.container_name(&name);
-        let (status, pid, addr, cmd) = match State::load(paths, &id) {
-            Err(_) => (
-                "-".to_owned(),
-                "-".to_owned(),
-                "-".to_owned(),
-                String::new(),
-            ),
-            Ok(state) => {
-                let observed = state.observed_status();
-                let cfg = Config::load(paths, &id).ok();
-                (
-                    observed.to_string(),
-                    match (observed, state.init_pid) {
-                        (Status::Running | Status::Created, Some(p)) => p.to_string(),
-                        _ => "-".into(),
-                    },
-                    cfg.as_ref()
-                        .and_then(|c| c.ip.clone())
-                        .unwrap_or_else(|| "-".into()),
-                    state.command.join(" "),
-                )
-            }
-        };
-        println!("{name:<24} {status:<9} {pid:<8} {addr:<15} {cmd}");
+        for id in st.container_names(&name) {
+            // The row is named after the CONTAINER, not the service, because
+            // with replicas a service is several of them and a table that
+            // prints the same name three times is not a table.
+            let name = &id;
+            let (status, pid, addr, cmd) = match State::load(paths, &id) {
+                Err(_) => (
+                    "-".to_owned(),
+                    "-".to_owned(),
+                    "-".to_owned(),
+                    String::new(),
+                ),
+                Ok(state) => {
+                    let observed = state.observed_status();
+                    let cfg = Config::load(paths, &id).ok();
+                    (
+                        observed.to_string(),
+                        match (observed, state.init_pid) {
+                            (Status::Running | Status::Created, Some(p)) => p.to_string(),
+                            _ => "-".into(),
+                        },
+                        cfg.as_ref()
+                            .and_then(|c| c.ip.clone())
+                            .unwrap_or_else(|| "-".into()),
+                        state.command.join(" "),
+                    )
+                }
+            };
+            println!("{name:<24} {status:<9} {pid:<8} {addr:<15} {cmd}");
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Where a container's current health is written.
+///
+/// A file beside the container, like the stop sentinel, and for the
+/// same reason: two processes write the container's state and the
+/// supervisor rewrites `state.json` wholesale from its own copy, so a
+/// field there would be erased within milliseconds.
+pub(crate) fn health_file(paths: &Paths, id: &str) -> PathBuf {
+    paths.dir(id).join("health")
+}
+
+/// Run a container's healthcheck until the container goes away.
+///
+/// `starting` until the first pass, then `healthy` or `unhealthy`,
+/// which is the same vocabulary Docker uses and means the same thing:
+/// `starting` is "has not passed yet and has not run out of attempts",
+/// not "unknown".
+fn cmd_health_watch(
+    paths: &Paths,
+    id: &str,
+    interval: u64,
+    retries: u64,
+    test: &[String],
+) -> Result<ExitCode> {
+    let _ = sys::set_process_name("rustainer-hc");
+    let file = health_file(paths, id);
+    let mut failures = 0u64;
+    let mut state = "starting";
+    let _ = std::fs::write(&file, "starting");
+    loop {
+        // The container's directory going away is the signal to stop.
+        // Nothing has to tell this process anything: `rm` deletes the
+        // directory, and a watcher writing into a directory that no
+        // longer exists would recreate it.
+        if !paths.dir(id).exists() {
+            return Ok(ExitCode::SUCCESS);
+        }
+        match State::load(paths, id) {
+            Ok(st) if matches!(st.observed_status(), Status::Running | Status::Created) => {}
+            _ => {
+                let _ = std::fs::remove_file(&file);
+                return Ok(ExitCode::SUCCESS);
+            }
+        }
+        let next = match health_probe(paths, id, test) {
+            Ok(0) => {
+                failures = 0;
+                "healthy"
+            }
+            _ => {
+                failures += 1;
+                // `starting` only until the attempts run out: a probe
+                // that has never passed is not the same as one that has
+                // started failing, and reporting a container unhealthy
+                // in its first second is how healthchecks get ignored.
+                if state == "starting" && failures < retries {
+                    "starting"
+                } else {
+                    "unhealthy"
+                }
+            }
+        };
+        if next != state {
+            state = next;
+            let _ = std::fs::write(&file, state);
+        }
+        std::thread::sleep(Duration::from_secs(interval.max(1)));
+    }
 }
 
 fn cmd_forward(fd: i32, to: &str) -> Result<ExitCode> {

@@ -598,6 +598,8 @@ rustainer stack ps    -f examples/rustainer.toml
 rustainer stack down  -f examples/rustainer.toml
 rustainer stack down  -t 1 -f examples/rustainer.toml   # a shorter grace
 rustainer stack up    --profile debug -f examples/rustainer.toml
+rustainer stack up    -f base.toml -f prod.toml   # later wins, key by key
+rustainer stack run   -f examples/rustainer.toml db /bin/sh   # one-off
 ```
 
 ```toml
@@ -653,6 +655,28 @@ A service kept by a profile that depends on one a profile excluded is
 **refused** — starting it anyway would ignore the profile, and leaving it
 out would break the dependant.
 
+**`extends`, several `-f` files, and `depends_on = { db = "healthy" }`**
+came next. One merge rule serves the first two, because both are "take
+that table and override parts of it" — and **a list replaces rather than
+appends**, since an override that sets `command` must not append to the
+base command and run something nobody wrote.
+
+A `healthcheck` is a command run with `exec`, so one that passes here
+passes when you run it by hand. `up` waits for it before starting the
+dependant, and a service that *exits* while being waited on fails the
+`up` at once instead of burning thirty retries. Waiting on a service
+with no healthcheck is refused while the file is parsed — in Compose
+that waits forever. It is not a probe loop for the life of the
+container: nothing reacts to a container going unhealthy later.
+
+Finding that out cost a real bug, and not in the stacks code. Running
+the probe in-process left `stack up` attached to the probed container's
+namespaces, because **`setns` does not move the caller — it moves the
+caller's next child**. The service started next was created inside the
+previous one's namespaces and failed with `ENOENT` for paths that
+plainly existed. The probe is a child process now, which is the rule the
+API server already follows for the same reason.
+
 **Services find each other through `/etc/hosts`, not DNS.** Every address
 is allocated *before anything starts*, so every container's hosts file can
 name every other one — including the services that do not exist yet. The
@@ -669,6 +693,40 @@ Stopping three such services one at a time means waiting three times, and
 measuring against `docker compose down` is how that was found: 3.1s
 against 1.3s, for no reason but queueing. Now 1.0s, and `-t` sets the
 grace.
+
+**`replicas` runs a service as N containers**, `<stack>-<service>-1` and
+so on; a service with one replica keeps its unsuffixed name, because
+renaming every existing stack's containers for a feature they do not use
+is not a trade worth making. Replicas are where `/etc/hosts` runs out,
+and the limit is stated rather than left to be discovered under load: a
+name can appear more than once in that file, but **every resolver takes
+the first match**, so the service name reaches replica 1 and nothing
+round-robins. Each replica answers to its own name. Load balancing needs
+a resolver, and there is no daemon here to be one.
+
+**`stack run`** is `compose run`: a one-off container with the service's
+image, environment, volumes and network, a command of your choosing, and
+nothing left behind. It does *not* start the service's dependencies —
+starting half a stack as a side effect of a one-off command is how you
+end up with two copies of a database.
+
+**`configs` and `secrets`** are read-only bind mounts — which is what
+they are in Compose outside swarm as well. A config lands at `/<name>`,
+a secret at `/run/secrets/<name>`. The whole difference between the two
+keywords here is one check, and it is the one worth having: **a secret
+whose file anyone but its owner can read is refused**, before anything
+starts, with the `chmod` to run. A secret in a world-readable file in a
+repository is the most common way one leaks.
+
+**A healthcheck keeps running after `up`.** A watcher process beside
+each container — not inside the supervisor, which must stay able to call
+`clone3` — writes `starting`, `healthy` or `unhealthy` where `ps`, the
+API and the page can read it, and exits when its container does.
+`starting` means "has not passed yet and has not run out of attempts",
+not "unknown": reporting a container unhealthy in its first second is
+how healthchecks come to be ignored. The page shows it as a second pill
+beside the status, because a container that is running *and* unhealthy
+is both of those things.
 
 A stack is **not an orchestrator**. No reconciliation loop, no
 rescheduling, no health-gated rollout. `up` starts what is not running in

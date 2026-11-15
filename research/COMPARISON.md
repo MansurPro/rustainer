@@ -277,8 +277,20 @@ exist and cannot find each other is not up.
 
 | | docker compose | rustainer | |
 |---|---|---|---|
-| `up`, to mutually reachable by name | 209-361ms | 35-39ms | **6.0-9.3x** |
-| `down -t 1` | 1293ms | 1048ms | 1.2x |
+| `up`, to mutually reachable by name | 209-361ms | 34-39ms | **6.0-9.3x** |
+| `down -t 1` | 1282-1293ms | 1048-1060ms | 1.2x |
+| **`up` with 3 replicas** | 243ms | **25ms** | **9.7x** |
+| **health-gated `up`** | 4214ms | **3047ms** | see below |
+
+The health-gated row is the one worth reading carefully, and it is the
+only measurement here of the features this comparison itself caused.
+Both files say the same thing: `db` is ready when `/tmp/ready` exists,
+it writes that file three seconds in, and `web` must not start before
+then. **Both engines pay the same three seconds**, so subtract them and
+what is left is the machinery around the wait: **47ms here against
+1214ms**. `docker compose up --wait` and `depends_on: condition:
+service_healthy` do a great deal more than poll a command - and for the
+question `depends_on` actually asks, that is the price of it.
 
 **Two things this measurement changed rather than confirmed**, which is
 the only reason it was worth running:
@@ -320,12 +332,83 @@ which is the practical result of running the comparison at all:
 - **`restart`** per service, validated at parse time so a typo is caught
   before half the stack is running.
 
+Then three more, on a second pass:
+
+- **Several `-f` files merged in order**, and **`extends`**. One
+  mechanism serves both, because both are "take that table and override
+  parts of it": tables merge key by key, and **a list replaces rather
+  than appends**. Appending looks friendlier and is a trap - an override
+  that sets `command` would append to the base command and run something
+  nobody wrote. `extends` in a circle names the loop.
+- **`healthcheck` and `depends_on = { db = "healthy" }`.** The probe is
+  `exec` in the container, so a healthcheck that passes here passes when
+  a person runs the same command by hand. `up` waits before starting the
+  dependant, and **a service that exits while being waited on fails the
+  `up` immediately** rather than burning through thirty retries. Waiting
+  on a service that has no healthcheck is refused at parse time - in
+  Compose that waits forever.
+
+  It is **not** a probe loop running for the life of the container:
+  nothing here reacts to a container becoming unhealthy later. The half
+  that is implemented is the half `depends_on` needs.
+
+**That work found a real bug, and it was not in the stacks code.**
+Running the probe in-process left `stack up` attached to the probed
+container's namespaces, because `setns` does not move the caller - it
+moves the caller's next *child*. The next service started inside the
+previous one's namespaces and failed with ENOENT for paths that plainly
+existed. The probe is now a child process, which is the same rule the
+API server follows for the same reason.
+
+And a third pass closed two more:
+
+- **`replicas`** - a service becomes N containers, `<stack>-<service>-1`
+  and so on, while a service with one replica keeps its unsuffixed name
+  so no existing stack's containers get renamed for a feature it is not
+  using. `0` is refused rather than quietly running nothing.
+
+  Replicas are where `/etc/hosts` runs out, and the limit is stated
+  rather than discovered under load: a name may appear more than once in
+  that file but every resolver takes the first match, so the *service*
+  name reaches replica 1 and **nothing round-robins**. Each replica is
+  reachable by its own name. Load balancing needs a resolver, and there
+  is no daemon here to be one.
+- **`stack run`** - `compose run`: a one-off with the service's image,
+  environment, volumes and network, a command of your choosing, removed
+  when it exits. It does **not** start the service's dependencies:
+  starting half a stack as a side effect of a one-off command is how you
+  end up with two copies of a database.
+
+A fourth pass closed the last two that were worth closing:
+
+- **`configs` and `secrets`.** Both are read-only bind mounts, which is
+  what they are in Compose outside swarm too; a config lands at
+  `/<name>` and a secret at `/run/secrets/<name>`. The difference
+  between the two keywords here is a check, and it is the one worth
+  having: **a secret whose file is readable by anyone but its owner is
+  refused**, before anything starts, with the `chmod` to run. A secret
+  in a world-readable file in a repository is the most common way one
+  leaks, and a tool that mounts it without comment has helped.
+- **A healthcheck that keeps running.** A watcher process beside each
+  container with a healthcheck - not inside the supervisor, which has
+  to stay able to call `clone3` - writes `starting`, `healthy` or
+  `unhealthy` to a file that `ps`, the API and the page read. It exits
+  when its container does; it is not a daemon and the test asserts that.
+  `starting` means "has not passed yet and has not run out of
+  attempts", not "unknown", because reporting a container unhealthy in
+  its first second is how healthchecks come to be ignored.
+
+  The page shows health as a **second pill** beside the status, not as a
+  different colour on the first: a container that is running and
+  unhealthy is both of those things, and collapsing them loses the half
+  the operator needs.
+
 ### What Compose still has that these stacks do not
 
-`extends` and several `-f` files merged in order; `depends_on` with
-`condition: service_healthy` (there are no healthchecks here);
-`deploy`/replicas; configs and secrets; `watch`/`develop`; and
-`compose run` for a one-off container against the stack.
+`watch`/`develop` - file-watching rebuilds - and the rest of `deploy`
+beyond replicas: placement constraints, resource reservations and
+rollback policy, which are orchestrator concepts this deliberately is
+not. That is the list, and it is now short enough to read.
 
 ---
 
@@ -358,41 +441,87 @@ Windows story**. On Linux, Docker needs no VM and the gap is the daemon
 alone. The honest claim is about the UI process and the engine, not
 about replacing the product.
 
-### What each one puts in front of you
+### Side by side, both Containers screens
 
-Docker Desktop's navigation, as observed: Gordon, Containers, Images,
-Volumes, Kubernetes, Builds, Models, MCP Toolkit, Docker Hub, Logs,
-Settings, Extensions. A status bar carries engine state, RAM, CPU and
-disk; container CPU is shown against the machine's total (`1.61% / 800%`
-on 8 CPUs).
+Docker Desktop's Containers view, read off the running application:
 
-rustainer's: Containers, Stacks, Networks, Events, Images, Volumes.
+- **Header**: Search (⌘K), help, notifications, learning, settings, a
+  grid of apps, **Sign in**.
+- **Navigation**: Gordon, Containers, Images, Volumes, Kubernetes,
+  Builds, Models, MCP Toolkit (BETA), Docker Hub, Logs, Settings,
+  Extensions.
+- **Above the table**: `Container CPU usage 1.55% / 800% (8 CPUs
+  available)`, `Container memory usage 350.91MB / 3.73GB`, *Show
+  charts*; a search box, a column chooser, and an *Only show running
+  containers* toggle.
+- **Columns**: select, expand, status, Name, Container ID, Image,
+  Port(s), CPU (%), Last started, Actions (stop / menu / delete).
+- **Status bar**: Engine running, RAM 1.82 GB, CPU 1.87%, Disk 60.97 GB
+  used (limit 86.31 GB), a terminal button, *Update available*.
+
+rustainer's: RUNNING / TOTAL / CPU / MEMORY tiles, a filter, *Run a
+container*, and columns ID, STACK, STATUS, COMMAND, ADDRESS, CPU,
+MEMORY, AGE with details / stop / remove.
 
 | | Docker Desktop | rustainer |
 |---|---|---|
 | Containers, Images, Volumes | yes | yes |
-| Builds | a view of its own | a build dialog |
-| **Networks** | **not in the navigation** - the CLI | **a view**, with subnet, bridge and member count |
-| **Events** | **not in the navigation** | **a view**, colour-coded by kind |
-| **Stacks** | Compose projects group inside Containers | **a view of its own** |
-| Kubernetes, Models, MCP Toolkit, Docker Hub, Extensions, Gordon | yes | no, and not planned |
+| per-container CPU and memory | yes | yes |
+| **container address in the list** | no - Ports only | **yes**, ADDRESS column |
+| **which stack a container belongs to** | expandable grouping | **a column, and a Stacks view** |
+| **Networks** | **not in the navigation** - CLI only | **a view**: subnet, bridge, members |
+| **Events** | **not in the navigation** | **a view**, colour-coded |
+| only-show-running toggle | yes | **yes** — added because of this comparison |
+| column chooser | yes | **yes** — added because of this comparison |
+| per-container CPU history | full charts | a sparkline in the row |
+| Image and Port(s) columns | yes | ports fold into ADDRESS |
+| Kubernetes, Models, MCP Toolkit, Hub, Extensions, Gordon, Sign in | yes | no, and not planned |
 | Settings for CPU/memory/disk | yes - it owns a VM | nothing to allocate |
 
-**What was not compared**: Docker Desktop's per-container detail pages.
-Recent versions have an exec terminal, a file browser and per-container
-stats there, and this comparison never opened them, so it says nothing
-about them. Only the top-level navigation above was observed.
+**Where Docker Desktop was better, and what was done about it.** Three
+things, all found by looking at the two screens rather than by
+reasoning about them: an only-show-running toggle, a column chooser,
+and per-container CPU history. All three now exist here - the history
+as a sparkline in the row rather than a chart panel, because the page
+already keeps the samples it needs and a 46-pixel SVG costs nothing.
+
+The fourth was the one that mattered. Its Containers screen reports `Container memory usage 350.91MB / 3.73GB` on
+a host where nothing asked for a memory limit. Ours printed `-` for
+every container, because `memory.current` exists only where the memory
+controller is enabled in the parent's `subtree_control`, and this engine
+enables no controller it was not asked for. Looking at the two screens
+next to each other is what turned that from a defensible design note
+into a missing number.
+
+It now sums the RSS of the processes in the container's cgroup, which
+needs no controller and adds no accounting overhead - `cgroup.procs` is
+always present and `/proc/<pid>/status` always has `VmRSS`. **It is not
+the same number**: it double-counts pages two processes share and omits
+page cache the cgroup is charged for. So the cell is labelled `rss`, and
+hovering says exactly that. A number with its limits stated beats a dash.
+
+**The limits of this comparison, stated rather than implied.** Docker
+Desktop's window can be captured; its Electron UI cannot be driven from
+a script with the tools here - clicking its navigation by accessibility
+element and by screen coordinate both failed to change screens. So what
+is compared above is the Containers screen and the navigation, both read
+off the running application, and **nothing else**: not Images, not
+Volumes, and not the per-container detail pages, which in recent
+versions carry an exec terminal and a file browser. Those may well be
+better than anything here. This document does not say otherwise, because
+it did not look.
 
 ### What the page does that is worth something
 
 - **A real terminal into a container**, over a pty, from the browser.
 - **The commands it ran**, shown as CLI you could have typed. It teaches
   its own command line instead of hiding it.
-- **It says what it does not know.** A container's memory reads `-`, not
-  `0B`, when the memory controller is not enabled in that subtree, and
-  hovering says why. The summary tile sums only containers whose usage
-  is actually known - it printed `0B` until this was looked at, which
-  reads as "using nothing".
+- **It says what it does not know, and what kind of number it is
+  showing.** Memory is `memory.current` where the controller is enabled
+  and summed RSS where it is not, labelled `rss` either way so the two
+  are never passed off as interchangeable. The summary tile sums only
+  containers whose usage is known - it printed `0B` until this was
+  looked at, which reads as "using nothing".
 
 ## 9. Reproducing this
 

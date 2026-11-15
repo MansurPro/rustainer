@@ -139,12 +139,17 @@ echo
 echo "2. Up starts everything, in dependency order"
 UP=$(timeout 300 "$B" stack up -f "$F" 2>&1)
 echo "$UP" | tail -1
-check "it reports three services started" \
-    "$(echo "$UP" | grep -c 'service(s) started')" "1"
+# "container(s)", not "service(s)": a service with `replicas` is several
+# containers, and a count that says "3 services" while starting seven of
+# them is the kind of number people stop reading.
+check "it reports three containers started" \
+    "$(echo "$UP" | grep -c 'container(s) started')" "1"
 # The order is the contract: `ps` prints it, and it must put a service
-# after everything it depends on.
+# after everything it depends on. Printed by CONTAINER name for the same
+# reason - a table that prints one service's name three times is not a
+# table.
 ORDER=$("$B" stack ps -f "$F" | tail -n +2 | awk '{print $1}' | tr '\n' ' ')
-check "the order is dependencies first" "$ORDER" "db api web "
+check "the order is dependencies first" "$ORDER" "stagetest-db stagetest-api stagetest-web "
 sleep 1.5
 check "all three are running" \
     "$("$B" stack ps -f "$F" | tail -n +2 | awk '$2 == "running"' | grep -c .)" "3"
@@ -271,6 +276,207 @@ check "asking for the profile starts it" \
 timeout 300 "$B" stack down -t 0 --profile debug -f "$D/rustainer.toml" >/dev/null 2>&1
 check "and down with the same profile removes everything" \
     "$("$B" ps -a | grep -c featstack- || true)" "0"
+
+echo
+echo "9. Several -f files, extends, and waiting for healthy"
+M="$SCRATCH/merge"
+mkdir -p "$M"
+cat > "$M/base.toml" <<EOF
+name = "mergestack"
+
+[services.common]
+image = "$IMG"
+command = ["/bin/sleep", "300"]
+env = ["FROM_BASE=yes"]
+
+[services.db]
+extends = "common"
+env = ["FROM_BASE=yes", "ROLE=db"]
+
+[services.db.healthcheck]
+test = ["/bin/sh", "-c", "test -f /tmp/ready"]
+interval = 1
+retries = 20
+
+[services.web]
+extends = "common"
+depends_on = { db = "healthy" }
+EOF
+# The override file: later wins, key by key.
+cat > "$M/prod.toml" <<EOF
+[services.web]
+env = ["FROM_BASE=yes", "TIER=prod"]
+EOF
+
+# A healthcheck that cannot pass must fail the up rather than hang.
+cat > "$M/never.toml" <<EOF
+name = "neverstack"
+
+[services.db]
+image = "$IMG"
+command = ["/bin/sleep", "60"]
+
+[services.db.healthcheck]
+test = ["/bin/false"]
+interval = 1
+retries = 2
+
+[services.web]
+image = "$IMG"
+command = ["/bin/sleep", "60"]
+depends_on = { db = "healthy" }
+EOF
+refuses "a healthcheck that never passes fails the up, and says so" "never became healthy" \
+    timeout 300 "$B" stack up -f "$M/never.toml"
+timeout 120 "$B" stack down -t 0 -f "$M/never.toml" >/dev/null 2>&1
+
+# The real one: db becomes healthy only once the file appears, and web
+# must not exist before that.
+( sleep 4; timeout 60 "$B" exec mergestack-db /bin/touch /tmp/ready >/dev/null 2>&1 ) &
+TOUCHER=$!
+timeout 300 "$B" stack up -f "$M/base.toml" -f "$M/prod.toml" > "$SCRATCH/merge.log" 2>&1
+RC=$?
+wait $TOUCHER 2>/dev/null
+[ $RC -eq 0 ] && ok "the merged stack came up" \
+    || { bad "merged up failed"; tail -3 "$SCRATCH/merge.log" | sed 's/^/    /'; }
+
+contains "extends brought the base image down" \
+    "$(timeout 60 "$B" exec mergestack-db /bin/echo ok 2>&1 | tail -1)" "ok"
+contains "and the base env with it" \
+    "$(timeout 60 "$B" exec mergestack-web /bin/sh -c 'echo $FROM_BASE' 2>&1 | tail -1)" "yes"
+contains "the second -f file overrode what it mentioned" \
+    "$(timeout 60 "$B" exec mergestack-web /bin/sh -c 'echo $TIER' 2>&1 | tail -1)" "prod"
+check "the dependant started only after the dependency was healthy" \
+    "$("$B" ps -a | grep -c mergestack-web || true)" "1"
+contains "the wait is reported" "$(cat "$SCRATCH/merge.log")" "healthy after"
+timeout 300 "$B" stack down -t 0 -f "$M/base.toml" -f "$M/prod.toml" >/dev/null 2>&1
+
+echo
+echo "10. Replicas, and a one-off against the stack"
+R="$SCRATCH/rep"
+mkdir -p "$R"
+cat > "$R/rustainer.toml" <<EOF
+name = "repstack"
+
+[services.worker]
+image = "$IMG"
+command = ["/bin/sleep", "300"]
+replicas = 3
+env = ["ROLE=worker"]
+
+[services.solo]
+image = "$IMG"
+command = ["/bin/sleep", "300"]
+EOF
+timeout 300 "$B" stack up -f "$R/rustainer.toml" >/dev/null 2>&1
+check "three replicas got three containers" \
+    "$("$B" ps -a | grep -cE 'repstack-worker-[123]' || true)" "3"
+check "and the single service kept its unsuffixed name" \
+    "$("$B" ps -a | grep -c 'repstack-solo' || true)" "1"
+check "stack ps lists every replica by container name" \
+    "$(timeout 60 "$B" stack ps -f "$R/rustainer.toml" | grep -cE 'repstack-worker-[123]' || true)" "3"
+# Each replica is reachable by its own name; the service name reaches
+# the first, because /etc/hosts has no round robin and we do not pretend.
+contains "a replica is in its peers' hosts file" \
+    "$(timeout 60 "$B" exec repstack-solo /bin/cat /etc/hosts 2>&1 | tr '\n' ' ')" "repstack-worker-2"
+check "and is reachable by that name" \
+    "$(timeout 60 "$B" exec repstack-solo /bin/sh -c 'ping -c1 -W2 repstack-worker-2 >/dev/null 2>&1 && echo ok || echo failed' 2>&1 | tail -1)" \
+    "ok"
+
+# A one-off borrows the service's settings and leaves nothing behind.
+OUT=$(timeout 300 "$B" stack run -f "$R/rustainer.toml" solo /bin/sh -c 'echo $ROLE; echo one-off-ran' 2>&1)
+contains "the one-off ran our command" "$OUT" "one-off-ran"
+OUT2=$(timeout 300 "$B" stack run -f "$R/rustainer.toml" worker /bin/sh -c 'echo $ROLE' 2>&1)
+contains "and borrowed the service's environment" "$OUT2" "worker"
+check "it left no container behind" \
+    "$("$B" ps -a | grep -c -- '-run-' || true)" "0"
+refuses "a service that is not in the stack is named, not guessed at" "no service called" \
+    "$B" stack run -f "$R/rustainer.toml" nosuch /bin/true
+timeout 300 "$B" stack down -t 0 -f "$R/rustainer.toml" >/dev/null 2>&1
+check "down removed every replica" \
+    "$("$B" ps -a | grep -c repstack- || true)" "0"
+
+echo
+echo "11. Configs and secrets"
+C="$SCRATCH/cfg"
+mkdir -p "$C"
+echo "server { listen 80; }" > "$C/site.conf"
+echo "hunter2" > "$C/db.pass"
+chmod 600 "$C/db.pass"
+cat > "$C/rustainer.toml" <<EOF
+name = "cfgstack"
+
+[configs.site]
+file = "site.conf"
+
+[secrets.dbpass]
+file = "db.pass"
+
+[services.app]
+image = "$IMG"
+command = ["/bin/sleep", "300"]
+configs = ["site"]
+secrets = ["dbpass"]
+EOF
+timeout 300 "$B" stack up -f "$C/rustainer.toml" >/dev/null 2>&1
+check "a config arrives at /<name>" \
+    "$(timeout 60 "$B" exec cfgstack-app /bin/cat /site 2>&1 | tail -1)" "server { listen 80; }"
+check "a secret arrives under /run/secrets" \
+    "$(timeout 60 "$B" exec cfgstack-app /bin/cat /run/secrets/dbpass 2>&1 | tail -1)" "hunter2"
+check "and both are read-only inside" \
+    "$(timeout 60 "$B" exec cfgstack-app /bin/sh -c 'echo x > /site 2>/dev/null && echo writable || echo readonly' 2>&1 | tail -1)" \
+    "readonly"
+timeout 300 "$B" stack down -t 0 -f "$C/rustainer.toml" >/dev/null 2>&1
+
+# The check that earns the separate keyword: a secret the whole machine
+# can read is refused before anything starts.
+chmod 644 "$C/db.pass"
+refuses "a world-readable secret is refused, with the chmod to run" "chmod 600" \
+    timeout 120 "$B" stack up -f "$C/rustainer.toml"
+chmod 600 "$C/db.pass"
+printf 'name = "gone"\n\n[configs.nope]\nfile = "not-here.conf"\n\n[services.a]\nimage = "%s"\ncommand = ["/bin/true"]\nconfigs = ["nope"]\n' "$IMG" > "$C/missing.toml"
+refuses "a config whose file is missing is named before anything starts" "does not exist" \
+    timeout 120 "$B" stack up -f "$C/missing.toml"
+"$B" ps -a 2>/dev/null | awk 'NR>1 && /cfgstack-/ {print $1}' \
+    | while read -r c; do "$B" rm --force "$c" >/dev/null 2>&1; done
+
+echo
+echo "12. The healthcheck keeps running after the stack is up"
+H="$SCRATCH/hc"
+mkdir -p "$H"
+cat > "$H/rustainer.toml" <<EOF
+name = "hcstack"
+
+[services.app]
+image = "$IMG"
+command = ["/bin/sh", "-c", "touch /tmp/ready; sleep 300"]
+
+[services.app.healthcheck]
+test = ["/bin/sh", "-c", "test -f /tmp/ready"]
+interval = 1
+retries = 5
+EOF
+timeout 300 "$B" stack up -f "$H/rustainer.toml" >/dev/null 2>&1
+sleep 3
+HF="$RUSTAINER_ROOT/containers/hcstack-app/health"
+check "a watcher records the container as healthy" "$(cat "$HF" 2>/dev/null)" "healthy"
+# The point of a CONTINUOUS check: take the marker away and the status
+# must change by itself, with nobody asking.
+timeout 60 "$B" exec hcstack-app /bin/rm -f /tmp/ready >/dev/null 2>&1
+sleep 9
+check "and notices by itself when it stops being true" "$(cat "$HF" 2>/dev/null)" "unhealthy"
+timeout 60 "$B" exec hcstack-app /bin/touch /tmp/ready >/dev/null 2>&1
+sleep 4
+check "and when it becomes true again" "$(cat "$HF" 2>/dev/null)" "healthy"
+# And the watcher is not a daemon: it goes when the container does.
+timeout 300 "$B" stack down -t 0 -f "$H/rustainer.toml" >/dev/null 2>&1
+sleep 3
+LEFT=0
+for p in /proc/[0-9]*; do
+    [ -r "$p/comm" ] || continue
+    [ "$(cat "$p/comm" 2>/dev/null)" = "rustainer-hc" ] && LEFT=$((LEFT + 1))
+done
+check "the watcher exits with its container" "$LEFT" "0"
 
 echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"

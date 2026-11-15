@@ -38,6 +38,30 @@ pub struct Stack {
     /// Prefixes every container name, so one host can run two stacks.
     pub name: String,
     pub services: BTreeMap<String, Service>,
+    /// Files to put inside containers that ask for them.
+    ///
+    /// `configs.<name>.file` is a path, relative to the stack file.
+    /// A service lists the names it wants and gets each one at
+    /// `/<name>`, read-only.
+    #[serde(default)]
+    pub configs: BTreeMap<String, FileSource>,
+    /// The same, mounted under `/run/secrets/` and refused if the
+    /// source file is readable by anyone but its owner.
+    ///
+    /// That check is the entire difference between the two, and it is
+    /// the one worth having: a secret in a world-readable file in the
+    /// repository is the most common way one leaks, and a tool that
+    /// mounts it without comment has helped.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, FileSource>,
+}
+
+/// Where a config or secret comes from.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FileSource {
+    /// A path, relative to the stack file.
+    pub file: String,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Default)]
@@ -87,8 +111,40 @@ pub struct Service {
     #[serde(default)]
     pub volumes: Vec<String>,
     /// Services that must be started before this one.
+    ///
+    /// Either a list of names, or a table giving a condition per name:
+    ///
+    /// ```toml
+    /// depends_on = ["db"]
+    /// depends_on = { db = "healthy" }
+    /// ```
+    ///
+    /// `started` (the default) means the container exists and is
+    /// running. `healthy` means its `healthcheck` has passed, and `up`
+    /// waits for that before starting this service.
     #[serde(default)]
-    pub depends_on: Vec<String>,
+    pub depends_on: DependsOn,
+    /// Inherit every field of another service in this stack, then
+    /// override what is set here.
+    #[serde(default)]
+    pub extends: Option<String>,
+    /// A command that decides whether this service is ready.
+    #[serde(default)]
+    pub healthcheck: Option<HealthCheck>,
+    /// Configs this service wants, by name. Each arrives at `/<name>`.
+    #[serde(default)]
+    pub configs: Vec<String>,
+    /// Secrets this service wants. Each arrives at `/run/secrets/<name>`.
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    /// How many containers to run for this service.
+    ///
+    /// One by default, and one keeps the plain `<stack>-<service>`
+    /// name: a file that never mentions replicas must not have its
+    /// container names change underneath it. Above one they are
+    /// `<stack>-<service>-1`, `-2`, and so on.
+    #[serde(default = "one_replica")]
+    pub replicas: u32,
     #[serde(default)]
     pub memory: Option<String>,
     #[serde(default)]
@@ -104,9 +160,101 @@ pub struct Service {
     pub network: Option<String>,
 }
 
+/// `depends_on`, in either of the two shapes Compose accepts.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum DependsOn {
+    /// `depends_on = ["db"]` - started, not healthy.
+    Names(Vec<String>),
+    /// `depends_on = { db = "healthy" }`.
+    Conditions(BTreeMap<String, String>),
+}
+
+impl Default for DependsOn {
+    fn default() -> Self {
+        DependsOn::Names(Vec::new())
+    }
+}
+
+impl DependsOn {
+    /// Every service named, whatever the shape.
+    pub fn names(&self) -> Vec<&str> {
+        match self {
+            DependsOn::Names(v) => v.iter().map(String::as_str).collect(),
+            DependsOn::Conditions(m) => m.keys().map(String::as_str).collect(),
+        }
+    }
+
+    /// Does this dependency have to be HEALTHY, not merely started?
+    pub fn wants_healthy(&self, dep: &str) -> bool {
+        match self {
+            DependsOn::Names(_) => false,
+            DependsOn::Conditions(m) => m.get(dep).map(String::as_str) == Some("healthy"),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let DependsOn::Conditions(m) = self {
+            for (name, cond) in m {
+                if cond != "started" && cond != "healthy" {
+                    bail!(
+                        "{cond:?} is not a condition for {name:?}. Use \"started\" \
+                         (the default) or \"healthy\", which waits for that \
+                         service's healthcheck to pass."
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What makes a service ready.
+///
+/// Evaluated by `up` while it waits, not by a supervisor running a
+/// probe loop for the life of the container. That is the smaller half
+/// of what Compose's healthchecks do and it is the half `depends_on`
+/// actually needs: the question being answered is "may I start the next
+/// service yet", and nothing here reacts to a container becoming
+/// unhealthy later.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HealthCheck {
+    /// The command, as a list. Exit 0 means healthy.
+    pub test: Vec<String>,
+    /// Seconds between attempts. 1 by default.
+    #[serde(default = "one")]
+    pub interval: u64,
+    /// How many attempts before giving up. 30 by default.
+    #[serde(default = "thirty")]
+    pub retries: u64,
+    /// Seconds to wait before the first attempt. 0 by default.
+    #[serde(default)]
+    pub start_period: u64,
+}
+
+fn one() -> u64 {
+    1
+}
+fn one_replica() -> u32 {
+    1
+}
+fn thirty() -> u64 {
+    30
+}
+
 impl Stack {
+    /// One document. `parse_many` is what the CLI uses, because `-f` is
+    /// repeatable; this is the single-file shorthand the tests read
+    /// better with, and it goes through exactly the same path.
+    #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self> {
-        let stack: Stack = toml::from_str(text).map_err(|e| {
+        Self::parse_many(std::slice::from_ref(&text.to_owned()))
+    }
+
+    /// Deserialize and validate an already-merged document.
+    fn from_value(doc: toml::Value) -> Result<Self> {
+        let stack: Stack = doc.try_into().map_err(|e: toml::de::Error| {
             let m = e.to_string();
             // serde's own message for this is "invalid type: string",
             // which is true and useless. The reader needs the shape.
@@ -152,7 +300,49 @@ impl Stack {
                 crate::supervise_restart_check(r)
                     .with_context(|| format!("service {name:?}: `restart`"))?;
             }
-            for dep in &svc.depends_on {
+            svc.depends_on
+                .validate()
+                .with_context(|| format!("service {name:?}: `depends_on`"))?;
+            if let Some(h) = &svc.healthcheck
+                && h.test.is_empty()
+            {
+                bail!("service {name:?} has a `healthcheck` with no `test` command");
+            }
+            for c in &svc.configs {
+                if !stack.configs.contains_key(c) {
+                    bail!(
+                        "service {name:?} wants config {c:?}, which this stack does not \
+                         define. Add `[configs.{c}]` with a `file`."
+                    );
+                }
+            }
+            for c in &svc.secrets {
+                if !stack.secrets.contains_key(c) {
+                    bail!(
+                        "service {name:?} wants secret {c:?}, which this stack does not \
+                         define. Add `[secrets.{c}]` with a `file`."
+                    );
+                }
+            }
+            if svc.replicas == 0 {
+                bail!(
+                    "service {name:?} asks for 0 replicas. Remove the service, or \
+                     put it behind a profile, rather than defining one that never runs."
+                );
+            }
+            for dep in svc.depends_on.names() {
+                if svc.depends_on.wants_healthy(dep)
+                    && stack
+                        .services
+                        .get(dep)
+                        .is_some_and(|d| d.healthcheck.is_none())
+                {
+                    bail!(
+                        "service {name:?} waits for {dep:?} to be healthy, but {dep:?} \
+                         has no `healthcheck`, so nothing would ever report it healthy. \
+                         Give {dep:?} a healthcheck, or depend on it being started."
+                    );
+                }
                 if !stack.services.contains_key(dep) {
                     bail!(
                         "service {name:?} depends on {dep:?}, which this stack does not \
@@ -168,6 +358,119 @@ impl Stack {
             }
         }
         Ok(stack)
+    }
+
+    /// Merge several stack documents, later over earlier.
+    ///
+    /// One mechanism serves two features: several `-f` files, and
+    /// `extends`. Both are "take that table and override parts of it",
+    /// and writing it twice would be writing the same subtle rule twice
+    /// - tables merge key by key, everything else replaces.
+    ///
+    /// A list REPLACES rather than appends. Appending looks friendlier
+    /// and is a trap: an override file that sets `command` would append
+    /// to the base command and run something nobody wrote.
+    fn merge(base: &mut toml::Value, over: &toml::Value) {
+        match (base, over) {
+            (toml::Value::Table(b), toml::Value::Table(o)) => {
+                for (k, v) in o {
+                    match b.get_mut(k) {
+                        Some(existing) => Self::merge(existing, v),
+                        None => {
+                            b.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            (b, o) => *b = o.clone(),
+        }
+    }
+
+    /// Parse one or more documents as a single stack.
+    ///
+    /// Later documents override earlier ones, which is what `-f a -f b`
+    /// means everywhere else. `extends` is resolved afterwards, on the
+    /// merged result, so a service can extend one defined in a different
+    /// file.
+    pub fn parse_many(texts: &[String]) -> Result<Self> {
+        let mut merged: Option<toml::Value> = None;
+        for (n, t) in texts.iter().enumerate() {
+            let v: toml::Value = toml::from_str(t)
+                .map_err(|e| anyhow::anyhow!("file {} is not valid TOML: {e}", n + 1))?;
+            match &mut merged {
+                None => merged = Some(v),
+                Some(m) => Self::merge(m, &v),
+            }
+        }
+        let mut merged = merged.unwrap_or_else(|| toml::Value::Table(Default::default()));
+        Self::resolve_extends(&mut merged)?;
+        Self::from_value(merged)
+    }
+
+    /// Fold every `extends` into the service that declares it.
+    ///
+    /// Depth first, so a chain works, with the visit set carrying the
+    /// cycle: `a extends b extends a` is a stack file that cannot be
+    /// resolved and saying which services are in the loop is the useful
+    /// half of the message.
+    fn resolve_extends(doc: &mut toml::Value) -> Result<()> {
+        let Some(services) = doc.get("services").and_then(|s| s.as_table()).cloned() else {
+            return Ok(());
+        };
+        let mut resolved: BTreeMap<String, toml::Value> = BTreeMap::new();
+        for name in services.keys() {
+            let mut seen: Vec<String> = Vec::new();
+            let v = Self::resolve_one(name, &services, &mut seen, &mut resolved)?;
+            resolved.insert(name.clone(), v);
+        }
+        let table = doc.as_table_mut().expect("the document is a table");
+        table.insert(
+            "services".into(),
+            toml::Value::Table(resolved.into_iter().collect()),
+        );
+        Ok(())
+    }
+
+    fn resolve_one(
+        name: &str,
+        services: &toml::map::Map<String, toml::Value>,
+        seen: &mut Vec<String>,
+        done: &mut BTreeMap<String, toml::Value>,
+    ) -> Result<toml::Value> {
+        if let Some(v) = done.get(name) {
+            return Ok(v.clone());
+        }
+        if seen.iter().any(|s| s == name) {
+            seen.push(name.to_owned());
+            bail!(
+                "`extends` goes in a circle and cannot be resolved: {}",
+                seen.join(" -> ")
+            );
+        }
+        let Some(me) = services.get(name) else {
+            bail!(
+                "a service extends {name:?}, which this stack does not define. \
+                 The services it does define are: {}",
+                services.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+        };
+        let Some(base_name) = me.get("extends").and_then(|v| v.as_str()) else {
+            return Ok(me.clone());
+        };
+        if base_name == name {
+            bail!("service {name:?} extends itself");
+        }
+        seen.push(name.to_owned());
+        let mut base = Self::resolve_one(base_name, services, seen, done)?;
+        seen.pop();
+        Self::merge(&mut base, me);
+        // The marker is spent: leaving it in would be harmless but would
+        // let `rustainer stack ps` print a field that no longer means
+        // anything.
+        if let Some(t) = base.as_table_mut() {
+            t.remove("extends");
+        }
+        Ok(base)
     }
 
     /// Expand `${VAR}` and `${VAR:-default}` before the TOML is parsed.
@@ -274,7 +577,7 @@ impl Stack {
             if !keep.contains(name) {
                 continue;
             }
-            for dep in &svc.depends_on {
+            for dep in svc.depends_on.names() {
                 if !keep.contains(dep) {
                     bail!(
                         "service {name:?} is in this run but depends on {dep:?}, which \
@@ -303,6 +606,24 @@ impl Stack {
         format!("{}-{}", self.name, service)
     }
 
+    /// Every container name for a service, which is one name unless it
+    /// asked for replicas.
+    ///
+    /// A single replica keeps the unsuffixed name on purpose: adding
+    /// `-1` to every existing stack's containers would rename things
+    /// people have in scripts, for the benefit of a feature they are
+    /// not using.
+    pub fn container_names(&self, service: &str) -> Vec<String> {
+        let n = self.services.get(service).map(|s| s.replicas).unwrap_or(1);
+        if n <= 1 {
+            vec![self.container_name(service)]
+        } else {
+            (1..=n)
+                .map(|i| format!("{}-{}-{}", self.name, service, i))
+                .collect()
+        }
+    }
+
     /// Start order: dependencies first, ties broken alphabetically so the
     /// same file always produces the same order.
     ///
@@ -327,7 +648,7 @@ impl Stack {
                 .services
                 .iter()
                 .filter(|(n, s)| {
-                    !placed.contains(*n) && s.depends_on.iter().all(|d| placed.contains(d))
+                    !placed.contains(*n) && s.depends_on.names().iter().all(|d| placed.contains(*d))
                 })
                 .map(|(n, _)| n.clone())
                 .collect();
@@ -364,7 +685,7 @@ impl Stack {
                 .services
                 .iter()
                 .filter(|(n, s)| {
-                    !placed.contains(*n) && s.depends_on.iter().all(|d| placed.contains(d))
+                    !placed.contains(*n) && s.depends_on.names().iter().all(|d| placed.contains(*d))
                 })
                 .map(|(n, _)| n.clone())
                 .collect();
@@ -554,6 +875,141 @@ depends_on = ["db"]
         let e = Stack::parse("name=\"x\"\n[services.a]\nimage=\"i\"\nrestart=\"sometimes\"\n")
             .unwrap_err();
         assert!(e.to_string().contains("restart"), "{e}");
+    }
+
+    #[test]
+    fn several_files_merge_later_over_earlier() {
+        let base = "name=\"x\"\n[services.web]\nimage=\"base\"\n\
+                    command=[\"a\",\"b\"]\nenv=[\"K=1\"]\n"
+            .to_owned();
+        let over = "[services.web]\nimage=\"prod\"\n[services.extra]\nimage=\"i\"\n".to_owned();
+        let s = Stack::parse_many(&[base, over]).unwrap();
+        assert_eq!(s.services["web"].image, "prod");
+        // A key the override did not mention survives.
+        assert_eq!(s.services["web"].env, vec!["K=1"]);
+        // A service only the override defines is added.
+        assert!(s.services.contains_key("extra"));
+    }
+
+    #[test]
+    fn an_override_replaces_a_list_rather_than_appending_to_it() {
+        // Appending looks friendlier and would make an override that
+        // sets `command` run something nobody wrote.
+        let base = "name=\"x\"\n[services.a]\nimage=\"i\"\ncommand=[\"one\"]\n".to_owned();
+        let over = "[services.a]\ncommand=[\"two\"]\n".to_owned();
+        let s = Stack::parse_many(&[base, over]).unwrap();
+        assert_eq!(s.services["a"].command, vec!["two"]);
+    }
+
+    #[test]
+    fn extends_inherits_then_overrides() {
+        let s = Stack::parse(
+            "name=\"x\"\n[services.base]\nimage=\"i\"\nenv=[\"A=1\"]\nuser=\"nobody\"\n\
+             [services.child]\nextends=\"base\"\nuser=\"root\"\n",
+        )
+        .unwrap();
+        assert_eq!(s.services["child"].image, "i");
+        assert_eq!(s.services["child"].env, vec!["A=1"]);
+        assert_eq!(s.services["child"].user.as_deref(), Some("root"));
+        // The marker is spent once it is resolved.
+        assert_eq!(s.services["child"].extends, None);
+    }
+
+    #[test]
+    fn extends_in_a_circle_names_the_loop() {
+        let e = Stack::parse(
+            "name=\"x\"\n[services.a]\nimage=\"i\"\nextends=\"b\"\n\
+             [services.b]\nimage=\"i\"\nextends=\"a\"\n",
+        )
+        .unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("circle"), "{m}");
+        assert!(m.contains("->"), "{m}");
+    }
+
+    #[test]
+    fn depends_on_takes_both_shapes() {
+        let s = Stack::parse(
+            "name=\"x\"\n[services.db]\nimage=\"i\"\n\
+             [services.db.healthcheck]\ntest=[\"true\"]\n\
+             [services.web]\nimage=\"i\"\ndepends_on={db=\"healthy\"}\n",
+        )
+        .unwrap();
+        assert_eq!(s.services["web"].depends_on.names(), vec!["db"]);
+        assert!(s.services["web"].depends_on.wants_healthy("db"));
+        // The list form still parses, and means "started".
+        let s = Stack::parse(
+            "name=\"x\"\n[services.db]\nimage=\"i\"\n\
+             [services.web]\nimage=\"i\"\ndepends_on=[\"db\"]\n",
+        )
+        .unwrap();
+        assert!(!s.services["web"].depends_on.wants_healthy("db"));
+    }
+
+    #[test]
+    fn waiting_for_health_needs_something_that_reports_it() {
+        // The trap: `condition: service_healthy` against a service with
+        // no healthcheck waits forever in Compose. Refused here.
+        let e = Stack::parse(
+            "name=\"x\"\n[services.db]\nimage=\"i\"\n\
+             [services.web]\nimage=\"i\"\ndepends_on={db=\"healthy\"}\n",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("has no `healthcheck`"), "{e}");
+
+        let e = Stack::parse(
+            "name=\"x\"\n[services.db]\nimage=\"i\"\n\
+             [services.web]\nimage=\"i\"\ndepends_on={db=\"whenever\"}\n",
+        )
+        .unwrap_err();
+        // `{:#}`, not `{}`: anyhow's Display shows only the outermost
+        // context, and the sentence worth asserting on is the innermost.
+        assert!(format!("{e:#}").contains("is not a condition"), "{e:#}");
+    }
+
+    #[test]
+    fn one_replica_keeps_the_plain_name() {
+        // Adding `-1` to every existing stack's containers would rename
+        // things people have in scripts, for a feature they are not
+        // using.
+        let s = Stack::parse("name=\"x\"\n[services.web]\nimage=\"i\"\n").unwrap();
+        assert_eq!(s.container_names("web"), vec!["x-web"]);
+
+        let s = Stack::parse("name=\"x\"\n[services.web]\nimage=\"i\"\nreplicas=3\n").unwrap();
+        assert_eq!(
+            s.container_names("web"),
+            vec!["x-web-1", "x-web-2", "x-web-3"]
+        );
+    }
+
+    #[test]
+    fn zero_replicas_is_refused_rather_than_silently_nothing() {
+        let e = Stack::parse("name=\"x\"\n[services.web]\nimage=\"i\"\nreplicas=0\n").unwrap_err();
+        assert!(e.to_string().contains("0 replicas"), "{e}");
+    }
+
+    #[test]
+    fn a_service_cannot_ask_for_a_config_the_stack_does_not_define() {
+        let e = Stack::parse("name=\"x\"\n[services.a]\nimage=\"i\"\nconfigs=[\"nginx\"]\n")
+            .unwrap_err();
+        assert!(e.to_string().contains("wants config"), "{e}");
+        let e =
+            Stack::parse("name=\"x\"\n[services.a]\nimage=\"i\"\nsecrets=[\"db\"]\n").unwrap_err();
+        assert!(e.to_string().contains("wants secret"), "{e}");
+    }
+
+    #[test]
+    fn configs_and_secrets_parse_and_attach() {
+        let s = Stack::parse(
+            "name=\"x\"\n[configs.site]\nfile=\"nginx.conf\"\n\
+             [secrets.dbpass]\nfile=\"secret.txt\"\n\
+             [services.a]\nimage=\"i\"\nconfigs=[\"site\"]\nsecrets=[\"dbpass\"]\n",
+        )
+        .unwrap();
+        assert_eq!(s.configs["site"].file, "nginx.conf");
+        assert_eq!(s.secrets["dbpass"].file, "secret.txt");
+        assert_eq!(s.services["a"].configs, vec!["site"]);
+        assert_eq!(s.services["a"].secrets, vec!["dbpass"]);
     }
 
     #[test]
