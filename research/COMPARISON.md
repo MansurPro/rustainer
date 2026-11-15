@@ -277,8 +277,20 @@ exist and cannot find each other is not up.
 
 | | docker compose | rustainer | |
 |---|---|---|---|
-| `up`, to mutually reachable by name | 209-361ms | 35-39ms | **6.0-9.3x** |
-| `down -t 1` | 1293ms | 1048ms | 1.2x |
+| `up`, to mutually reachable by name | 209-361ms | 34-39ms | **6.0-9.3x** |
+| `down -t 1` | 1282-1293ms | 1048-1060ms | 1.2x |
+| **`up` with 3 replicas** | 243ms | **25ms** | **9.7x** |
+| **health-gated `up`** | 4214ms | **3047ms** | see below |
+
+The health-gated row is the one worth reading carefully, and it is the
+only measurement here of the features this comparison itself caused.
+Both files say the same thing: `db` is ready when `/tmp/ready` exists,
+it writes that file three seconds in, and `web` must not start before
+then. **Both engines pay the same three seconds**, so subtract them and
+what is left is the machinery around the wait: **47ms here against
+1214ms**. `docker compose up --wait` and `depends_on: condition:
+service_healthy` do a great deal more than poll a command - and for the
+question `depends_on` actually asks, that is the price of it.
 
 **Two things this measurement changed rather than confirmed**, which is
 the only reason it was worth running:
