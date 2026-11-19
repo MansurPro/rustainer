@@ -223,7 +223,19 @@ impl Cgroup {
             return Ok(None);
         }
 
-        let base = delegating_parent();
+        let mut base = delegating_parent();
+        // A privileged container is promised every controller, and the
+        // cgroup we happen to be in may not have them to give: a login
+        // session's scope on a stock systemd host has no `cpu`, and a
+        // kubelet refuses to start without it. Root has a place that has
+        // them all - a cgroup of our own directly under the root, which
+        // is where Docker's cgroupfs driver keeps `/docker`.
+        if limits.all_controllers
+            && let Some(top) = top_level()
+            && controllers_of(&top) > controllers_of(&base)
+        {
+            base = top;
+        }
 
         // Make sure we are in the leaf, not in the cgroup we are about to
         // enable controllers on.
@@ -450,6 +462,30 @@ fn describe(l: &Limits) -> String {
     } else {
         parts.join(", ")
     }
+}
+
+fn controllers_of(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("cgroup.controllers"))
+        .map_or(0, |s| s.split_whitespace().count())
+}
+
+/// `/sys/fs/cgroup/rustainer` with everything the root has switched on
+/// for it, or `None` when we may not make one (rootless: the root of the
+/// hierarchy is not ours to write).
+fn top_level() -> Option<PathBuf> {
+    let root = Path::new(CGROUP_ROOT);
+    let top = root.join("rustainer");
+    std::fs::create_dir_all(&top).ok()?;
+    // In a container the "root" is an ordinary cgroup and may not enable
+    // a controller while it holds processes; on a host it is exempt.
+    let _ = enter_own_leaf();
+    let have = std::fs::read_to_string(root.join("cgroup.controllers")).unwrap_or_default();
+    for c in have.split_whitespace() {
+        if !subtree_has(root, c) {
+            let _ = write_file(&root.join("cgroup.subtree_control"), &format!("+{c}"));
+        }
+    }
+    Some(top)
 }
 
 /// The cgroup that delegates to the containers: our own, or its parent when
