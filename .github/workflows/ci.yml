@@ -195,3 +195,22 @@ jobs:
               env RUSTAINER_BIN="$PWD/target/release/rustainer" \
               bash "scripts/stage${s}-success-test.sh"
           done
+
+  # A real cluster: k3s in a privileged container, a deployment, a
+  # service, a restart. Its own job because it takes minutes and pulls
+  # three images, and a slow registry should not hide a stage failure.
+  kube:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get -qq install -y iproute2 nftables >/dev/null
+      - run: cargo build --release
+      # Off on a fresh host, and the engine refuses to change it.
+      - run: sudo sysctl -w net.ipv4.ip_forward=1
+      - name: Kubernetes test
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/kube-test.sh
+      - name: The node's log, if that failed
+        if: failure()
+        run: sudo target/release/rustainer logs rustainer-kube 2>&1 | tail -60

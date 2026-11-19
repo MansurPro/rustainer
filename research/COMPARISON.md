@@ -899,8 +899,8 @@ all three are compatibility fixes in their own right:
 `scripts/kube-test.sh` is the evidence: the node becomes Ready, a
 two-replica nginx deployment rolls out, its service answers on a cluster
 address, the API server is reachable from the host, and after `kube
-down` and `kube up` the deployment is still there. It is not in CI - it
-needs root, three image pulls and several minutes. It passes 8 of 8 in
+down` and `kube up` the deployment is still there. It runs in CI as
+its own job, since it needs three image pulls and several minutes. It passes 8 of 8 in
 two places: nested inside Docker Desktop's VM, and on a stock Debian 13
 host (kernel 6.12, systemd, booted for the purpose under KVM) as root.
 

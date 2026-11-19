@@ -3,10 +3,9 @@
 #
 #   sudo RUSTAINER_BIN=... bash scripts/kube-test.sh
 #
-# Not part of CI. It pulls a 70 MiB node image and two more for the
-# workload, needs root, a firewall tool and several minutes - the cost of
-# testing a cluster rather than a claim about one. Run it by hand after
-# touching `--privileged`, cgroups, or `kube`.
+# Its own CI job, apart from the stages: it pulls a 70 MiB node image
+# and two more for the workload, needs root, a firewall tool and several
+# minutes - the cost of testing a cluster rather than a claim about one.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 B="${RUSTAINER_BIN:-target/release/rustainer}"
