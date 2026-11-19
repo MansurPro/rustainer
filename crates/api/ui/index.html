@@ -746,9 +746,14 @@ function buildDetail() {
         "and `rustainer exec -it` already is one."));
     body.append(pad);
   } else if (detailTab === "files") {
-    body.append(c.status === "running"
-      ? fileBrowser("/api/containers/" + c.id + "/files")
-      : el("div", { className: "empty" }, "Files are readable only while the container runs."));
+    // Keyed by state as well as id: running shows the whole tree and
+    // stopped shows only the writable layer, and one must not be left
+    // on screen as the other.
+    if (c.status !== "running") {
+      body.append(el("div", { className: "hint", style: "padding:8px 14px" },
+        "Not running: these are only the files this container created or changed, without the image beneath them."));
+    }
+    body.append(fileBrowser("/api/containers/" + c.id + "/files", c.status === "running" ? "" : "#stopped"));
   } else {
     body.append(inspectTable(c));
   }
@@ -1124,12 +1129,12 @@ function pruneButton(button, unused, noun, call) {
 // One element per tree, kept: the lists around it are redrawn every two
 // seconds, and a browser that returned to "/" each time would be unusable.
 const browsers = new Map();
-function fileBrowser(base) {
-  if (browsers.has(base)) return browsers.get(base);
+function fileBrowser(base, variant = "") {
+  if (browsers.has(base + variant)) return browsers.get(base + variant);
   const crumbs = el("div", { className: "mono", style: "padding:8px 14px;border-bottom:1px solid var(--line)" });
   const pane = el("div");
   const box = el("div", {}, [crumbs, pane]);
-  browsers.set(base, box);
+  browsers.set(base + variant, box);
   const go = async (path) => {
     const parts = path.split("/").filter(Boolean);
     crumbs.replaceChildren(el("button", { className: "act", textContent: "/", onclick: () => go("/") }));

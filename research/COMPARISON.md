@@ -441,14 +441,16 @@ A fourth pass closed the last two that were worth closing:
   unhealthy is both of those things, and collapsing them loses the half
   the operator needs.
 
-And `watch`, in the two actions that can be honoured honestly:
+And `watch`, in all three of Compose's actions:
 
 - **`rebuild`** builds the image again and replaces the container;
   **`restart`** replaces it without building, which is what a changed
-  config file needs. **`sync` is refused by name**, because copying
-  files into a running container needs a way to write into its
-  filesystem from outside and this engine deliberately has no `cp`. A
-  `sync` that quietly rebuilt instead would be worse than not having it.
+  config file needs; **`sync`** copies changed files into the running
+  container and replaces nothing. `sync` was refused by name until the
+  file browser needed a path walk a container cannot redirect; the same
+  walk made writing safe. Stage 18 has the container plant a symlink at
+  the destination pointing at a host directory and asserts nothing
+  arrives there. It does not propagate deletions or copy symlinks.
 - `rebuild` on a service with no `build` is refused while the file is
   parsed, rather than discovered when a file changes at midnight.
 - It **polls mtimes** rather than subscribing to inotify. A watch that
@@ -465,7 +467,7 @@ roll back. `deploy.resources` has no equivalent spelling because the
 limits themselves already do: `memory`, `cpus` and `pids_limit` are
 service keys here.
 
-And `watch`'s `sync` action, above.
+And `watch`'s `sync` propagating deletions, above.
 
 That is the list.
 
@@ -590,7 +592,9 @@ the same image deleted the record the other still needed.
 
 Stated as limits: an image's size is its **compressed** layers, not disk
 use; a volume's size stops counting at 20,000 entries and is then shown
-as a floor; and a stopped container cannot be browsed.
+as a floor; and a stopped container shows only its writable layer - the
+files it created or changed - because the merged view went with its
+mount namespace.
 
 `start` and `restart` followed, because a Containers screen without them
 is a list of things you can only delete. An exited container comes back

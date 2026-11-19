@@ -220,7 +220,7 @@ echo "10. Files: a container's and a volume's, and never the host's"
 # host has and the container must never be shown.
 echo "HOSTSECRET-$$" > "$SCRATCH/hostsecret"
 FID=$(timeout 60 "$B" run -d --network none --layer "$BASE" -v filevol:/v /bin/sh -c \
-    "echo inside > /v/note; ln -s $SCRATCH/hostsecret /v/abs; \
+    "echo mine > /wrote; echo inside > /v/note; ln -s $SCRATCH/hostsecret /v/abs; \
      ln -s ../../../../../../../..$SCRATCH/hostsecret /v/climb; exec sleep 60" 2>/dev/null | tail -1)
 for _ in $(seq 50); do
     [ -L "$RUSTAINER_IMAGE_ROOT/volumes/filevol/climb" ] && break
@@ -240,8 +240,12 @@ check "no link or .. reads a host file" "$LEAK" ""
 check "a traversing volume name is refused" \
     "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/volumes/..%2F..%2Fstate/files")" "400"
 "$B" stop -t 0 "$FID" >/dev/null 2>&1
-check "a stopped container has no files to show" \
-    "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/containers/$FID/files")" "409"
+# Stopped, there is no mount namespace to look into: what is left is the
+# writable layer, which is the container's own files and not the image's.
+contains "a stopped container shows what it wrote" \
+    "$(curl -sS "$URL/api/containers/$FID/files?path=/wrote")" '"text":"mine\n"'
+check "and not the image beneath it" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/containers/$FID/files?path=/etc/alpine-release")" "404"
 
 echo
 echo "11. An exited container starts again as itself"

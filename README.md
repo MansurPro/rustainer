@@ -730,13 +730,14 @@ beside the status, because a container that is running *and* unhealthy
 is both of those things.
 
 **`stack watch`** rebuilds or restarts a service when its files change,
-which is Compose's `develop.watch`. Two actions, and the third refused
-by name: `rebuild` builds the image again and replaces the container,
-`restart` replaces it without building — and **`sync` is not
-implemented**, because copying files into a running container needs a
-way to write into its filesystem from outside and there is deliberately
-no `cp` here. A `sync` that quietly rebuilt instead would be worse than
-not having one. It polls mtimes rather than using inotify: a watch that
+which is Compose's `develop.watch`, in all three actions: `rebuild`
+builds the image again and replaces the container, `restart` replaces
+it without building, and `sync` copies changed files into the running
+container at a `target` and replaces nothing. `sync` writes through
+`/proc/<pid>/root` with every directory resolved by
+`openat2(RESOLVE_IN_ROOT)`, so a symlink the container planted in the
+destination cannot steer the copy onto the host. It does not propagate
+deletions and does not copy symlinks. It polls mtimes rather than using inotify: a watch that
 misses an event is worse than one that notices a second late, and
 inotify's queue overflows silently under a build that touches a thousand
 files.
