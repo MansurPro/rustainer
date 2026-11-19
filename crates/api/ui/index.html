@@ -307,7 +307,7 @@
         <button class="act" id="image-cols">columns</button>
         <input id="pullref" placeholder="alpine:3.21" style="width: 200px; padding: 3px 8px; font-size: 12px;">
         <button class="act" id="pull">Pull</button>
-        <button class="act" id="tags" title="List this repository's tags in its registry.">Tags</button>
+        <button class="act" id="tags" title="List this repository's tags in its registry. Type `name/` to list a Docker Hub namespace's public repositories.">Tags</button>
         <button class="act" id="build">Build…</button>
         <button class="act danger" id="picked-images" hidden></button>
         <button class="act danger" id="prune-images" hidden></button>
@@ -444,9 +444,9 @@ let onlyRunning = false;
 
 /// A sparkline of the last samples, or nothing when there is no history
 /// worth drawing. Inline SVG: no library, and it scales with the text.
-function spark(values, w = 46, h = 12) {
+function spark(values, w = 46, h = 12, top = 0) {
   if (!values || values.length < 3) return "";
-  const max = Math.max(1, ...values);
+  const max = Math.max(1, top, ...values);
   const step = w / (values.length - 1);
   const d = values
     .map((v, i) => `${i ? "L" : "M"}${(i * step).toFixed(1)},${(h - (v / max) * h).toFixed(1)}`)
@@ -795,18 +795,22 @@ function buildDetail() {
 // A sparkline with the two things that make it readable as a chart:
 // what the top of it is worth, and how far back it goes.
 let zoomed = false;   // one switch for all four: they are read together
-function chart(values, fmt) {
+function chart(values, fmt, limit) {
   const [w, h] = zoomed ? [760, 120] : [420, 40];
-  const peak = Math.max(...values);
+  // With a limit, the chart is scaled to it and its top edge IS the
+  // limit: how close the line is to the top is how close the container
+  // is to being killed, which is the one thing a memory chart is for.
+  const peak = limit || Math.max(...values);
   const axis = (text, style) => el("div", { className: "mono dim", style: "font-size:10px;" + style }, text);
   return el("div", { style: "display:flex;gap:8px;align-items:stretch" }, [
     el("div", { style: "display:flex;flex-direction:column;justify-content:space-between;text-align:right;min-width:64px" },
-      [axis(fmt(peak), ""), axis(fmt(0), "")]),
+      [axis((limit ? "limit " : "") + fmt(peak), limit ? "color:var(--bad)" : ""), axis(fmt(0), "")]),
     el("div", {}, [
-      el("div", { style: "border-left:1px solid var(--line);border-bottom:1px solid var(--line);padding:2px 0 0 2px;cursor:zoom-" + (zoomed ? "out" : "in"),
+      el("div", { style: "border-left:1px solid var(--line);border-bottom:1px solid var(--line);padding:2px 0 0 2px;" +
+                         (limit ? "border-top:1px dashed var(--bad);" : "") + "cursor:zoom-" + (zoomed ? "out" : "in"),
                   title: "Click to zoom " + (zoomed ? "out" : "in"),
                   onclick: () => { zoomed = !zoomed; const c = lastContainers.find((x) => x.id === openRow); if (c) $("#statspane").replaceWith(statsPane(c)); } },
-        spark(values, w, h) || el("div", { style: `width:${w}px;height:${h}px` })),
+        spark(values, w, h, limit || 0) || el("div", { style: `width:${w}px;height:${h}px` })),
       el("div", { style: `display:flex;justify-content:space-between;width:${w + 2}px` },
         [axis(values.length * 2 + "s ago", ""), axis("now", "")]),
     ]),
@@ -833,7 +837,7 @@ function statsPane(c) {
   box.append(el("table", {}, el("tbody", {}, rows.map(([k, a, fmt]) => el("tr", {}, [
     el("td", { className: "dim nowrap", style: "width:150px" }, k),
     el("td", { className: "mono nowrap", style: "width:110px" }, fmt(last(a))),
-    el("td", {}, chart(a, fmt)),
+    el("td", {}, chart(a, fmt, k === "Memory" ? c.memory : 0)),
   ])))));
   box.append(el("div", { className: "hint", style: "padding:8px 14px" },
     "Each chart is scaled to its own peak, which is the number at its top. Disk needs the io controller and is absent without it."));
@@ -1658,7 +1662,24 @@ $("#pullref").onkeydown = (e) => { if (e.key === "Enter") $("#pull").click(); };
 // two clicks and no guessing.
 $("#tags").onclick = async (e) => {
   const box = $("#taglist");
-  const repo = $("#pullref").value.trim().replace(/[:@][^/]*$/, "");
+  const typed = $("#pullref").value.trim();
+  // `name/` asks for that Docker Hub namespace's repositories instead:
+  // the way to find what an account has before knowing what to pull.
+  if (/^[\w.-]+\/$/.test(typed)) {
+    const ns = typed.slice(0, -1);
+    e.target.disabled = true;
+    const r = await api("/api/registry/repos?namespace=" + encodeURIComponent(ns));
+    e.target.disabled = false;
+    logCommand(["repos", ns], r);
+    box.hidden = false;
+    const rows = (r.stdout || "").split("\n").filter(Boolean).map((l) => l.split("\t"));
+    box.replaceChildren(...(rows.length ? rows.map(([name, pulls, updated]) => el("button", {
+      className: "act mono", textContent: name, title: pulls + " pulls, updated " + updated,
+      onclick: () => { $("#pullref").value = name; $("#tags").click(); },
+    })) : [el("span", { className: "hint", style: "margin:0" }, (r.stderr || r.error || "No public repositories.").split("\n")[0])]));
+    return;
+  }
+  const repo = typed.replace(/[:@][^/]*$/, "");
   if (!repo) { box.hidden = true; return; }
   e.target.disabled = true;
   const r = await api("/api/registry/tags?repository=" + encodeURIComponent(repo));

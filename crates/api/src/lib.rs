@@ -123,6 +123,13 @@ impl Server {
             ("POST", "/api/containers") => return self.create(stream, req),
             ("GET", "/api/images") => return http::json(stream, 200, &self.images()),
             ("POST", "/api/images/pull") => return self.pull(stream, req),
+            ("GET", "/api/registry/repos") => {
+                let ns = req.param("namespace").unwrap_or_default();
+                if !is_safe_id(&ns) {
+                    return http::error(stream, 400, "not a namespace");
+                }
+                return self.run_cli(stream, &["repos", &ns]);
+            }
             ("GET", "/api/registry/tags") => {
                 let Some(repo) = req.param("repository").filter(|s| !s.is_empty()) else {
                     return http::error(stream, 400, "a repository is required");

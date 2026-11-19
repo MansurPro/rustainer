@@ -149,6 +149,16 @@ pub struct Service {
     /// `<stack>-<service>-1`, `-2`, and so on.
     #[serde(default = "one_replica")]
     pub replicas: u32,
+    /// Compose's `deploy.placement.constraints`: conditions on the node
+    /// a service may run on, e.g. `node.platform.arch == aarch64`.
+    ///
+    /// There is one node here, so this cannot choose between hosts. It
+    /// does what a one-node swarm does with the same file: evaluates
+    /// each constraint against this machine and refuses to start the
+    /// service if one does not hold - which is the useful half, because
+    /// it is what stops an amd64-only service being started on arm.
+    #[serde(default)]
+    pub placement: Vec<String>,
     #[serde(default)]
     pub memory: Option<String>,
     #[serde(default)]
@@ -210,6 +220,68 @@ impl DependsOn {
             }
         }
         Ok(())
+    }
+}
+
+/// One placement constraint: `<key> == <value>` or `<key> != <value>`.
+#[derive(Debug, PartialEq)]
+pub struct Constraint {
+    pub key: String,
+    pub equal: bool,
+    pub value: String,
+}
+
+impl Constraint {
+    /// The keys a single machine can answer for itself. `node.labels.*`
+    /// and `node.role` are properties an orchestrator assigns, and
+    /// there is none here to have assigned them - so they are refused
+    /// by name rather than treated as never matching.
+    pub const KEYS: [&str; 3] = ["node.hostname", "node.platform.os", "node.platform.arch"];
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (key, equal, value) = if let Some((k, v)) = s.split_once("!=") {
+            (k, false, v)
+        } else if let Some((k, v)) = s.split_once("==") {
+            (k, true, v)
+        } else {
+            return Err("expected `key == value` or `key != value`".into());
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if !Self::KEYS.contains(&key) {
+            return Err(format!(
+                "{key:?} is not something one machine can answer. Supported: {}",
+                Self::KEYS.join(", ")
+            ));
+        }
+        if value.is_empty() {
+            return Err("the value is empty".into());
+        }
+        Ok(Self {
+            key: key.to_owned(),
+            equal,
+            value: value.to_owned(),
+        })
+    }
+
+    /// Does this hold for a node with these properties?
+    pub fn holds(&self, hostname: &str, os: &str, arch: &str) -> bool {
+        let actual = match self.key.as_str() {
+            "node.hostname" => hostname,
+            "node.platform.os" => os,
+            _ => arch,
+        };
+        // Docker reports `x86_64` and `aarch64`; people also write the
+        // image-platform spellings, and a constraint that silently never
+        // matched because of that would be a bad afternoon.
+        let same = |a: &str, b: &str| {
+            let norm = |x: &str| match x {
+                "amd64" => "x86_64".to_owned(),
+                "arm64" => "aarch64".to_owned(),
+                other => other.to_lowercase(),
+            };
+            norm(a) == norm(b)
+        };
+        same(actual, &self.value) == self.equal
     }
 }
 
@@ -379,6 +451,11 @@ impl Stack {
                          it a build context.",
                         w.path
                     );
+                }
+            }
+            for c in &svc.placement {
+                if let Err(e) = Constraint::parse(c) {
+                    bail!("service {name:?}: placement constraint {c:?}: {e}");
                 }
             }
             if svc.replicas == 0 {
@@ -1067,6 +1144,37 @@ depends_on = ["db"]
         assert_eq!(s.secrets["dbpass"].file, "secret.txt");
         assert_eq!(s.services["a"].configs, vec!["site"]);
         assert_eq!(s.services["a"].secrets, vec!["dbpass"]);
+    }
+
+    #[test]
+    fn placement_constraints_are_parsed_and_judged_against_one_node() {
+        let c = Constraint::parse("node.platform.arch == arm64").unwrap();
+        assert!(
+            c.holds("box", "linux", "aarch64"),
+            "arm64 and aarch64 are one architecture"
+        );
+        assert!(!c.holds("box", "linux", "x86_64"));
+        let c = Constraint::parse("node.hostname!=build-1").unwrap();
+        assert!(c.holds("box", "linux", "aarch64"));
+        assert!(!c.holds("build-1", "linux", "aarch64"));
+        // What only an orchestrator could know is refused by name.
+        for bad in [
+            "node.role == manager",
+            "node.labels.zone == a",
+            "node.hostname",
+            "node.hostname == ",
+        ] {
+            assert!(Constraint::parse(bad).is_err(), "{bad:?} was accepted");
+        }
+        let e = Stack::parse(
+            "name=\"x\"\n[services.a]\nimage=\"i\"\nplacement=[\"node.role == manager\"]\n",
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("not something one machine can answer"),
+            "{e}"
+        );
     }
 
     #[test]

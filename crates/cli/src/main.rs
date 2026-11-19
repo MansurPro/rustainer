@@ -102,6 +102,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List the public repositories of a Docker Hub namespace: a user,
+    /// an organisation, or `library` for the official images.
+    ///
+    /// Docker Hub only - it is Hub's own API, not part of the registry
+    /// protocol - and public repositories only, since nothing here
+    /// signs in.
+    Repos { namespace: String },
     /// List the tags a repository has in its registry.
     Tags {
         /// A repository, e.g. `alpine` or `ghcr.io/owner/name`.
@@ -658,6 +665,14 @@ fn real_main() -> Result<ExitCode> {
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
         Command::Scan { image, json } => cmd_scan(&image, json),
+        Command::Repos { namespace } => {
+            let repos = rustainer_image::registry::hub_repositories(&namespace)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            for (name, pulls, updated) in repos {
+                println!("{namespace}/{name}\t{pulls}\t{updated}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Tags { repository } => {
             let r = rustainer_image::Reference::parse(&repository)
                 .map_err(|e| anyhow::anyhow!("{repository}: {e}"))?;
@@ -2423,6 +2438,30 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
         let path = base_dir.join(&src.file);
         if !path.exists() {
             bail!("config {name:?}: {} does not exist", path.display());
+        }
+    }
+
+    // Placement, checked for the whole stack before anything starts: a
+    // stack that brings up its database and then finds the application
+    // may not run here has left more behind than one that refused.
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    for name in &order {
+        for c in &st.services[name].placement {
+            let parsed = stack::Constraint::parse(c).map_err(|e| anyhow::anyhow!(e))?;
+            if !parsed.holds(
+                hostname.trim(),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            ) {
+                bail!(
+                    "service {name:?} may not run on this machine: its placement \
+                     constraint {c:?} does not hold here (hostname {:?}, {} {}). There \
+                     is no other node to place it on.",
+                    hostname.trim(),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                );
+            }
         }
     }
 

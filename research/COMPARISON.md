@@ -460,10 +460,16 @@ And `watch`, in all three of Compose's actions:
 
 ### What Compose still has that these stacks do not
 
-**Placement constraints**, the part of `deploy` that needs more than one
-host: there is no scheduler here to place anything. `deploy.resources`
-has no equivalent spelling because the limits themselves already do:
-`memory`, `cpus` and `pids_limit` are service keys here.
+**Placement** across hosts: there is one host, so nothing chooses
+between them. What is here is what a one-node swarm does with the same
+file - `placement = ["node.platform.arch == aarch64"]` is evaluated
+against this machine, and a constraint that does not hold refuses the
+whole stack before anything starts. Hostname, OS and architecture are
+the keys one machine can answer for itself; `node.role` and
+`node.labels.*` are refused by name, since only an orchestrator could
+have assigned them. `deploy.resources` has no equivalent spelling
+because the limits themselves already do: `memory`, `cpus` and
+`pids_limit` are service keys here.
 
 Rollback, the other part, is here in the one form a single host can
 honour. `stack update <service>` stops the old container and **sets it
@@ -670,7 +676,7 @@ The tables below are corrected against that.
 | Layers and history | each layer with its command and size, grouped by base image | per-layer sizes and the build history, as two lists |
 | Packages and CVEs | Scout: OS and application packages, grouped by layer | a scan against OSV: apk and dpkg packages, Python and Node packages, each finding with the layer that introduced it |
 | Push from the UI | yes | yes, with the credentials the server was started with |
-| Registry | "My Hub": your repositories | the tags of any repository you name; no account view |
+| Registry | "My Hub": your repositories, signed in | the public repositories of any Docker Hub namespace, and the tags of any repository; nothing private, because nothing signs in |
 
 **Volumes**
 
@@ -698,7 +704,7 @@ The tables below are corrected against that.
 | Files: what differs from the image | each entry marked ADDED or MODIFIED | the same two marks, from the writable layer; deletions are not shown |
 | Files: download | yes | yes |
 | Files: edit, upload | yes | yes, up to 64M per upload; mode and owner kept on edit |
-| Stats | four charts with axes, limits and zoom | the same four series over the last minute, each with its peak and time span, and a click to enlarge; no limit line; disk only with the io controller |
+| Stats | four charts with axes, limits and zoom | the same four series over the last minute, each with its peak and time span, a click to enlarge, and the memory limit drawn as the top of its chart; disk only with the io controller |
 | Bind mounts tab | yes | listed under inspect |
 | Start / stop / restart / delete | yes | yes |
 
@@ -735,8 +741,9 @@ database is SQLite. An image where it finds nothing is reported as
 having nothing to look up rather than nothing wrong. A package an upper
 layer deleted is still reported, which errs toward saying too much.
 
-What is still missing: an account's own repositories, which needs a
-sign-in this has no notion of, and a limit line on the charts. Search, bulk selection, totals, the added/modified marks and
+What is still missing is what needs an identity: private repositories,
+and anything else behind a Docker Hub sign-in. This has no notion of an
+account and was not given one. Search, bulk selection, totals, the added/modified marks and
 chart axes were added after seeing the application have them.
 
 ### What the page does that is worth something

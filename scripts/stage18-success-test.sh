@@ -631,5 +631,26 @@ refuses "a service with no healthcheck cannot be updated this way" "has no healt
 timeout 300 "$B" stack down -t 0 -f "$U/rustainer.toml" >/dev/null 2>&1
 
 echo
+echo "16. placement is judged against this one machine"
+# What a one-node swarm does with the same file: a constraint that holds
+# is no obstacle, and one that does not stops the stack before anything
+# starts - including the services it would not have applied to.
+PL="$SCRATCH/place"; mkdir -p "$PL"
+place() {
+    printf 'name = "pstack"\n\n[services.first]\nimage = "%s"\ncommand = ["/bin/sleep", "60"]\n\n[services.app]\nimage = "%s"\ncommand = ["/bin/sleep", "60"]\ndepends_on = ["first"]\nplacement = ["%s"]\n' "$IMG" "$IMG" "$1" > "$PL/rustainer.toml"
+}
+place "node.platform.arch != $(uname -m)"
+refuses "a constraint this machine does not meet refuses the stack" "may not run on this machine" \
+    timeout 120 "$B" stack up -f "$PL/rustainer.toml"
+check "and nothing was started first" "$("$B" ps -a | grep -c pstack)" "0"
+place "node.platform.arch == $(uname -m)"
+timeout 300 "$B" stack up -f "$PL/rustainer.toml" >/dev/null 2>&1
+check "a constraint it does meet is no obstacle" "$("$B" ps | awk '$1 == "pstack-app" {print $2}')" "running"
+timeout 300 "$B" stack down -t 0 -f "$PL/rustainer.toml" >/dev/null 2>&1
+place "node.role == manager"
+refuses "a constraint only an orchestrator could judge is refused by name" "not something one machine can answer" \
+    timeout 120 "$B" stack up -f "$PL/rustainer.toml"
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
