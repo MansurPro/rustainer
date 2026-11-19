@@ -1444,8 +1444,44 @@ pub fn refresh_network_hosts(paths: &Paths, network: &str) {
         for (name, ip) in &cfg.peers {
             body.push_str(&format!("{ip}\t{name}\n"));
         }
-        let _ = std::fs::write(paths.dir(id).join("hosts"), body);
+        let _ = overwrite_in_place(&paths.dir(id).join("hosts"), body);
     }
+}
+
+/// Replace a file's contents with no moment at which it is empty.
+///
+/// `std::fs::write` truncates and then writes, and a container reading
+/// `/etc/hosts` between the two finds no names at all - not even its
+/// own. Renaming a new file over it, the usual answer, is not available:
+/// the container has this inode bind-mounted, and a rename would leave
+/// it holding the old one. So it is one write over the old bytes, padded
+/// with newlines when the new text is shorter. The file never shrinks,
+/// which for a hosts file costs some blank lines.
+fn overwrite_in_place(path: &Path, body: String) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    let old = file.metadata()?.len() as usize;
+    let mut bytes = body.into_bytes();
+    if bytes.len() < old {
+        bytes.resize(old, b'\n');
+    }
+    file.write_all_at(&bytes, 0)
+}
+
+#[test]
+fn overwriting_in_place_never_shrinks_the_file() {
+    let p = std::env::temp_dir().join(format!("rustainer-hosts-{}", std::process::id()));
+    std::fs::write(&p, "a long first version\n").unwrap();
+    overwrite_in_place(&p, "short\n".into()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "short\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+    );
+    std::fs::remove_file(&p).unwrap();
 }
 
 /// Where a requested stop is recorded.

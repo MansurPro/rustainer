@@ -160,6 +160,24 @@ check "a name resolves" \
 check "/etc/hosts names the container itself" \
     "$(R --hostname boxy /bin/sh -c 'grep -c boxy /etc/hosts' 2>/dev/null | tail -1)" "1"
 
+# Every arrival and departure on the network rewrites every member's
+# hosts file. Truncate-then-write left it empty for an instant, and a
+# container that looked at that instant resolved nothing - which is how
+# the assertion above failed once in CI. Three readers in a tight loop
+# saw it hundreds of times in forty arrivals.
+for w in hw1 hw2 hw3; do
+    "$B" run -d --name "$w" --hostname boxy --layer "$BASE" /bin/sh -c \
+        'while :; do read -r a < /etc/hosts || echo EMPTY; done' >/dev/null 2>&1
+done
+for _ in $(seq 40); do R /bin/true >/dev/null 2>&1; done
+SEEN=0
+for w in hw1 hw2 hw3; do
+    "$B" stop -t 0 "$w" >/dev/null 2>&1
+    SEEN=$((SEEN + $("$B" logs "$w" 2>/dev/null | grep -c EMPTY)))
+    "$B" rm --force "$w" >/dev/null 2>&1
+done
+check "/etc/hosts is never empty while the network changes" "$SEEN" "0"
+
 echo
 echo "5. The real payoff, which needs all of the above"
 check "apk can reach a mirror and install a package" \
