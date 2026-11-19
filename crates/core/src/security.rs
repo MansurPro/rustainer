@@ -315,8 +315,7 @@ pub enum Action {
 /// paths, module loading, kexec, and the keyring.
 pub fn default_profile() -> Profile {
     const DENIED: &[&str] = &[
-        // Namespace creation. clone3 cannot be argument-filtered at all.
-        "clone3",
+        // Namespace creation. (clone3 is below, with its own errno.)
         "setns",
         "unshare",
         // The mount family. Without these, masked and read-only paths are
@@ -365,12 +364,27 @@ pub fn default_profile() -> Profile {
     Profile {
         default_action: Action::Allow,
         default_errno: None,
-        syscalls: vec![SyscallRule {
-            names: DENIED.iter().map(|s| (*s).to_owned()).collect(),
-            action: Action::Errno,
-            errno: Some(libc::EPERM as u32),
-            args: None,
-        }],
+        syscalls: vec![
+            SyscallRule {
+                names: DENIED.iter().map(|s| (*s).to_owned()).collect(),
+                action: Action::Errno,
+                errno: Some(libc::EPERM as u32),
+                args: None,
+            },
+            // clone3 cannot be argument-filtered at all, so it is denied
+            // wholesale - but with ENOSYS, not EPERM. glibc 2.34 and
+            // later start every thread with clone3 and fall back to
+            // clone only when told the call does not exist; told
+            // "not permitted", pthread_create simply fails, and with it
+            // every threaded program on a current Debian or Ubuntu.
+            // Docker's profile says ENOSYS for the same reason.
+            SyscallRule {
+                names: vec!["clone3".into()],
+                action: Action::Errno,
+                errno: Some(libc::ENOSYS as u32),
+                args: None,
+            },
+        ],
     }
 }
 
@@ -417,6 +431,50 @@ pub fn compile(profile: &Profile) -> Result<Vec<libc::sock_filter>, SeccompError
     } else {
         return Err(SeccompError::UnsupportedArch);
     };
+
+    // A deny-list may mix actions - EPERM for most, ENOSYS for clone3.
+    // Each action's rules compile to a filter of their own, and the
+    // filters are chained: where one would return "allow", it jumps to
+    // the next instead, which starts from the architecture check again.
+    // Not done for an allow-list, where "allow" is a verdict and not
+    // the absence of one.
+    if profile.default_action == Action::Allow {
+        let mut groups: Vec<(serde_json::Value, Vec<SyscallRule>)> = Vec::new();
+        for rule in &profile.syscalls {
+            let a = action_json(rule.action, rule.errno);
+            match groups.iter_mut().find(|(have, _)| *have == a) {
+                Some((_, rules)) => rules.push(rule.clone()),
+                None => groups.push((a, vec![rule.clone()])),
+            }
+        }
+        if groups.len() > 1 {
+            let count = groups.len();
+            let mut chained = Vec::new();
+            for (i, (_, syscalls)) in groups.into_iter().enumerate() {
+                let part = compile(&Profile {
+                    default_action: Action::Allow,
+                    default_errno: None,
+                    syscalls,
+                })?;
+                let len = part.len();
+                for (j, mut ins) in part.into_iter().enumerate() {
+                    if i + 1 < count
+                        && ins.code == (libc::BPF_RET | libc::BPF_K) as u16
+                        && ins.k == libc::SECCOMP_RET_ALLOW
+                    {
+                        ins = libc::sock_filter {
+                            code: (libc::BPF_JMP | libc::BPF_JA) as u16,
+                            jt: 0,
+                            jf: 0,
+                            k: (len - j - 1) as u32,
+                        };
+                    }
+                    chained.push(ins);
+                }
+            }
+            return Ok(chained);
+        }
+    }
 
     // seccompiler takes one action for the whole matched set, so a profile
     // mixing actions across rules cannot be expressed. Reject it rather
@@ -846,8 +904,10 @@ mod tests {
         // "deny namespace creation" is inexpressible for clone3 and the only
         // correct answer is to deny the call.
         let p = default_profile();
-        assert!(p.syscalls[0].names.iter().any(|n| n == "clone3"));
         assert!(p.syscalls[0].names.iter().any(|n| n == "mount"));
+        // ...and as "no such call", so that glibc falls back to clone.
+        assert_eq!(p.syscalls[1].names, ["clone3"]);
+        assert_eq!(p.syscalls[1].errno, Some(libc::ENOSYS as u32));
     }
 
     #[test]

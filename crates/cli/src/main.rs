@@ -110,6 +110,15 @@ enum Command {
     /// is the same cluster. Needs root and a Linux host.
     #[command(subcommand)]
     Kube(KubeCmd),
+    /// Language models: pull one from a registry, serve it, ask it.
+    ///
+    /// Docker's `ai/` namespace on Docker Hub holds models as OCI
+    /// artifacts whose layer is a GGUF file. `model pull` downloads
+    /// that file; `model run` starts a llama.cpp server container with
+    /// it mounted read-only and an OpenAI-compatible API on a local
+    /// port.
+    #[command(subcommand)]
+    Model(ModelCmd),
     /// Add something to the page: a stack plus the address of its UI.
     ///
     /// An extension here is a directory with two files - a stack file,
@@ -409,6 +418,166 @@ enum KubeCmd {
     },
     /// Print a kubeconfig for the cluster, for kubectl on this machine.
     Config,
+}
+
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// Download a model: `rustainer model pull ai/smollm2:360M-Q4_K_M`.
+    Pull { model: String },
+    /// The models on disk, and whether each is being served.
+    Ls,
+    /// Delete a model's file (and stop its server).
+    Rm { model: String },
+    /// Serve a model. Pulls it first if it is not here.
+    Run {
+        model: String,
+        /// The local port for the OpenAI-compatible API. Docker's own
+        /// model runner uses this one, so clients set up for it work.
+        #[arg(long, default_value_t = 12434)]
+        port: u16,
+        /// The server. Any image whose entrypoint is llama.cpp's
+        /// `llama-server` will do, e.g. a `server-cuda` build.
+        #[arg(long, default_value = "ghcr.io/ggml-org/llama.cpp:server")]
+        image: String,
+    },
+    /// Stop serving a model. Its file is kept.
+    Stop { model: String },
+    /// Ask a running model one question and print the answer.
+    Ask { model: String, prompt: String },
+}
+
+fn cmd_model(paths: &Paths, cmd: ModelCmd) -> Result<ExitCode> {
+    use rustainer_image::model;
+    let root = Store::default_root();
+    let parse =
+        |m: &str| rustainer_image::Reference::parse(m).map_err(|e| anyhow::anyhow!("{m}: {e}"));
+    // One container per model, named after it.
+    let container = |r: &rustainer_image::Reference| {
+        let slug: String = format!("{}-{}", r.name, r.tag)
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("model-{slug}")
+    };
+    let serving =
+        |id: &str| State::load(paths, id).is_ok_and(|s| s.observed_status() == Status::Running);
+    // Reached on the bridge, not through the published port: the
+    // address is in the container's own record and the port is not.
+    let base = |id: &str| -> Result<String> {
+        let ip = Config::load(paths, id)
+            .ok()
+            .and_then(|c| c.ip)
+            .with_context(|| format!("{id} is not running; `rustainer model run` starts it"))?;
+        Ok(format!("http://{ip}:8080"))
+    };
+    match cmd {
+        ModelCmd::Pull { model: m } => {
+            let r = parse(&m)?;
+            let (path, fresh) = model::pull(&root, &r).map_err(|e| anyhow::anyhow!(e))?;
+            if fresh {
+                rustainer_core::events::record(paths, "model-pull", &m, serde_json::json!({}));
+            }
+            println!("{}", path.display());
+        }
+        ModelCmd::Ls => {
+            for (name, bytes) in model::list(&root) {
+                let state = if serving(&container(&parse(&name)?)) {
+                    "serving"
+                } else {
+                    ""
+                };
+                println!("{name}\t{bytes}\t{state}");
+            }
+        }
+        ModelCmd::Stop { model: m } => {
+            let id = container(&parse(&m)?);
+            if paths.dir(&id).exists() {
+                supervise::remove(paths, &id, true)?;
+            }
+            println!("{id}");
+        }
+        ModelCmd::Rm { model: m } => {
+            let r = parse(&m)?;
+            let id = container(&r);
+            if paths.dir(&id).exists() {
+                supervise::remove(paths, &id, true)?;
+            }
+            let path = model::path(&root, &r);
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            println!("{m}");
+        }
+        ModelCmd::Run {
+            model: m,
+            port,
+            image,
+        } => {
+            let r = parse(&m)?;
+            let id = container(&r);
+            if serving(&id) {
+                println!("{id} is already serving");
+                return Ok(ExitCode::SUCCESS);
+            }
+            let (path, _) = model::pull(&root, &r).map_err(|e| anyhow::anyhow!(e))?;
+            if paths.dir(&id).exists() {
+                supervise::remove(paths, &id, true)?;
+            }
+            let file = path.file_name().unwrap().to_string_lossy();
+            let mut command: Vec<OsString> = vec![image.into()];
+            command.extend(
+                [
+                    "-m",
+                    &format!("/models/{file}"),
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8080",
+                ]
+                .map(OsString::from),
+            );
+            let _ = cmd_run(
+                paths,
+                RunArgs {
+                    detach: true,
+                    name: Some(id.clone()),
+                    network: "bridge".into(),
+                    hostname: id.clone(),
+                    volumes: vec![format!("{}:/models:ro", path.parent().unwrap().display())],
+                    publish: vec![format!("127.0.0.1:{port}:8080")],
+                    restart: "no".into(),
+                    command,
+                    ..Default::default()
+                },
+            )
+            .context("starting the model server")?;
+            let base = base(&id)?;
+            // Loading is reading the whole file; allow a large one time.
+            for _ in 0..300 {
+                if model::ready(&base) {
+                    println!("serving {m} at http://127.0.0.1:{port}/v1");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                std::thread::sleep(Duration::from_secs(1));
+                // After the sleep: a container is `created` for a moment
+                // before it is `running`, and that is not an exit.
+                if !serving(&id) {
+                    bail!("the model server exited while loading. `rustainer logs {id}` has why.");
+                }
+            }
+            bail!("the model was not loaded in five minutes; `rustainer logs {id}`");
+        }
+        ModelCmd::Ask { model: m, prompt } => {
+            let id = container(&parse(&m)?);
+            let answer = model::ask(&base(&id)?, &prompt).map_err(|e| anyhow::anyhow!(e))?;
+            println!("{answer}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The cluster's container, and its volume.
@@ -1009,6 +1178,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Rmi(a) => cmd_rmi(a),
         Command::Scan { image, json } => cmd_scan(&image, json),
         Command::Kube(c) => cmd_kube(&paths, c),
+        Command::Model(c) => cmd_model(&paths, c),
         Command::Extension(c) => cmd_extension(&paths, c),
         Command::Mcp(McpCmd::Ls) => {
             for r in rustainer_image::registry::hub_repositories("mcp", None)

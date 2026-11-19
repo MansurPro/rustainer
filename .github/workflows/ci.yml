@@ -214,3 +214,19 @@ jobs:
       - name: The node's log, if that failed
         if: failure()
         run: sudo target/release/rustainer logs rustainer-kube 2>&1 | tail -60
+
+  # A real model from Docker Hub's catalogue, served and asked.
+  models:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get -qq install -y iproute2 nftables >/dev/null
+      - run: cargo build --release
+      - run: sudo sysctl -w net.ipv4.ip_forward=1
+      - name: Models test
+        run: sudo RUSTAINER_BIN="$PWD/target/release/rustainer" bash scripts/model-test.sh
+      - name: The server's log, if that failed
+        if: failure()
+        run: sudo target/release/rustainer logs model-ai-smollm2-135m-q4-k-m 2>&1 | tail -60

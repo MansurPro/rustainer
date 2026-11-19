@@ -133,6 +133,32 @@ impl Server {
             }
             ("POST", "/api/kube/up") => return self.run_cli(stream, &["kube", "up"]),
             ("POST", "/api/kube/down") => return self.run_cli(stream, &["kube", "down"]),
+            ("GET", "/api/models") => return self.run_cli(stream, &["model", "ls"]),
+            (
+                "POST",
+                "/api/models/pull" | "/api/models/run" | "/api/models/stop" | "/api/models/rm"
+                | "/api/models/ask",
+            ) => {
+                let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                // A reference, not a flag: it is placed on a command line.
+                let Some(model) = spec["model"].as_str().filter(|m| {
+                    !m.is_empty()
+                        && !m.starts_with('-')
+                        && m.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "._-/:".contains(c))
+                }) else {
+                    return http::error(stream, 400, "a model reference is required");
+                };
+                let verb = req.path.rsplit('/').next().unwrap_or_default();
+                return match (verb, spec["prompt"].as_str()) {
+                    // `--` so a prompt that starts with a dash stays a prompt.
+                    ("ask", Some(prompt)) => {
+                        self.run_cli(stream, &["model", "ask", model, "--", prompt])
+                    }
+                    ("ask", None) => http::error(stream, 400, "a prompt is required"),
+                    _ => self.run_cli(stream, &["model", verb, model]),
+                };
+            }
             ("GET", "/api/extensions") => {
                 return self.run_cli(stream, &["extension", "ls", "--json"]);
             }

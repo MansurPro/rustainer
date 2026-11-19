@@ -942,6 +942,18 @@ only on the way back, as a `diff_id` mismatch on layer 0.
 Pull now keeps the manifest it fetched, which is what lets a pulled image
 be pushed on at all, and `build` writes one for the image it made.
 
+### Models
+
+    rustainer model pull ai/smollm2:360M-Q4_K_M   # a GGUF from Docker Hub's ai/ catalogue
+    rustainer model run  ai/smollm2:360M-Q4_K_M   # OpenAI-compatible API on 127.0.0.1:12434
+    rustainer model ask  ai/smollm2:360M-Q4_K_M "What is a cgroup?"
+    rustainer model ls | stop | rm
+
+A model is a file under the image store and a llama.cpp server
+container that mounts it read-only. CPU by default; `--image` takes a
+GPU build of the server. Needs root, for the bridge the server is
+reached on.
+
 ### User-defined networks
 
 ```sh

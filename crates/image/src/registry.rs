@@ -465,6 +465,50 @@ impl Client {
         Ok(body)
     }
 
+    /// Fetch a blob straight to a file, verifying its digest as it
+    /// streams: for the ones too large to hold in memory. Written
+    /// beside `dest` and renamed, so a file at `dest` is a whole one.
+    ///
+    /// Uses the token a preceding [`Client::manifest`] call obtained.
+    pub fn blob_to_file(
+        &mut self,
+        r: &Reference,
+        digest: &str,
+        dest: &std::path::Path,
+    ) -> Result<(), Error> {
+        let url = format!("{}/v2/{}/blobs/{}", r.base_url(), r.name, digest);
+        let mut req = self.agent.get(&url);
+        if let Some(t) = &self.token {
+            req = req.header("Authorization", &format!("Bearer {t}"));
+        }
+        let resp = req.call().map_err(|e| Error::Http(e.to_string()))?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(Error::Status {
+                registry: r.endpoint(),
+                status,
+                what: "a blob".into(),
+                body: String::new(),
+            });
+        }
+        let io = |e: std::io::Error| Error::Http(format!("{}: {e}", dest.display()));
+        let partial = dest.with_extension("partial");
+        let mut reader = HashingReader::new(resp.into_body().into_reader());
+        let mut file = std::fs::File::create(&partial).map_err(io)?;
+        let copied = std::io::copy(&mut reader, &mut file);
+        let actual = reader.digest();
+        if copied.is_err() || actual != digest {
+            let _ = std::fs::remove_file(&partial);
+            copied.map_err(io)?;
+            return Err(Error::DigestMismatch {
+                what: format!("blob {digest}"),
+                expected: digest.to_owned(),
+                actual,
+            });
+        }
+        std::fs::rename(&partial, dest).map_err(io)
+    }
+
     /// One request, with lazy authentication.
     ///
     /// `GET /v2/` is skipped: `mcr.microsoft.com` never challenges and Hub
