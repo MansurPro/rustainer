@@ -31,9 +31,10 @@ away.** Twelve speed ratios were measured against Docker, on two hosts:
   bridge, and there is nothing in between to make faster.
 - Memory is a separate axis and a larger one: 7× to 18× less per running
   container, and nothing resident when nothing runs (Docker: 120-170 MiB).
-- Compatibility: **28 of 28** Docker Hub images tried run unchanged
-  (section 6), private repositories included, and it reads Docker's
-  model artifacts too.
+- Compatibility: **28 of 28** Docker Hub images behave identically to
+  the same image under Docker - same user, directory, `PATH` and exit
+  status (section 6; 30 were offered, 2 excluded because Docker itself
+  could not pull them). It also reads Docker's model artifacts.
 
 So "2× to 3× better with compatibility" is true as a statement about
 the typical operation and false as a statement about every operation.
