@@ -4296,6 +4296,7 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 // checking - but what it copied is part of the identity
                 // of every step after it, and the diff_id is exactly a
                 // hash of that.
+                build::settle_directory_times(&layer_dir);
                 let (diff_id, tar) = build::seal_layer(&layer_dir)?;
                 chain = hash(&[&chain, "copy", &diff_id]);
                 let layer_dir = store.commit_layer(&diff_id, &layer_dir)?;

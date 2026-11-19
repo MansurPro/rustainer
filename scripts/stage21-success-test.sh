@@ -220,6 +220,10 @@ COPY greeting.txt /g.txt
 EOF
 timeout 600 "$B" build --network none -t rep:1 "$CTX" >/dev/null 2>&1
 BEFORE=$(find "$RUSTAINER_IMAGE_ROOT"/layers* -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+# A second later, on purpose. A tar header holds whole seconds, so two
+# builds inside one second agree by accident - which is how a layer that
+# recorded the time of the copy passed this check on a fast machine.
+sleep 1.1
 timeout 600 "$B" build --network none -t rep:2 "$CTX" >/dev/null 2>&1
 AFTER=$(find "$RUSTAINER_IMAGE_ROOT"/layers* -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
 check "rebuilding adds no new layer" "$AFTER" "$BEFORE"
@@ -251,6 +255,7 @@ if [ "${#F1}" -eq 36 ] && [ "${#S1}" -eq 36 ] && [ "$F1" != "$S1" ]; then
 else
     bad "each step wrote a value of its own (got '$F1' and '$S1')"
 fi
+sleep 1.1   # see section 7: across a second boundary, or it proves nothing
 OUT=$(timeout 600 "$B" build --network none -t kc:2 "$K" 2>&1)
 contains "the second build says what it reused" "$OUT" "2 step(s) reused"
 check "and the first step really did not run again" "$(kval kc:2 /first)" "$F1"

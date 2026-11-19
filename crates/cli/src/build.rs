@@ -241,7 +241,34 @@ pub fn copy_into(src: &Path, dest: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::copy(src, dest)?;
+    // The source's modification time, not the moment of the copy. A
+    // layer's identity is a hash of its tar, the tar records mtimes, and
+    // "when the build happened to run" is not part of what was copied:
+    // with it in, the same context built twice a second apart made two
+    // different layers, and every cached step after a COPY was a miss.
+    if let Ok(t) = md.modified() {
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(dest)
+            .and_then(|f| f.set_modified(t));
+    }
     Ok(())
+}
+
+/// Give every directory in a COPY layer one fixed modification time.
+///
+/// The directories are made by the copy - the destination's parents, and
+/// a copied tree's own - so their times are the time of the build, for
+/// the reason above. The epoch rather than the source directory's time,
+/// because half of them have no source directory.
+pub fn settle_directory_times(dir: &Path) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            settle_directory_times(&e.path());
+            let _ =
+                std::fs::File::open(e.path()).and_then(|f| f.set_modified(std::time::UNIX_EPOCH));
+        }
+    }
 }
 
 /// The instructions that produce a layer, in order, for reporting.
