@@ -368,7 +368,7 @@
   <section id="view-events" hidden>
     <div class="card">
       <h2>Events <span class="spacer"></span>
-        <span class="dim" style="font-size:11px;text-transform:none;letter-spacing:0">newest last</span>
+        <span class="dim" style="font-size:11px;text-transform:none;letter-spacing:0">newest first</span>
       </h2>
       <div id="events"></div>
     </div>
@@ -2171,8 +2171,12 @@ function renderEvents(list) {
     tb.append(el("tr", {}, [
       el("td", { className: "mono dim nowrap" }, at.toLocaleTimeString()),
       el("td", { className: "mono nowrap", style: `color:${colour[e.kind] || "var(--text)"}` }, e.kind),
-      el("td", { className: "mono truncate" }, String(e.id ?? "")),
-      el("td", { className: "mono dim truncate hide-s" }, JSON.stringify(e.detail ?? {})),
+      el("td", { className: "mono nowrap" }, String(e.id ?? "")),
+      // key=value, not JSON: this column is read, not parsed. The cell
+      // takes the row's spare width, and the whole record is the tooltip.
+      el("td", { className: "mono dim truncate hide-s", style: "width:60%;max-width:0",
+        title: JSON.stringify(e.detail ?? {}, null, 1) },
+        Object.entries(e.detail ?? {}).map(([k, v]) => k + "=" + (typeof v === "object" ? JSON.stringify(v) : v)).join("  ")),
     ]));
   }
   t.append(tb);
