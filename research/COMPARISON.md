@@ -802,9 +802,13 @@ every build this engine has done - taken from the event log, so there
 is no second record to disagree with it - with how long it took, how
 many steps came from the cache, and for a build that failed, the step
 and exit status. Each can be rebuilt from the page, with or without the
-cache. It was not compared against Docker Desktop's Builds screen, which
-also shows per-step timings, logs and build provenance; this shows none
-of those.
+cache. Docker Desktop's own Builds screen, read from the running
+application, has a build history and an active-builds tab, a builder
+selector, import of build records, search, and columns for name, id,
+builder, duration and age; opening a build there shows per-step timings,
+logs and provenance. This has the history, the duration and the
+rebuild; it has no active-builds view, one builder, and none of the
+per-step detail.
 
 **MCP servers**, which Docker Desktop has as its MCP Toolkit. A server
 packaged as an image is a program that speaks a protocol on stdin and
@@ -830,6 +834,38 @@ It is **not Docker's extension format** and cannot load anything from
 Docker's marketplace: there is one extension, the example in
 `extensions/hello`, and no SDK for an extension to call back into the
 engine.
+
+**Kubernetes**, which Docker Desktop offers as a switch. Here it is
+`rustainer kube up`: k3s, running as a node inside one container of this
+engine. Getting there needed three things the engine did not have, and
+all three are compatibility fixes in their own right:
+
+- **`--privileged`** - every capability, no syscall filter, nothing
+  masked, `/sys` and the container's own cgroup writable, every cgroup
+  controller delegated, and the host's kmsg, fuse, loop and tun devices.
+  One explicit flag, off by default, implemented as an edit of the
+  finished mount plan so that an ordinary container's plan is not
+  touched by its existence. A process in such a container is root on
+  the host in every way that matters.
+- **Arguments after the image name are arguments to its ENTRYPOINT.**
+  This engine replaced the entrypoint as well as the CMD, which is right
+  only for images that have none - most small ones, and so most of the
+  images it had been tested with. `run rancher/k3s server` was looking
+  for a program called `server`. `--entrypoint` now exists to replace it
+  on purpose.
+- **A container's nested cgroups are removed with it.** A kubelet builds
+  a tree several levels deep; left behind, it made the next container of
+  the same name fail at `clone3` with EBUSY.
+
+`scripts/kube-test.sh` is the evidence: the node becomes Ready, a
+two-replica nginx deployment rolls out, its service answers on a cluster
+address, the API server is reachable from the host, and after `kube
+down` and `kube up` the deployment is still there. It is not in CI - it
+needs root, three image pulls and several minutes - and it has only been
+run nested inside Docker Desktop's VM, never on a bare Linux host. Root
+and Linux only; there is no rootless cluster. Docker Desktop's own
+Kubernetes was switched off on the machine this was compared on, so its
+screen was seen only in that state: a "create cluster" button.
 
 What is still missing is what needs an identity: private repositories,
 and anything else behind a Docker Hub sign-in. This has no notion of an

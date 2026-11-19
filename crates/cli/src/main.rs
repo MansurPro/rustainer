@@ -102,6 +102,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// A single-node Kubernetes cluster, in one container.
+    ///
+    /// k3s, running in a `--privileged` container of this engine: the
+    /// way Docker Desktop's own Kubernetes is a node in a container.
+    /// The cluster's data is a named volume, so `down` and `up` again
+    /// is the same cluster. Needs root and a Linux host.
+    #[command(subcommand)]
+    Kube(KubeCmd),
     /// Add something to the page: a stack plus the address of its UI.
     ///
     /// An extension here is a directory with two files - a stack file,
@@ -331,6 +339,22 @@ struct RunArgs {
     #[arg(long, value_name = "OPT")]
     security_opt: Vec<String>,
 
+    /// Replace the image's ENTRYPOINT. An empty string removes it, so
+    /// that what follows the image name is the whole command.
+    #[arg(long)]
+    entrypoint: Option<String>,
+
+    /// Run without confinement: every capability, no syscall filter,
+    /// nothing masked, `/sys` and the container's cgroup writable, and
+    /// the host's kmsg, fuse, loop and tun devices.
+    ///
+    /// For a container that has to be a container engine or a cluster
+    /// node itself. A process in one is root on this machine in every
+    /// way that matters; do not use it for anything you would not run
+    /// as root directly.
+    #[arg(long)]
+    privileged: bool,
+
     /// Publish a container port to the host: `[host-ip:]host-port:container-port`.
     /// Repeatable. TCP only.
     #[arg(short = 'p', long = "publish", value_name = "SPEC")]
@@ -363,6 +387,125 @@ struct PullArgs {
 #[derive(Args)]
 struct RmiArgs {
     image: String,
+}
+
+#[derive(Subcommand)]
+enum KubeCmd {
+    /// Start the cluster, or start it again.
+    Up {
+        /// The k3s image. Pinned by default so that `up` means the
+        /// same cluster next month.
+        #[arg(long, default_value = "rancher/k3s:v1.31.4-k3s1")]
+        image: String,
+    },
+    /// Stop the cluster's container. Its data volume is kept.
+    Down,
+    /// Run kubectl against the cluster: `rustainer kube kubectl get pods -A`.
+    Kubectl {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Print a kubeconfig for the cluster, for kubectl on this machine.
+    Config,
+}
+
+/// The cluster's container, and its volume.
+const KUBE: &str = "rustainer-kube";
+
+fn cmd_kube(paths: &Paths, cmd: KubeCmd) -> Result<ExitCode> {
+    // kubectl runs inside the node, where k3s ships it already pointed
+    // at the cluster - as a child process, for the reason every exec
+    // from a long-lived caller is one: `setns` moves the next child.
+    let kubectl = |args: &[String]| -> Result<ExitCode> {
+        let status = std::process::Command::new("/proc/self/exe")
+            .arg("--root")
+            .arg(paths_root(paths))
+            .args(["exec", KUBE, "kubectl"])
+            .args(args)
+            .status()
+            .context("running kubectl in the cluster's container")?;
+        Ok(ExitCode::from(
+            status.code().unwrap_or(1).clamp(0, 255) as u8
+        ))
+    };
+    let running = State::load(paths, KUBE)
+        .is_ok_and(|s| matches!(s.observed_status(), Status::Running | Status::Created));
+    match cmd {
+        KubeCmd::Up { image } => {
+            if running {
+                println!("{KUBE} is already running");
+                return Ok(ExitCode::SUCCESS);
+            }
+            // A stopped one is in the way of the name; its state is in
+            // the volume, not in the container.
+            if paths.dir(KUBE).exists() {
+                supervise::remove(paths, KUBE, true)?;
+            }
+            let mut command: Vec<OsString> = vec![image.into()];
+            // Traefik is left out: it claims ports 80 and 443 on the
+            // node, and a cluster that does that unasked is a surprise.
+            command.extend(["server", "--disable", "traefik"].map(OsString::from));
+            let _ = cmd_run(
+                paths,
+                RunArgs {
+                    detach: true,
+                    privileged: true,
+                    name: Some(KUBE.into()),
+                    network: "bridge".into(),
+                    hostname: "rustainer-kube".into(),
+                    volumes: vec![format!("{KUBE}:/var/lib/rancher")],
+                    publish: vec!["127.0.0.1:6443:6443".into()],
+                    restart: "no".into(),
+                    command,
+                    ..Default::default()
+                },
+            )
+            .context("starting the cluster's container")?;
+            println!("waiting for the node to be Ready");
+            for _ in 0..90 {
+                std::thread::sleep(Duration::from_secs(2));
+                let out = std::process::Command::new("/proc/self/exe")
+                    .arg("--root")
+                    .arg(paths_root(paths))
+                    .args(["exec", KUBE, "kubectl", "get", "nodes", "--no-headers"])
+                    .output();
+                if let Ok(o) = out
+                    && String::from_utf8_lossy(&o.stdout).split_whitespace().nth(1) == Some("Ready")
+                {
+                    println!("the cluster is ready: rustainer kube kubectl get pods -A");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                if !State::load(paths, KUBE).is_ok_and(|s| s.observed_status() == Status::Running) {
+                    bail!(
+                        "the cluster's container exited while starting. \
+                         `rustainer logs {KUBE}` has why."
+                    );
+                }
+            }
+            bail!("the node did not become Ready in three minutes; `rustainer logs {KUBE}`");
+        }
+        KubeCmd::Down => {
+            if paths.dir(KUBE).exists() {
+                supervise::remove(paths, KUBE, true)?;
+            }
+            println!("{KUBE} stopped; its data is in the {KUBE} volume");
+        }
+        KubeCmd::Kubectl { args } => return kubectl(&args),
+        KubeCmd::Config => {
+            if !running {
+                bail!("the cluster is not running; `rustainer kube up` first");
+            }
+            let status = std::process::Command::new("/proc/self/exe")
+                .arg("--root")
+                .arg(paths_root(paths))
+                .args(["exec", KUBE, "cat", "/etc/rancher/k3s/k3s.yaml"])
+                .status()?;
+            return Ok(ExitCode::from(
+                status.code().unwrap_or(1).clamp(0, 255) as u8
+            ));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[derive(Subcommand)]
@@ -863,6 +1006,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
         Command::Scan { image, json } => cmd_scan(&image, json),
+        Command::Kube(c) => cmd_kube(&paths, c),
         Command::Extension(c) => cmd_extension(&paths, c),
         Command::Mcp(McpCmd::Ls) => {
             for (name, pulls, _) in rustainer_image::registry::hub_repositories("mcp")
@@ -1087,19 +1231,38 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect();
 
-            let override_cmd: Vec<OsString> = args.command[1..].to_vec();
-            let cmd = if override_cmd.is_empty() {
-                let c = image.command();
-                if c.is_empty() {
-                    bail!(
-                        "{reference} declares neither an Entrypoint nor a Cmd, so there is \
-                         nothing to run. Give a command after the image name."
-                    );
-                }
-                c.into_iter().map(OsString::from).collect()
-            } else {
-                override_cmd
+            // What comes after the image name replaces the image's CMD,
+            // not its ENTRYPOINT: `run rancher/k3s server` is `k3s
+            // server`, because the image's entrypoint is `k3s` and its
+            // arguments are what the user is supplying. This used to
+            // replace both, which is right only for images with no
+            // entrypoint - most small ones, and so most tests.
+            let entrypoint: Vec<String> = match &args.entrypoint {
+                Some(e) if e.is_empty() => Vec::new(),
+                Some(e) => vec![e.clone()],
+                None => image.entrypoint.clone(),
             };
+            let tail: Vec<OsString> = if args.command.len() > 1 {
+                args.command[1..].to_vec()
+            } else if args.entrypoint.is_some() {
+                // Replacing the entrypoint discards the image's CMD too,
+                // as Docker's does: it was written as arguments to the
+                // entrypoint that is no longer there.
+                Vec::new()
+            } else {
+                image.cmd.iter().map(OsString::from).collect()
+            };
+            let cmd: Vec<OsString> = entrypoint
+                .into_iter()
+                .map(OsString::from)
+                .chain(tail)
+                .collect();
+            if cmd.is_empty() {
+                bail!(
+                    "{reference} declares neither an Entrypoint nor a Cmd, so there is \
+                     nothing to run. Give a command after the image name."
+                );
+            }
             (Some(String::new()), cmd)
         }
     };
@@ -1360,6 +1523,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         },
         seccomp: seccomp_profile,
         seccomp_unconfined,
+        privileged: args.privileged,
     };
     if let Some(c) = config.cpus
         && c <= 0.0
@@ -4132,6 +4296,7 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 // checking - but what it copied is part of the identity
                 // of every step after it, and the diff_id is exactly a
                 // hash of that.
+                build::settle_directory_times(&layer_dir);
                 let (diff_id, tar) = build::seal_layer(&layer_dir)?;
                 chain = hash(&[&chain, "copy", &diff_id]);
                 let layer_dir = store.commit_layer(&diff_id, &layer_dir)?;

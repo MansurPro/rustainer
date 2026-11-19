@@ -237,6 +237,76 @@ impl MountPlan {
     pub fn labels(&self) -> Vec<&'static str> {
         self.ops.iter().map(|o| o.label).collect()
     }
+
+    /// The same plan with its confinement taken out, for `--privileged`.
+    ///
+    /// Done as an edit of the finished plan rather than as a flag
+    /// threaded through its construction, so that the ordinary plan -
+    /// the one every other container gets, and the one the tests pin
+    /// down - is not touched by the existence of this mode at all.
+    ///
+    /// What goes: every masked and read-only path, the read-only
+    /// attribute on `/sys` and on the container's cgroup. What is
+    /// added: the handful of host devices a nested engine or a kubelet
+    /// opens and cannot create - bound individually, onto the
+    /// container's own `/dev`, rather than handing over the host's
+    /// `/dev` whole.
+    pub fn privileged(mut self) -> Self {
+        self.ops.retain(|o| {
+            !matches!(
+                o.op,
+                Op::Mask { .. } | Op::ReadOnly { .. } | Op::SetAttrRecursiveReadonly { .. }
+            )
+        });
+        for o in &mut self.ops {
+            if let Op::Mount { fstype, flags, .. } = &mut o.op
+                && fstype.as_bytes() == b"sysfs"
+            {
+                flags.remove(sys::MountFlags::RDONLY);
+            }
+        }
+        let rootfs = PathBuf::from(std::ffi::OsStr::from_bytes(self.rootfs.as_bytes()));
+        for dev in ["kmsg", "fuse", "loop-control", "net/tun"] {
+            let host = Path::new("/dev").join(dev);
+            if !host.exists() {
+                continue;
+            }
+            let target = join(&rootfs, &format!("dev/{dev}"));
+            let (Ok(source), Ok(target_c)) = (cstr(&host), cstr(&target)) else {
+                continue;
+            };
+            if let Some(parent) = Path::new(dev)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                && let Ok(dir) = cstr(&join(&rootfs, &format!("dev/{}", parent.display())))
+            {
+                self.ops.push(PlannedOp {
+                    op: Op::Mkdir {
+                        target: dir,
+                        mode: 0o755,
+                    },
+                    optional: true,
+                    label: "creating a directory for a host device",
+                });
+            }
+            self.ops.push(PlannedOp {
+                op: Op::Touch {
+                    target: target_c.clone(),
+                },
+                optional: true,
+                label: "creating a bind target for a host device",
+            });
+            self.ops.push(PlannedOp {
+                op: Op::Bind {
+                    source,
+                    target: target_c,
+                },
+                optional: true,
+                label: "binding a host device",
+            });
+        }
+        self
+    }
 }
 
 fn cstr(p: &Path) -> Result<CString, PlanError> {

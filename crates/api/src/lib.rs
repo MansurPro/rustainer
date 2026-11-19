@@ -123,6 +123,16 @@ impl Server {
             ("POST", "/api/containers") => return self.create(stream, req),
             ("GET", "/api/images") => return http::json(stream, 200, &self.images()),
             ("POST", "/api/images/pull") => return self.pull(stream, req),
+            // Nodes and pods together, as kubectl prints them: the page
+            // reads the cluster through the same tool a person would.
+            ("GET", "/api/kube") => {
+                return self.run_cli(
+                    stream,
+                    &["kube", "kubectl", "get", "nodes,pods", "-A", "-o", "json"],
+                );
+            }
+            ("POST", "/api/kube/up") => return self.run_cli(stream, &["kube", "up"]),
+            ("POST", "/api/kube/down") => return self.run_cli(stream, &["kube", "down"]),
             ("GET", "/api/extensions") => {
                 return self.run_cli(stream, &["extension", "ls", "--json"]);
             }

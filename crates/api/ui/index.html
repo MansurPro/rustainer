@@ -245,6 +245,7 @@
     <button data-view="builds">Builds</button>
     <button data-view="volumes">Volumes</button>
     <button data-view="mcp">MCP</button>
+    <button data-view="kube">Kubernetes</button>
     <button data-view="extensions">Extensions</button>
   </nav>
   <div class="spacer"></div>
@@ -287,6 +288,21 @@
     <div class="card">
       <h2>Networks</h2>
       <div id="networks"></div>
+    </div>
+  </section>
+
+  <section id="view-kube" hidden>
+    <div class="card">
+      <h2>Kubernetes <span id="kube-state" class="dim" style="text-transform:none;letter-spacing:0"></span>
+        <span class="spacer"></span>
+        <button class="act" id="kube-up">Start cluster</button>
+        <button class="act danger" id="kube-down" hidden>Stop cluster</button>
+      </h2>
+      <div class="hint" style="padding:10px 14px;border-bottom:1px solid var(--line);margin:0">
+        A single-node k3s cluster in one <span class="mono">--privileged</span> container of this engine. Its data is a volume, so stopping
+        and starting keeps the cluster. <span class="mono">rustainer kube kubectl …</span> is kubectl; <span class="mono">rustainer kube config</span>
+        prints a kubeconfig. Needs root on a Linux host.</div>
+      <div id="kube"></div>
     </div>
   </section>
 
@@ -448,7 +464,7 @@ const ago = (secs) => {
 };
 
 // --- state --------------------------------------------------------------
-const VIEWS = ["containers", "stacks", "networks", "events", "images", "builds", "volumes", "mcp", "extensions"];
+const VIEWS = ["containers", "stacks", "networks", "events", "images", "builds", "volumes", "mcp", "kube", "extensions"];
 let view = "containers";
 let filter = "";
 let openRow = null;           // container id whose detail panel is open
@@ -1850,6 +1866,58 @@ function renderNetworks(list) {
   box.replaceChildren(t);
 }
 
+let kubeBusy = null;   // "starting" / "stopping" while a request is out
+for (const [id, action, label] of [["kube-up", "up", "starting"], ["kube-down", "down", "stopping"]]) {
+  $("#" + id).onclick = async () => {
+    kubeBusy = label; renderKube(null);
+    const r = await post("/api/kube/" + action);
+    logCommand(["kube", action], r);
+    kubeBusy = null; refresh();
+  };
+}
+function renderKube(doc) {
+  const box = $("#kube"), up = $("#kube-up"), down = $("#kube-down");
+  const items = (doc && doc.items) || [];
+  const running = !!doc;
+  up.hidden = running; down.hidden = !running;
+  up.disabled = down.disabled = !!kubeBusy;
+  $("#kube-state").textContent = kubeBusy ? "· " + kubeBusy + "…" : running ? "· running" : "· not running";
+  if (kubeBusy === "starting") {
+    box.replaceChildren(el("div", { className: "empty" }, "Starting the node and waiting for it to be Ready. The first start pulls the image."));
+    return;
+  }
+  if (!running) {
+    box.replaceChildren(el("div", { className: "empty" }, "No cluster is running."));
+    return;
+  }
+  const nodes = items.filter((i) => i.kind === "Node"), pods = items.filter((i) => i.kind === "Pod");
+  const ready = (conds) => (conds || []).some((c) => c.type === "Ready" && c.status === "True");
+  const age = (t) => ago(Date.parse(t) / 1000);
+  const table = (heads, rows) => el("table", {}, [
+    el("thead", {}, el("tr", {}, heads.map((h) => el("th", {}, h)))), el("tbody", {}, rows)]);
+  box.replaceChildren(
+    table(["Node", "", "Version", "Age"], nodes.map((n) => el("tr", {}, [
+      el("td", { className: "mono" }, n.metadata.name),
+      el("td", {}, el("span", { className: "pill " + (ready(n.status.conditions) ? "h-healthy" : "h-unhealthy") },
+        [el("span", { className: "dot" }), ready(n.status.conditions) ? "Ready" : "NotReady"])),
+      el("td", { className: "mono dim" }, (n.status.nodeInfo || {}).kubeletVersion || ""),
+      el("td", { className: "mono dim" }, age(n.metadata.creationTimestamp)),
+    ]))),
+    table(["Namespace", "Pod", "", "Restarts", "Address", "Age"], pods.map((p) => {
+      const cs = p.status.containerStatuses || [];
+      const ok = p.status.phase === "Running" && cs.every((c) => c.ready);
+      return el("tr", {}, [
+        el("td", { className: "mono dim" }, p.metadata.namespace),
+        el("td", { className: "mono" }, p.metadata.name),
+        el("td", {}, el("span", { className: "pill " + (ok ? "h-healthy" : p.status.phase === "Pending" ? "h-starting" : "h-unhealthy") },
+          [el("span", { className: "dot" }), cs.filter((c) => c.ready).length + "/" + cs.length + " " + p.status.phase])),
+        el("td", { className: "mono dim" }, String(cs.reduce((n, c) => n + (c.restartCount || 0), 0))),
+        el("td", { className: "mono dim" }, p.status.podIP || "—"),
+        el("td", { className: "mono dim" }, age(p.metadata.creationTimestamp)),
+      ]);
+    })));
+}
+
 let openExtension = null;
 function renderExtensions(list) {
   const box = $("#extensions"), frame = $("#extension-frame");
@@ -2203,6 +2271,12 @@ async function refresh() {
     renderEvents(Array.isArray(evs) ? evs : []);
   } else if (view === "mcp") {
     await loadMcp();
+  } else if (view === "kube") {
+    if (kubeBusy) return;
+    const r = await api("/api/kube");
+    let doc = null;
+    try { if (r.ok !== false) doc = JSON.parse(r.stdout); } catch { /* not running */ }
+    renderKube(doc);
   } else if (view === "extensions") {
     const r = await api("/api/extensions");
     let list = [];

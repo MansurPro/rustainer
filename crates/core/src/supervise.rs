@@ -161,6 +161,16 @@ pub struct Config {
     /// "unspecified" the moment it passed through the config file.
     #[serde(default)]
     pub seccomp_unconfined: bool,
+    /// `--privileged`: this container is not confined.
+    ///
+    /// Every capability, no syscall filter, nothing in `/proc` masked,
+    /// `/sys` and its own cgroup writable, and the host's kernel-log,
+    /// fuse, loop and tun devices. It is what a container needs in
+    /// order to BE a container engine or a node - and it is root on the
+    /// host in every way that matters, which is why it is one explicit
+    /// flag and not a set of knobs that could be reached by accident.
+    #[serde(default)]
+    pub privileged: bool,
     #[serde(default)]
     pub workdir: Option<String>,
     /// Extracted layer directories, lowest first. Empty means `rootfs` is
@@ -308,12 +318,14 @@ impl Config {
             memory: self.memory,
             cpus: self.cpus,
             pids: self.pids,
+            all_controllers: self.privileged,
         }
     }
 
     /// The resolved security posture, compiled parent-side.
     pub fn security(&self) -> Result<Security, Error> {
         let keep = match &self.capabilities {
+            _ if self.privileged => CapabilitySet::all(),
             None => security::default_capabilities(),
             Some(names) => {
                 let mut set = CapabilitySet::empty();
@@ -330,7 +342,7 @@ impl Config {
                 set
             }
         };
-        let profile = if self.seccomp_unconfined {
+        let profile = if self.seccomp_unconfined || self.privileged {
             None
         } else {
             match &self.seccomp {
@@ -458,14 +470,19 @@ impl Config {
         } else {
             Privileges::probe()
         };
-        Ok(Some(mount::plan(
+        let plan = mount::plan(
             Path::new(r),
             privs,
             cgroup_dir,
             overlay.as_ref(),
             &binds,
             &self.volumes,
-        )?))
+        )?;
+        Ok(Some(if self.privileged {
+            plan.privileged()
+        } else {
+            plan
+        }))
     }
 }
 
@@ -1558,6 +1575,7 @@ mod tests {
             memory: None,
             cpus: None,
             pids: None,
+            privileged: false,
             capabilities: None,
             user: None,
             seccomp: None,

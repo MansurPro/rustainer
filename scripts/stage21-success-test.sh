@@ -220,6 +220,10 @@ COPY greeting.txt /g.txt
 EOF
 timeout 600 "$B" build --network none -t rep:1 "$CTX" >/dev/null 2>&1
 BEFORE=$(find "$RUSTAINER_IMAGE_ROOT"/layers* -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+# A second later, on purpose. A tar header holds whole seconds, so two
+# builds inside one second agree by accident - which is how a layer that
+# recorded the time of the copy passed this check on a fast machine.
+sleep 1.1
 timeout 600 "$B" build --network none -t rep:2 "$CTX" >/dev/null 2>&1
 AFTER=$(find "$RUSTAINER_IMAGE_ROOT"/layers* -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
 check "rebuilding adds no new layer" "$AFTER" "$BEFORE"
@@ -251,6 +255,7 @@ if [ "${#F1}" -eq 36 ] && [ "${#S1}" -eq 36 ] && [ "$F1" != "$S1" ]; then
 else
     bad "each step wrote a value of its own (got '$F1' and '$S1')"
 fi
+sleep 1.1   # see section 7: across a second boundary, or it proves nothing
 OUT=$(timeout 600 "$B" build --network none -t kc:2 "$K" 2>&1)
 contains "the second build says what it reused" "$OUT" "2 step(s) reused"
 check "and the first step really did not run again" "$(kval kc:2 /first)" "$F1"
@@ -283,6 +288,20 @@ if [ "$(kval kc:6 /first)" != "$F1" ] && [ -n "$(kval kc:6 /first)" ]; then
 else
     bad "--no-cache runs every step again (got '$(kval kc:6 /first)')"
 fi
+
+echo
+echo "7c. What follows the image name is arguments to its ENTRYPOINT"
+# Docker's rule, and the one every image with an entrypoint is written
+# for: `run image a b` is `<entrypoint> a b`, and CMD is only the default
+# arguments. This engine used to replace the entrypoint too.
+N="$SCRATCH/epctx"; mkdir -p "$N"
+printf 'FROM %s\nENTRYPOINT ["/bin/echo", "entry"]\nCMD ["default-arg"]\n' "$IMG" > "$N/Dockerfile"
+timeout 600 "$B" build --network none -t ep:1 "$N" >/dev/null 2>&1
+epr() { timeout 60 "$B" run --network none "$@" 2>/dev/null | tail -1; }
+check "with no arguments, CMD supplies them" "$(epr ep:1)" "entry default-arg"
+check "arguments replace CMD and keep the entrypoint" "$(epr ep:1 one two)" "entry one two"
+check "--entrypoint replaces it, and drops CMD with it" "$(epr --entrypoint /bin/pwd ep:1)" "/"
+check "an empty --entrypoint makes the arguments the whole command" "$(epr --entrypoint "" ep:1 /bin/echo bare)" "bare"
 
 echo
 echo "8. The built image is an ordinary image"

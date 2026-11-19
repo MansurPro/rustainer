@@ -198,16 +198,19 @@ echo "6. USER by name, resolved against the CONTAINER's /etc/passwd"
 # than the image asked for.
 if pull_or_report "the prometheus image" quay.io/prometheus/prometheus:v3.1.0; then
     PROM=$PULLED
+    # `--entrypoint`, because this image HAS one: what follows the image
+    # name is arguments to `prometheus`, as it is in Docker, and asking
+    # prometheus to parse "/bin/busybox id" tests nothing about users.
     if [ "$IN_USERNS" = yes ]; then
         # A single-ID user namespace maps exactly one id, so 65534 is not
         # reachable however correctly we resolved it. The refusal naming
         # 65534 is the stronger assertion anyway: it can only say that
         # number if it looked `nobody` up in the image's own /etc/passwd.
         contains "USER nobody is RESOLVED, then refused for want of a mapping" \
-            "$(R "$PROM" /bin/busybox id)" "uid 65534"
+            "$(R --entrypoint /bin/busybox "$PROM" id)" "uid 65534"
     else
         contains "an image that sets USER nobody runs as nobody" \
-            "$(R "$PROM" /bin/busybox id)" "uid=65534"
+            "$(R --entrypoint /bin/busybox "$PROM" id)" "uid=65534"
     fi
 fi
 if pull_or_report "the nginx image" nginx:1.27-alpine; then
