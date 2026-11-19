@@ -342,8 +342,8 @@ enum StackCmd {
     Ps(StackArgs),
     /// Rebuild or restart services when their files change.
     ///
-    /// Compose's `develop.watch`, in the two actions that can be
-    /// honoured honestly: `rebuild` and `restart`. Polls mtimes rather
+    /// Compose's `develop.watch`: `rebuild`, `restart`, and `sync`,
+    /// which copies changed files into the running container. Polls mtimes rather
     /// than subscribing to inotify - a watch that misses an event is
     /// worse than one that notices a second late, and inotify's queue
     /// overflows silently under a build that touches a thousand files.
@@ -1863,6 +1863,134 @@ fn tree_stamp(root: &Path) -> (u64, u64) {
 /// Watch the declared paths and rebuild or restart when they change.
 ///
 /// Runs until interrupted, like `compose watch`.
+/// What a `sync` watch remembers about each file: enough to tell that
+/// it changed. Per file rather than "newer than the last pass", because
+/// a file moved into the tree keeps its old mtime and is still new.
+type Seen = std::collections::HashMap<PathBuf, (Option<std::time::SystemTime>, u64)>;
+
+/// The regular files under `root`, relative to it. Symlinks are not
+/// followed and not copied: where one points means something different
+/// inside the container, and guessing is how a sync copies the wrong
+/// file.
+fn sync_scan(root: &Path) -> Seen {
+    fn walk(root: &Path, dir: &Path, out: &mut Seen) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                walk(root, &e.path(), out);
+            } else if md.is_file()
+                && let Ok(rel) = e.path().strip_prefix(root)
+            {
+                out.insert(rel.to_path_buf(), (md.modified().ok(), md.len()));
+            }
+        }
+    }
+    let mut out = Seen::new();
+    if root.is_file() {
+        if let (Ok(md), Some(name)) = (std::fs::metadata(root), root.file_name()) {
+            out.insert(PathBuf::from(name), (md.modified().ok(), md.len()));
+        }
+    } else {
+        walk(root, root, &mut out);
+    }
+    out
+}
+
+/// Copy `rels` from `src` into a running container at `target`.
+///
+/// Written through `/proc/<pid>/root`, with every directory resolved by
+/// `openat2(RESOLVE_IN_ROOT)`: the destination tree belongs to the
+/// container, and a symlink it planted at `/app/x -> /etc` must land
+/// the copy in ITS `/etc`, never the host's. Each file is written
+/// beside its destination and renamed over it, so a reader in the
+/// container sees the old file or the new one and never half of
+/// either, and a symlink sitting at the final name is replaced rather
+/// than followed.
+///
+/// Returns how many arrived. One file that cannot be written - the
+/// planted-symlink case above, or a read-only mount - is reported and
+/// does not hold up the rest of the batch.
+fn sync_into(pid: i32, src: &Path, target: &str, rels: &[PathBuf]) -> Result<usize> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = rustix::fs::open(
+        format!("/proc/{pid}/root"),
+        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("opening the container's filesystem")?;
+    let inside = |rel: &Path| {
+        rustix::fs::openat2(
+            &root,
+            if rel.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                rel
+            },
+            OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
+        )
+    };
+    let single = src.is_file();
+    let mut done = 0;
+    for rel in rels {
+        let one = || -> Result<()> {
+            let from = if single {
+                src.to_path_buf()
+            } else {
+                src.join(rel)
+            };
+            let dest = Path::new(target.trim_start_matches('/')).join(rel);
+            let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
+                return Ok(());
+            };
+            // mkdir -p, one component at a time, each one looked up from
+            // the root again so the confinement holds at every step.
+            let mut walked = PathBuf::new();
+            for comp in parent.components() {
+                let here = inside(&walked).with_context(|| format!("/{}", walked.display()))?;
+                match rustix::fs::mkdirat(&here, comp.as_os_str(), Mode::from_bits_truncate(0o755))
+                {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => bail!("creating /{}: {e}", walked.join(comp).display()),
+                }
+                walked.push(comp);
+            }
+            let dir = inside(parent).with_context(|| format!("/{}", parent.display()))?;
+            let mode = std::fs::metadata(&from)
+                .map(|m| m.permissions().mode())
+                .unwrap_or(0o644);
+            let tmp = format!(".{}.rustainer-sync", name.to_string_lossy());
+            let _ = rustix::fs::unlinkat(&dir, tmp.as_str(), rustix::fs::AtFlags::empty());
+            let fd = rustix::fs::openat(
+                &dir,
+                tmp.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_bits_truncate(mode & 0o7777),
+            )
+            .with_context(|| format!("writing /{}", dest.display()))?;
+            let mut out = std::fs::File::from(fd);
+            std::io::copy(&mut std::fs::File::open(&from)?, &mut out)
+                .with_context(|| format!("copying {}", from.display()))?;
+            // The mode again, explicitly: the create was subject to our umask.
+            let _ = out.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777));
+            rustix::fs::renameat(&dir, tmp.as_str(), &dir, name)
+                .with_context(|| format!("replacing /{}", dest.display()))?;
+            Ok(())
+        };
+        match one() {
+            Ok(()) => done += 1,
+            Err(e) => eprintln!("rustainer: sync: {}: {e:#}", rel.display()),
+        }
+    }
+    Ok(done)
+}
+
 fn stack_watch(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitCode> {
     let base = files
         .first()
@@ -1870,6 +1998,7 @@ fn stack_watch(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<Ex
         .unwrap_or(Path::new("."))
         .to_path_buf();
     let mut watched: Vec<(String, stack::Watch, PathBuf, (u64, u64))> = Vec::new();
+    let mut seen: std::collections::HashMap<PathBuf, Seen> = std::collections::HashMap::new();
     for (name, svc) in &st.services {
         for w in &svc.watch {
             let p = base.join(&w.path);
@@ -1881,6 +2010,9 @@ fn stack_watch(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<Ex
             }
             let stamp = tree_stamp(&p);
             println!("watching {} for {name} ({})", p.display(), w.action);
+            if w.action == "sync" {
+                seen.insert(p.clone(), sync_scan(&p));
+            }
             watched.push((name.clone(), w.clone(), p, stamp));
         }
     }
@@ -1898,6 +2030,33 @@ fn stack_watch(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<Ex
         // sees a half-written tree.
         let mut hit: Vec<(String, String)> = Vec::new();
         for (name, w, path, stamp) in &mut watched {
+            if w.action == "sync" {
+                // No container is replaced, so there is nothing to
+                // collect for later: copy what differs, now.
+                let now = sync_scan(path);
+                let before = seen.insert(path.clone(), now.clone()).unwrap_or_default();
+                let changed: Vec<PathBuf> = now
+                    .iter()
+                    .filter(|(rel, meta)| before.get(*rel) != Some(meta))
+                    .map(|(rel, _)| rel.clone())
+                    .collect();
+                if changed.is_empty() {
+                    continue;
+                }
+                let target = w.target.as_deref().unwrap_or("/");
+                for id in st.container_names(name) {
+                    let pid = State::load(paths, &id)
+                        .ok()
+                        .filter(|s| s.observed_status() == Status::Running)
+                        .and_then(|s| s.init_pid);
+                    let Some(pid) = pid else { continue };
+                    match sync_into(pid, path, target, &changed) {
+                        Ok(n) => println!("sync: {n} file(s) into {id}:{target}"),
+                        Err(e) => eprintln!("rustainer: sync into {id}: {e:#}"),
+                    }
+                }
+                continue;
+            }
             let now = tree_stamp(path);
             if now != *stamp {
                 *stamp = now;

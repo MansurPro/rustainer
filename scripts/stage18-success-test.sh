@@ -522,5 +522,51 @@ wait "$WPID" 2>/dev/null
 timeout 300 "$B" stack down -t 0 -f "$W/rustainer.toml" >/dev/null 2>&1
 
 echo
+echo "14. watch syncs files into a running container, and only into it"
+# Compose's third action. The container is NOT replaced - same pid before
+# and after - and the destination tree is the container's, so a link it
+# planted there must not steer the copy onto the host.
+Y="$SCRATCH/sync"
+mkdir -p "$Y/src/sub" "$Y/src/trap" "$Y/hostdir"
+echo "one" > "$Y/src/a.txt"
+cat > "$Y/rustainer.toml" <<EOF
+name = "ystack"
+
+[services.app]
+image = "$IMG"
+command = ["/bin/sh", "-c", "mkdir -p /app && ln -s $Y/hostdir /app/trap && exec sleep 300"]
+
+[[services.app.watch]]
+path = "src"
+action = "sync"
+target = "/app"
+EOF
+printf 'name = "ns"\n\n[services.a]\nimage = "%s"\ncommand = ["/bin/true"]\n\n[[services.a.watch]]\npath = "src"\naction = "sync"\n' "$IMG" > "$Y/notarget.toml"
+refuses "sync without a target is refused by name" "needs a \`target\`" \
+    timeout 60 "$B" stack up -f "$Y/notarget.toml"
+timeout 300 "$B" stack up -f "$Y/rustainer.toml" >/dev/null 2>&1
+YPID=$("$B" ps | awk '$1 == "ystack-app" {print $3}')
+timeout 300 "$B" stack watch -f "$Y/rustainer.toml" > "$SCRATCH/sync.log" 2>&1 &
+WPID=$!
+sleep 3
+echo "two" > "$Y/src/a.txt"
+echo "deep" > "$Y/src/sub/b.txt"
+echo "escaped" > "$Y/src/trap/c.txt"
+for _ in $(seq 30); do
+    OUT=$(timeout 60 "$B" exec ystack-app /bin/cat /app/sub/b.txt 2>/dev/null | tail -1)
+    [ "$OUT" = "deep" ] && break
+    sleep 1
+done
+check "a changed file arrives" "$(timeout 60 "$B" exec ystack-app /bin/cat /app/a.txt 2>/dev/null | tail -1)" "two"
+check "and a new one in a new directory" "$OUT" "deep"
+check "without the container being replaced" "$("$B" ps | awk '$1 == "ystack-app" {print $3}')" "$YPID"
+sleep 2
+check "a link in the container does not send the copy to the host" "$(ls "$Y/hostdir" | wc -l | tr -d ' ')" "0"
+contains "and the watcher says what it did" "$(cat "$SCRATCH/sync.log")" "sync:"
+kill "$WPID" 2>/dev/null
+wait "$WPID" 2>/dev/null
+timeout 300 "$B" stack down -t 0 -f "$Y/rustainer.toml" >/dev/null 2>&1
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

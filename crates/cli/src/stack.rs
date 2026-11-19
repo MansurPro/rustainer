@@ -215,11 +215,11 @@ impl DependsOn {
 
 /// One watched path.
 ///
-/// Compose's `develop.watch` in the two actions that can be honoured
-/// honestly here. `sync` is not among them: copying files into a
-/// running container needs a way to write into its filesystem from
-/// outside, and this engine deliberately has no `cp`. Saying so beats
-/// a `sync` that silently rebuilds instead.
+/// Compose's `develop.watch`, all three actions. `sync` was refused
+/// for a long time, because copying into a running container needs a
+/// way to write into its filesystem from outside that a container
+/// cannot redirect; the confined path walk built for the file browser
+/// is that way, so it is here now.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Watch {
@@ -228,8 +228,14 @@ pub struct Watch {
     /// `rebuild` (the default) builds the image again and replaces the
     /// container; `restart` replaces the container without rebuilding,
     /// which is what a changed config file needs.
+    /// `sync` copies changed files into the running container at
+    /// `target` and restarts nothing.
     #[serde(default = "rebuild")]
     pub action: String,
+    /// Where in the container `path` goes. Required by `sync`, and
+    /// meaningless to the other two.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 fn rebuild() -> String {
@@ -352,13 +358,18 @@ impl Stack {
                 }
             }
             for w in &svc.watch {
-                if w.action != "rebuild" && w.action != "restart" {
+                if !["rebuild", "restart", "sync"].contains(&w.action.as_str()) {
                     bail!(
-                        "service {name:?}: {:?} is not a watch action. Use \"rebuild\" \
-                         or \"restart\". Compose's \"sync\" is not implemented: \
-                         copying into a running container needs a way to write into \
-                         its filesystem from outside, and there is none here.",
+                        "service {name:?}: {:?} is not a watch action. Use \"rebuild\", \
+                         \"restart\" or \"sync\".",
                         w.action
+                    );
+                }
+                if w.action == "sync" && !w.target.as_deref().is_some_and(|t| t.starts_with('/')) {
+                    bail!(
+                        "service {name:?} watches {:?} with action \"sync\", which needs \
+                         a `target`: the absolute path in the container to copy into.",
+                        w.path
                     );
                 }
                 if w.action == "rebuild" && svc.build.is_none() {
@@ -1060,14 +1071,28 @@ depends_on = ["db"]
 
     #[test]
     fn watch_actions_are_checked_against_what_the_service_can_do() {
-        // "sync" is Compose's third action and is refused by name,
-        // rather than quietly rebuilding instead.
+        // An action nobody has is refused by name, and "sync" has to
+        // say where in the container the files go.
         let e = Stack::parse(
             "name=\"x\"\n[services.a]\nimage=\"i\"\n\
-             [[services.a.watch]]\npath=\"src\"\naction=\"sync\"\n",
+             [[services.a.watch]]\npath=\"src\"\naction=\"mirror\"\n",
         )
         .unwrap_err();
         assert!(e.to_string().contains("not a watch action"), "{e}");
+        for target in ["", "target=\"app\"\n"] {
+            let e = Stack::parse(&format!(
+                "name=\"x\"\n[services.a]\nimage=\"i\"\n\
+                 [[services.a.watch]]\npath=\"src\"\naction=\"sync\"\n{target}"
+            ))
+            .unwrap_err();
+            assert!(e.to_string().contains("needs a `target`"), "{e}");
+        }
+        let s = Stack::parse(
+            "name=\"x\"\n[services.a]\nimage=\"i\"\n\
+             [[services.a.watch]]\npath=\"src\"\naction=\"sync\"\ntarget=\"/app\"\n",
+        )
+        .unwrap();
+        assert_eq!(s.services["a"].watch[0].target.as_deref(), Some("/app"));
 
         // "rebuild" on a service with nothing to build is a file that
         // cannot mean what it says.

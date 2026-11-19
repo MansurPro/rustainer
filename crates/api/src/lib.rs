@@ -489,8 +489,13 @@ impl Server {
 
     /// A container's filesystem as its own processes see it: through
     /// `/proc/<pid>/root`, which is the overlay, the volumes and the
-    /// tmpfs mounts already assembled. Only while it runs - a stopped
-    /// container has no mount namespace left to look into.
+    /// tmpfs mounts already assembled.
+    ///
+    /// A stopped container has no mount namespace left to look into, so
+    /// what is shown instead is its writable layer: exactly the files it
+    /// created or changed, without the image beneath them. That is less
+    /// than the whole tree and it is the part that is the container's
+    /// own - and the page says which of the two it is showing.
     fn container_files(
         &self,
         stream: &mut TcpStream,
@@ -502,11 +507,19 @@ impl Server {
             .filter(|st| st.observed_status() == Status::Running)
             .and_then(|st| st.init_pid);
         let Some(pid) = pid else {
-            return http::error(
-                stream,
-                409,
-                "files are readable only while the container runs",
-            );
+            let upper = Config::load(&self.paths, id)
+                .ok()
+                .and_then(|c| c.overlay_dir)
+                .map(|d| Path::new(&d).join("upper"))
+                .filter(|u| u.is_dir());
+            return match upper {
+                Some(u) => browse_reply(stream, &u, req),
+                None => http::error(
+                    stream,
+                    409,
+                    "this container has no files of its own to show",
+                ),
+            };
         };
         browse_reply(stream, Path::new(&format!("/proc/{pid}/root")), req)
     }
