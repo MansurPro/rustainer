@@ -88,6 +88,20 @@ enum Command {
     Push(PushArgs),
     /// List images in the local store.
     Images,
+    /// Look up an image's installed packages in the OSV vulnerability
+    /// database.
+    ///
+    /// Sends the **names and versions** of the packages to api.osv.dev,
+    /// and nothing else. Reads the distribution's package database, so
+    /// it sees `apk` and `dpkg` packages and not application
+    /// dependencies or anything RPM-based.
+    Scan {
+        /// An image already in the local store.
+        image: String,
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// List the tags a repository has in its registry.
     Tags {
         /// A repository, e.g. `alpine` or `ghcr.io/owner/name`.
@@ -628,6 +642,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Push(a) => cmd_push(&paths, a),
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
+        Command::Scan { image, json } => cmd_scan(&image, json),
         Command::Tags { repository } => {
             let r = rustainer_image::Reference::parse(&repository)
                 .map_err(|e| anyhow::anyhow!("{repository}: {e}"))?;
@@ -3055,6 +3070,77 @@ fn cmd_images() -> Result<ExitCode> {
     for (key, digest) in store.list()? {
         println!("{key:<48} {digest}");
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_scan(image: &str, as_json: bool) -> Result<ExitCode> {
+    use rustainer_image::osv;
+    let store = Store::new(Store::default_root());
+    let local = store
+        .local(image)
+        .with_context(|| format!("{image} is not in the local store. Pull it first."))?;
+    // Topmost layer first: the package database an upper layer wrote
+    // is the one the container would see.
+    let roots: Vec<String> = local
+        .layers
+        .iter()
+        .rev()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let os_release = read_from_layers(&roots, "etc/os-release");
+    let apk = osv::parse_apk(&read_from_layers(&roots, "lib/apk/db/installed"));
+    let packages = if apk.is_empty() {
+        osv::parse_dpkg(&read_from_layers(&roots, "var/lib/dpkg/status"))
+    } else {
+        apk
+    };
+    if packages.is_empty() {
+        bail!(
+            "{image} has no apk or dpkg package database, so there is nothing to look up. \
+             That is not the same as having no vulnerabilities."
+        );
+    }
+    let Some(ecosystem) = osv::ecosystem(&os_release) else {
+        bail!(
+            "{image} has {} packages, but its /etc/os-release does not name a release \
+             OSV has advisories for (Alpine, Debian and Ubuntu are supported).",
+            packages.len()
+        );
+    };
+    let base = std::env::var("RUSTAINER_OSV_URL").unwrap_or_else(|_| "https://api.osv.dev".into());
+    if !as_json {
+        eprintln!(
+            "sending {} package names and versions ({ecosystem}) to {base}",
+            packages.len()
+        );
+    }
+    let report = osv::scan(&base, &ecosystem, &packages).map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!("{report}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let findings = report["findings"].as_array().cloned().unwrap_or_default();
+    println!(
+        "{:<6} {:<22} {:<24} {:<20} FIXED IN",
+        "SCORE", "ID", "PACKAGE", "INSTALLED"
+    );
+    for f in &findings {
+        println!(
+            "{:<6} {:<22} {:<24} {:<20} {}",
+            f["score"]
+                .as_f64()
+                .map_or("-".into(), |s| format!("{s:.1}")),
+            f["cve"].as_str().or(f["id"].as_str()).unwrap_or("?"),
+            f["package"].as_str().unwrap_or("?"),
+            f["version"].as_str().unwrap_or("?"),
+            f["fixed"].as_str().unwrap_or("-"),
+        );
+    }
+    println!(
+        "{} packages, {} known vulnerabilities",
+        packages.len(),
+        findings.len()
+    );
     Ok(ExitCode::SUCCESS)
 }
 

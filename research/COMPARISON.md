@@ -652,7 +652,7 @@ The tables below are corrected against that.
 | Pull | yes | yes |
 | Size | on disk | compressed layers, labelled |
 | Layers and history | each layer with its command and size, grouped by base image | per-layer sizes and the build history, as two lists |
-| Packages and CVEs (Scout) | yes | **no** |
+| Packages and CVEs | Scout: OS and application packages, grouped by layer | a scan against OSV: the distribution's packages only (apk, dpkg), not grouped by layer |
 | Push from the UI | yes | yes, with the credentials the server was started with |
 | Registry | "My Hub": your repositories | the tags of any repository you name; no account view |
 
@@ -693,13 +693,26 @@ because an archive is hostile input whoever made it - stage 17 imports
 one whose entry is named `../../outside-volume` and asserts nothing
 appears there.
 
-What is still missing, and is not close: **package and CVE data**, which
-needs a vulnerability database this project does not have; an account's
-own repositories. Editing a file, the memory, network and disk charts, log
-timestamps and a registry tag list followed in later passes. The
-timestamps are kept in an index beside each log rather than in it, so
-`logs` still prints byte for byte what the container wrote. It is nearer parity than it was, and
-it is not parity.
+**A scan** came last, because it is the one feature here that talks to
+a third party. `rustainer scan <image>` reads the image's own package
+database and asks OSV about each package; what it sends is a package
+name, a release and a version, and stage 22 asserts exactly that against
+a stand-in server - no image name, path, digest or hostname in any
+request. For `nginx:1.27-alpine` it reports 142 known vulnerabilities in
+58 packages in about five seconds, worst first, each with the release it
+is fixed in.
+
+Its limits are the limits of what it reads. It sees `apk` and `dpkg`
+packages on Alpine, Debian and Ubuntu; it does not see application
+dependencies, statically linked binaries, or anything RPM-based, and an
+image with no package database is reported as having nothing to look up
+rather than nothing wrong. Scout sees more, and attributes each finding
+to the layer that introduced it.
+
+What is still missing: an account's own repositories; search, filters
+and bulk selection on the lists; a disk-used total; marking what a
+running container changed against its image; and axes on the charts. It
+is nearer parity than it was, and it is not parity.
 
 ### What the page does that is worth something
 

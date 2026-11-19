@@ -60,6 +60,7 @@ mkdir -p "$RUSTAINER_IMAGE_ROOT"
 REG_PID=
 cleanup() {
     [ -n "$REG_PID" ] && kill "$REG_PID" 2>/dev/null
+    [ -n "${OSV_PID:-}" ] && kill "$OSV_PID" 2>/dev/null
     "$B" ps -a 2>/dev/null | tail -n +2 | awk '{print $1}' \
         | while read -r c; do [ -n "$c" ] && "$B" rm --force "$c" >/dev/null 2>&1; done
     if [ "$MOUNTED_TMPFS" = yes ]; then
@@ -97,6 +98,40 @@ CMD ["/bin/sh", "-c", "cat /payload.txt; echo \$PUSHED"]
 EOF
 timeout 600 "$B" build -t local/pushable:1 "$CTX" >/dev/null 2>&1 \
     || { echo "the build failed" >&2; exit 2; }
+
+echo
+echo "0. A scan asks about packages, and says nothing else"
+# Against a stand-in for api.osv.dev, so this needs no network and the
+# answer is known. What the stand-in logs is the half worth asserting:
+# a scanner's job is to tell a third party something, and the claim is
+# that it tells them package names and versions and nothing more.
+OPORT=$((36000 + ($$ % 12000)))
+python3 scripts/fake-osv.py "$SCRATCH/osv.log" "$OPORT" > "$SCRATCH/osv.out" 2>&1 &
+OSV_PID=$!
+for _ in $(seq 60); do grep -q '^ready ' "$SCRATCH/osv.out" 2>/dev/null && break; sleep 0.2; done
+SCAN=$(RUSTAINER_OSV_URL="http://127.0.0.1:$OPORT" timeout 120 "$B" scan --json local/pushable:1 2>&1)
+contains "the release is read from the image" "$SCAN" '"ecosystem":"Alpine:v3.21"'
+contains "the one known flaw is found" "$SCAN" '"id":"FAKE-2026-0001"'
+contains "under the name people search for" "$SCAN" '"cve":"CVE-2026-0001"'
+contains "with a score computed from its vector" "$SCAN" '"score":9.8'
+contains "and the fix for THIS release, not another" "$SCAN" '"fixed":"9.9.9-r0"'
+SENT=$(cat "$SCRATCH/osv.log" 2>/dev/null)
+contains "package names were sent" "$SENT" '"name":"busybox"'
+LEAK=
+for needle in "pushable" "$SCRATCH" "sha256" "payload" "$(hostname)"; do
+    case "$SENT" in *"$needle"*) LEAK="$LEAK $needle" ;; esac
+done
+check "and no image name, path, digest or host" "$LEAK" ""
+KEYS=$(python3 -c 'import json,sys
+keys=set()
+for line in open(sys.argv[1]):
+    for q in json.loads(line)["queries"]:
+        keys |= set(q) | {"package."+k for k in q["package"]}
+print(",".join(sorted(keys)))' "$SCRATCH/osv.log")
+check "a query is a name, a release and a version" "$KEYS" "package,package.ecosystem,package.name,version"
+kill "$OSV_PID" 2>/dev/null
+refuses "an image that was never pulled cannot be scanned" "not in the local store" \
+    "$B" scan nosuchimage:9
 
 echo
 echo "1. Refusals before any bytes move"
