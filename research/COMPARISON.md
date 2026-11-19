@@ -624,7 +624,6 @@ present in the installed version.
 | Remove unused | bulk select, shows space reclaimed | two-click "remove unused", no space figure |
 | Run from an image, with options | yes | yes, the same dialog as Run |
 | Pull | yes | yes |
-| Build | no (CLI) | yes |
 | Size | on disk | compressed layers, labelled |
 | Layers and history | yes, per layer | count only |
 | Packages and CVEs (Scout) | yes | **no** |
@@ -657,9 +656,9 @@ present in the installed version.
 | Start / stop / restart / delete | yes | yes |
 
 So the honest reading is not parity. The page has the working core of
-all three screens and two things Docker Desktop does not document -
-build from the Images screen, and a stopped container's files - and it
-is missing the registry and vulnerability side of Images, every volume
+all three screens and one thing those pages do not describe - a stopped
+container's files, where Docker documents the Files tab for running
+containers - and it is missing the registry and vulnerability side of Images, every volume
 operation beyond delete, file editing, log search, and network and disk
 statistics. Those are a list of what to build, not a rounding error.
 
