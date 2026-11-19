@@ -121,6 +121,48 @@ the variance is the internet's, so treat this as "not slower" rather than as a
 result. Both engines fetch the same bytes from the same host; the difference
 is in how much work happens between them.
 
+### Build — 2.8 to 3.5×, and parity against a warm cache
+
+Measured later than the rows above, with `scripts/bench-build-net.sh`,
+because a comparison that only times process start-up is a comparison
+of the one thing this architecture is good at. Three runs, ten builds
+each, of a five-step Dockerfile with no network:
+
+| measurement | rustainer | Docker | ratio |
+|---|---:|---:|---:|
+| build, no cache (median) | 57–77 ms | 198–215 ms | **2.8–3.5×** |
+| rebuild with nothing changed | 57–77 ms | 71–74 ms (cached) | 0.9–1.3× |
+
+The first row is the same advantage as everywhere else: each `RUN` is a
+container start, and that is what is fast here. The second row is the
+one to read. **This engine has no layer cache**: it does every step
+again every time, and it ties with Docker's cache only because the steps
+in this file take milliseconds. A build that compiles something for a
+minute is a minute here on every rebuild and a fraction of a second in
+Docker when nothing changed. For real builds, Docker's cache wins, and
+by as much as the build is long.
+
+### Network — the same
+
+| measurement | rustainer | Docker | ratio |
+|---|---:|---:|---:|
+| container to container, 1 GiB | 846–951 MiB/s | 635–939 MiB/s | 1.0–1.3× |
+| host to a published port, 1 GiB | 1159–1289 MiB/s | 1049–1210 MiB/s | 1.0–1.1×  |
+
+No difference, which is the expected and the correct result. A packet
+between two containers crosses a veth pair and a bridge in the kernel,
+and it does that identically whoever created them; neither engine is in
+the data path. The one 1.3× is the first run of three and did not
+repeat - the other two were 950 against 939 - so it is noise, and is
+left in the range rather than trimmed out of it.
+
+So the honest summary of "how much better" is not one number. Starting,
+stopping and inspecting containers is **2.4 to 9.7 times faster** and
+uses a fraction of the memory, because there is no daemon in the way.
+Moving bytes is **the same**, because the kernel does it. And building
+is faster cold and **slower in practice** for anything that benefits
+from a cache.
+
 ---
 
 ## 4. What the measurement found
@@ -764,6 +806,7 @@ chart axes were added after seeing the application have them.
 # Sections 6 and 7 run on the same host as section 2:
 #   docker exec -e RUSTAINER_BIN=/w/rustainer-musl bench bash scripts/compat-matrix.sh
 #   docker exec -e RUSTAINER_BIN=/w/rustainer-musl bench bash scripts/stack-bench.sh
+#   docker exec -e RUSTAINER_BIN=/w/rustainer-musl bench bash scripts/bench-build-net.sh
 
 # Build a static binary (any Linux host with a toolchain can skip the container)
 docker run --rm --platform linux/arm64 -v "$PWD":/w -w /w \
