@@ -114,7 +114,7 @@
 
   .pill {
     display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px;
-    border-radius: 999px; font-size: 11.5px; font-weight: 500;
+    border-radius: 999px; font-size: 11.5px; font-weight: 500; white-space: nowrap;
     background: var(--panel-2); border: 1px solid var(--line);
   }
   .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
@@ -300,6 +300,7 @@
         <input id="pullref" placeholder="alpine:3.21" style="width: 200px; padding: 3px 8px; font-size: 12px;">
         <button class="act" id="pull">Pull</button>
         <button class="act" id="build">Build…</button>
+        <button class="act danger" id="prune-images" hidden></button>
       </h2>
       <div id="images"></div>
     </div>
@@ -307,7 +308,8 @@
 
   <section id="view-volumes" hidden>
     <div class="card">
-      <h2>Volumes</h2>
+      <h2>Volumes <span class="spacer"></span>
+        <button class="act danger" id="prune-volumes" hidden></button></h2>
       <div id="volumes"></div>
     </div>
   </section>
@@ -693,7 +695,7 @@ function buildDetail() {
     el("span", { className: "mono", style: "text-transform:none;letter-spacing:0;color:var(--text)" }, c.id),
     el("span", { className: "spacer" }),
   ]);
-  for (const name of ["logs", "terminal", "exec", "inspect"]) {
+  for (const name of ["logs", "terminal", "exec", "files", "inspect"]) {
     head.append(el("button", {
       className: "act", textContent: name,
       style: detailTab === name ? "border-color:var(--accent);color:var(--accent)" : "",
@@ -735,6 +737,10 @@ function buildDetail() {
         "One shot, output collected. Not a terminal — a pty needs a second protocol, " +
         "and `rustainer exec -it` already is one."));
     body.append(pad);
+  } else if (detailTab === "files") {
+    body.append(c.status === "running"
+      ? fileBrowser("/api/containers/" + c.id + "/files")
+      : el("div", { className: "empty" }, "Files are readable only while the container runs."));
   } else {
     body.append(inspectTable(c));
   }
@@ -1033,6 +1039,13 @@ function renderStacks(list) {
     }, [
       el("b", { className: "mono" }, name),
       el("span", { className: "pill" }, running + " / " + members.length + " running"),
+      el("span", { className: "spacer", style: "flex:1" }),
+      el("button", { className: "act", textContent: "stop all", disabled: !running,
+        onclick: (e) => each(e.target, members.filter((m) => m.status === "running"),
+          (m) => [["stop", "-t", "5", m.id], "/api/containers/" + m.id + "/stop", "POST"]) }),
+      el("button", { className: "act danger", textContent: "remove all",
+        onclick: (e) => each(e.target, members,
+          (m) => [["rm", "--force", m.id], "/api/containers/" + m.id, "DELETE"]) }),
     ]);
     const t = el("table");
     t.append(el("thead", {}, el("tr", {}, [
@@ -1069,27 +1082,150 @@ function renderStacks(list) {
   box.replaceChildren(wrap);
 }
 
+// One request per item, each logged as the command it was. Sequential:
+// the order in the command strip is then the order things happened in.
+async function each(button, items, call) {
+  button.disabled = true;
+  for (const i of items) {
+    const [argv, url, method] = call(i);
+    logCommand(argv, await api(url, { method }));
+  }
+  await refresh();
+}
+
+// "Remove unused", in two clicks instead of a confirm() box: the first
+// says how many, the second does it, and looking away disarms it.
+function pruneButton(button, unused, noun, call) {
+  button.hidden = !unused.length;
+  if (button.dataset.armed === "1") return;   // do not relabel under the cursor
+  button.disabled = false;
+  button.textContent = "remove " + unused.length + " unused";
+  button.onclick = () => {
+    button.dataset.armed = "1";
+    button.textContent = "really remove " + unused.length + " " + noun + "?";
+    const disarm = () => { button.dataset.armed = ""; };
+    button.onblur = disarm;
+    button.onclick = async () => { await each(button, unused, call); disarm(); };
+  };
+}
+
+// --- a file browser -----------------------------------------------------
+// One element per tree, kept: the lists around it are redrawn every two
+// seconds, and a browser that returned to "/" each time would be unusable.
+const browsers = new Map();
+function fileBrowser(base) {
+  if (browsers.has(base)) return browsers.get(base);
+  const crumbs = el("div", { className: "mono", style: "padding:8px 14px;border-bottom:1px solid var(--line)" });
+  const pane = el("div");
+  const box = el("div", {}, [crumbs, pane]);
+  browsers.set(base, box);
+  const go = async (path) => {
+    const parts = path.split("/").filter(Boolean);
+    crumbs.replaceChildren(el("button", { className: "act", textContent: "/", onclick: () => go("/") }));
+    parts.forEach((p, i) => crumbs.append(" ", el("button", {
+      className: "act", textContent: p, onclick: () => go("/" + parts.slice(0, i + 1).join("/")),
+    })));
+    const r = await api(base + "?path=" + encodeURIComponent(path));
+    if (r.kind === "dir") {
+      if (!r.entries.length) { pane.replaceChildren(el("div", { className: "empty" }, "Empty directory.")); return; }
+      const tb = el("tbody");
+      for (const e of r.entries) {
+        const child = "/" + [...parts, e.name].join("/");
+        // A link is followed by the server, inside the tree, so it is
+        // as clickable as what it points at.
+        const name = e.kind === "other" ? e.name : el("button", {
+          className: "act", style: "border-color:transparent;padding-left:0",
+          textContent: e.name + (e.kind === "dir" ? "/" : ""), onclick: () => go(child),
+        });
+        tb.append(el("tr", {}, [
+          el("td", { className: "mono" }, [name, e.target ? el("span", { className: "dim" }, " → " + e.target) : ""]),
+          el("td", { className: "mono dim" }, e.kind === "file" ? bytes(e.size) : e.kind),
+          el("td", { className: "mono dim hide-s" }, e.mode + "  " + e.uid + ":" + e.gid),
+          el("td", { className: "mono dim hide-s" }, ago(e.mtime)),
+        ]));
+      }
+      const t = el("table", {}, [el("thead", {}, el("tr", {}, [
+        el("th", {}, "Name"), el("th", {}, "Size"),
+        el("th", { className: "hide-s" }, "Mode, owner"), el("th", { className: "hide-s" }, "Modified"),
+      ])), tb]);
+      pane.replaceChildren(t, r.truncated
+        ? el("div", { className: "hint", style: "padding:8px 14px" }, "Only the first " + r.entries.length + " entries are shown.") : "");
+    } else if (r.kind === "file") {
+      pane.replaceChildren(
+        el("div", { className: "hint", style: "padding:8px 14px" },
+          bytes(r.size) + (r.binary ? ", binary — not shown" : r.truncated ? ", showing the first 64K" : "")),
+        r.binary ? "" : el("pre", { className: "log", textContent: r.text }));
+    } else {
+      pane.replaceChildren(el("div", { className: "empty" },
+        r.kind === "other" ? "Not a file or a directory (a device, socket or pipe)." : (r.error || "unreadable")));
+    }
+  };
+  go("/");
+  return box;
+}
+
+let openImage = null;   // reference whose details are shown
+let openVolume = null;  // name whose files are shown
+
+function usedPill(ids) {
+  return ids && ids.length
+    ? el("span", { className: "pill h-healthy", title: ids.join(", ") },
+        [el("span", { className: "dot" }), "in use · " + ids.length])
+    : el("span", { className: "pill" }, "unused");
+}
+
 function renderImages(list) {
   const box = $("#images");
+  pruneButton($("#prune-images"), list.filter((i) => i.used_by && !i.used_by.length), "images",
+    (i) => [["rmi", i.reference], "/api/images/" + encodeURIComponent(i.reference), "DELETE"]);
   if (!list.length) {
     box.replaceChildren(el("div", { className: "empty" }, "No images in the store. Pull one."));
     return;
   }
   const t = el("table");
   t.append(el("thead", {}, el("tr", {}, [
-    el("th", {}, "Reference"), el("th", { className: "hide-s" }, "Config digest"), el("th", {}, ""),
+    el("th", {}, "Reference"), el("th", {}, ""),
+    el("th", { title: "The compressed layers: what a pull transfers." }, "Size"),
+    el("th", { className: "hide-s" }, "Layers"), el("th", { className: "hide-s" }, "Created"),
+    el("th", { className: "hide-s" }, "Config digest"), el("th", {}, ""),
   ])));
   const body = el("tbody");
   for (const i of list) {
+    const inUse = i.used_by && i.used_by.length;
+    const created = i.created ? Date.parse(i.created) / 1000 : 0;
     body.append(el("tr", {}, [
-      el("td", { className: "mono truncate" }, i.reference),
+      el("td", { className: "mono truncate", title: i.reference }, i.name || i.reference),
+      el("td", {}, usedPill(i.used_by)),
+      el("td", { className: "mono dim" }, bytes(i.compressed_size)),
+      el("td", { className: "mono dim hide-s" }, String(i.layers ?? "—")),
+      el("td", { className: "mono dim hide-s", title: i.created || "" }, created > 0 ? ago(created) : "—"),
       el("td", { className: "mono dim truncate hide-s" }, i.digest),
-      el("td", {}, el("div", { className: "actions" }, el("button", {
-        className: "act danger", textContent: "remove",
-        onclick: (e) => act(e.target, ["rmi", i.reference],
-          "/api/images/" + encodeURIComponent(i.reference), "DELETE"),
-      }))),
+      el("td", {}, el("div", { className: "actions" }, [
+        el("button", { className: "act", textContent: "run",
+          onclick: () => { $("#new-container").click(); $("#dlg-body input").value = i.name || i.reference; } }),
+        el("button", { className: "act", textContent: "inspect",
+          onclick: () => { openImage = openImage === i.reference ? null : i.reference; renderImages(list); } }),
+        el("button", {
+          className: "act danger", textContent: "remove", disabled: !!inUse,
+          title: inUse ? "In use by " + i.used_by.join(", ") + ". Remove those first." : "",
+          onclick: (e) => act(e.target, ["rmi", i.reference],
+            "/api/images/" + encodeURIComponent(i.reference), "DELETE"),
+        }),
+      ])),
     ]));
+    if (openImage === i.reference) {
+      const facts = [
+        ["entrypoint", (i.entrypoint || []).join(" ")], ["cmd", (i.cmd || []).join(" ")],
+        ["working dir", i.working_dir], ["user", i.user], ["created", i.created],
+        ["used by", (i.used_by || []).join(", ")], ["env", (i.env || []).join("\n")],
+      ].filter(([, v]) => v);
+      const inner = el("table", {}, el("tbody", {}, facts.map(([k, v]) => el("tr", {}, [
+        el("td", { className: "dim nowrap", style: "width:150px" }, k),
+        el("td", { className: "mono", style: "white-space:pre-wrap" }, v),
+      ]))));
+      body.append(el("tr", {}, el("td", { colSpan: 7, style: "padding:0" },
+        facts.length ? inner : el("div", { className: "empty" }, "The image declares nothing."))));
+    }
   }
   t.append(body);
   box.replaceChildren(t);
@@ -1097,6 +1233,8 @@ function renderImages(list) {
 
 function renderVolumes(list) {
   const box = $("#volumes");
+  pruneButton($("#prune-volumes"), list.filter((v) => !v.used_by.length), "volumes",
+    (v) => [["volume", "rm", v.name], "/api/volumes/" + encodeURIComponent(v.name), "DELETE"]);
   if (!list.length) {
     box.replaceChildren(el("div", { className: "empty" },
       "No named volumes. One appears the first time you use -v name:/path."));
@@ -1104,20 +1242,35 @@ function renderVolumes(list) {
   }
   const t = el("table");
   t.append(el("thead", {}, el("tr", {}, [
-    el("th", {}, "Name"), el("th", {}, "Entries"), el("th", { className: "hide-s" }, "Path"), el("th", {}, ""),
+    el("th", {}, "Name"), el("th", {}, ""), el("th", {}, "Size"),
+    el("th", { className: "hide-s" }, "Entries"), el("th", { className: "hide-s" }, "Path"), el("th", {}, ""),
   ])));
   const body = el("tbody");
   for (const v of list) {
+    const inUse = v.used_by.length;
     body.append(el("tr", {}, [
       el("td", { className: "mono" }, v.name),
-      el("td", { className: "mono dim" }, String(v.entries)),
+      el("td", {}, usedPill(v.used_by)),
+      el("td", { className: "mono dim",
+                 title: v.size_partial ? "Too many files to count on every refresh; at least this much." : "" },
+        (v.size_partial ? "≥ " : "") + bytes(v.size)),
+      el("td", { className: "mono dim hide-s" }, String(v.entries)),
       el("td", { className: "mono dim truncate hide-s" }, v.path),
-      el("td", {}, el("div", { className: "actions" }, el("button", {
-        className: "act danger", textContent: "remove",
-        onclick: (e) => act(e.target, ["volume", "rm", v.name],
-          "/api/volumes/" + encodeURIComponent(v.name), "DELETE"),
-      }))),
+      el("td", {}, el("div", { className: "actions" }, [
+        el("button", { className: "act", textContent: "files",
+          onclick: () => { openVolume = openVolume === v.name ? null : v.name; renderVolumes(list); } }),
+        el("button", {
+          className: "act danger", textContent: "remove", disabled: !!inUse,
+          title: inUse ? "Mounted by " + v.used_by.join(", ") + ". Remove those first." : "",
+          onclick: (e) => act(e.target, ["volume", "rm", v.name],
+            "/api/volumes/" + encodeURIComponent(v.name), "DELETE"),
+        }),
+      ])),
     ]));
+    if (openVolume === v.name) {
+      body.append(el("tr", {}, el("td", { colSpan: 6, style: "padding:0" },
+        fileBrowser("/api/volumes/" + encodeURIComponent(v.name) + "/files"))));
+    }
   }
   t.append(body);
   box.replaceChildren(t);

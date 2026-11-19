@@ -575,6 +575,24 @@ versions carry an exec terminal and a file browser. Those may well be
 better than anything here. This document does not say otherwise, because
 it did not look.
 
+That comparison is still not made, and is tracked as issue #23 rather
+than left as a sentence. What changed is this side of it: the page now
+has the three things those screens are for, built without sight of the
+other one. Images show size, layer count, age, what the image declares
+and **which containers are using it**; volumes show size and who mounts
+them; both have a two-click "remove unused"; and a running container or
+a volume can be browsed file by file. The browser resolves every path
+with `openat2(RESOLVE_IN_ROOT)`, because the tree belongs to a
+container and a symlink in it is hostile input - stage 17 plants an
+absolute link and a climbing one at a host file and asserts neither is
+read. Building it found one engine bug: removing one of two tags for
+the same image deleted the record the other still needed.
+
+Stated as limits: an image's size is its **compressed** layers, not disk
+use; a volume's size stops counting at 20,000 entries and is then shown
+as a floor; a stopped container cannot be browsed; and there is still no
+`start` or `restart` for a container that has exited.
+
 ### What the page does that is worth something
 
 - **A real terminal into a container**, over a pty, from the browser.

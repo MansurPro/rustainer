@@ -131,6 +131,10 @@ fn two() -> u32 {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct ImageConfig {
+    /// When the image says it was built. Optional in the spec and absent
+    /// from reproducible builds, so nothing may depend on it.
+    #[serde(default)]
+    pub created: Option<String>,
     #[serde(default)]
     pub rootfs: RootFs,
     #[serde(default)]
