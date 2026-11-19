@@ -806,6 +806,20 @@ cache. It was not compared against Docker Desktop's Builds screen, which
 also shows per-step timings, logs and build provenance; this shows none
 of those.
 
+**MCP servers**, which Docker Desktop has as its MCP Toolkit. A server
+packaged as an image is a program that speaks a protocol on stdin and
+stdout, so running one needs nothing new except a thing this engine
+turned out not to have: `run -i` without a terminal left the container's
+stdin on `/dev/null`. With that fixed, `mcp/time` from Docker Hub
+completes the MCP handshake, lists its tools and answers a call, driven
+through a pipe. The page lists the hundred most pulled servers in Hub's
+`mcp` catalogue - Hub refuses an anonymous caller more than that - takes
+any other server by name, and gives the exact
+`mcpServers` entry a client wants, with secrets left as placeholders to
+fill in rather than written on a command line. What it does not have is
+Docker's **gateway**: one endpoint that fronts many servers, holds their
+secrets and handles their OAuth. Here each client starts its own.
+
 What is still missing is what needs an identity: private repositories,
 and anything else behind a Docker Hub sign-in. This has no notion of an
 account and was not given one. Search, bulk selection, totals, the added/modified marks and

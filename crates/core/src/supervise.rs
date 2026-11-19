@@ -223,6 +223,14 @@ pub struct Config {
     /// at all, and whether `^C` arrives as a signal or as the byte 0x03.
     #[serde(default)]
     pub tty: bool,
+    /// Connect the container's stdin to ours when there is no pty.
+    ///
+    /// `run -i` without `-t`: a pipe, not a terminal. It is how one
+    /// program drives another through a container - `echo x | run -i
+    /// image cmd`, and every tool that launches a server and speaks a
+    /// protocol to it over stdin and stdout.
+    #[serde(default)]
+    pub stdin_open: bool,
     /// Extra `/etc/hosts` entries: `(name, address)`.
     ///
     /// How a stack's services find each other. Not DNS - a resolver in
@@ -656,9 +664,21 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
                 stderr: slave.try_clone()?,
             },
             None => {
-                let devnull = sys::open_devnull()?;
+                // Our own stdin when asked, which the CLI handed us for
+                // exactly this; /dev/null otherwise, because a container
+                // is not entitled to the operator's keyboard by default.
+                // Only the first attempt: a restarted container cannot
+                // be given input that has already been read.
+                let stdin = if config.stdin_open && first_attempt {
+                    {
+                        use std::os::fd::AsFd;
+                        std::io::stdin().as_fd().try_clone_to_owned()?
+                    }
+                } else {
+                    sys::open_devnull()?
+                };
                 crate::child::Stdio {
-                    stdin: devnull,
+                    stdin,
                     stdout: out_w.try_clone()?,
                     stderr: err_w.try_clone()?,
                 }
@@ -1529,6 +1549,7 @@ mod tests {
             restart: RestartPolicy::No,
             restart_max: None,
             tty: false,
+            stdin_open: false,
             volumes: Vec::new(),
             peers: Vec::new(),
             stack: None,

@@ -102,6 +102,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Find MCP servers and say how to plug one into a client.
+    ///
+    /// An MCP server packaged as an image is a program that speaks a
+    /// protocol on stdin and stdout, so running one is `run -i --rm
+    /// <image>` and nothing more; what is worth having is the catalogue
+    /// and the exact snippet a client's configuration wants.
+    #[command(subcommand)]
+    Mcp(McpCmd),
     /// List the public repositories of a Docker Hub namespace: a user,
     /// an organisation, or `library` for the official images.
     ///
@@ -252,6 +260,11 @@ struct RunArgs {
     #[arg(short = 'i', long)]
     interactive: bool,
 
+    /// Remove the container when it exits. Foreground runs only: a
+    /// detached container has nobody waiting to do the removing.
+    #[arg(long)]
+    rm: bool,
+
     /// Set an environment entry, `KEY=VALUE`. Replaces the image's own
     /// entry for that key rather than shadowing it. Repeatable.
     #[arg(short = 'e', long = "env")]
@@ -340,6 +353,28 @@ struct PullArgs {
 #[derive(Args)]
 struct RmiArgs {
     image: String,
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// List the servers in Docker Hub's `mcp` catalogue.
+    Ls,
+    /// Print the configuration that makes a client start this server
+    /// in a container: the `mcpServers` entry most clients read.
+    Config {
+        /// A catalogue name such as `time`, or a full image reference.
+        server: String,
+        /// Pass an environment variable through, `KEY` or `KEY=value`.
+        /// Repeatable. A bare `KEY` is written as a placeholder to fill
+        /// in: a secret belongs in the client's file, not in this
+        /// command's history.
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        /// The network the server gets. `none` for one that needs no
+        /// network is the safer default to choose deliberately.
+        #[arg(long, default_value = "bridge")]
+        network: String,
+    },
 }
 
 #[derive(Args)]
@@ -670,6 +705,55 @@ fn real_main() -> Result<ExitCode> {
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
         Command::Scan { image, json } => cmd_scan(&image, json),
+        Command::Mcp(McpCmd::Ls) => {
+            for (name, pulls, _) in rustainer_image::registry::hub_repositories("mcp")
+                .map_err(|e| anyhow::anyhow!(e))?
+            {
+                println!("{name}\t{pulls}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Mcp(McpCmd::Config {
+            server,
+            env,
+            network,
+        }) => {
+            let image = if server.contains('/') {
+                server.clone()
+            } else {
+                format!("mcp/{server}")
+            };
+            let name = server
+                .rsplit('/')
+                .next()
+                .unwrap_or(&server)
+                .split(':')
+                .next()
+                .unwrap_or(&server)
+                .to_owned();
+            let mut args: Vec<String> = ["run", "-i", "--rm", "--network", &network]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+            let mut placeholders = serde_json::Map::new();
+            for e in &env {
+                let key = e.split('=').next().unwrap_or(e);
+                // The value travels in the client's `env` block and is
+                // named, not inlined, on the command line.
+                args.push("-e".into());
+                args.push(key.to_owned());
+                placeholders.insert(
+                    key.to_owned(),
+                    serde_json::json!(e.split_once('=').map_or("<fill in>", |(_, v)| v)),
+                );
+            }
+            args.push(image);
+            let doc = serde_json::json!({ "mcpServers": { name: {
+                "command": "rustainer", "args": args, "env": placeholders,
+            }}});
+            println!("{}", serde_json::to_string_pretty(&doc)?);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Repos { namespace } => {
             let repos = rustainer_image::registry::hub_repositories(&namespace)
                 .map_err(|e| anyhow::anyhow!(e))?;
@@ -1019,7 +1103,19 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             // variable twice, which is how an operator concludes the
             // engine is broken. Same function `exec` uses, so the two
             // cannot drift apart.
-            rustainer_core::exec::merge_env(&base, &args.env)
+            // A bare `-e KEY` means "the value I have": taken from our
+            // own environment, and dropped if we do not have one. It is
+            // how a secret reaches a container without being written
+            // on a command line that `ps` shows to everybody.
+            let wanted: Vec<String> = args
+                .env
+                .iter()
+                .filter_map(|e| match e.contains('=') {
+                    true => Some(e.clone()),
+                    false => std::env::var(e).ok().map(|v| format!("{e}={v}")),
+                })
+                .collect();
+            rustainer_core::exec::merge_env(&base, &wanted)
         },
         hostname: args.hostname,
         // `None` means the host's filesystem view. An empty string means
@@ -1044,6 +1140,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         network: network_def.clone(),
         userns,
         tty: args.tty,
+        stdin_open: args.interactive && !args.tty && !args.detach,
         restart: restart_policy,
         restart_max,
         volumes,
@@ -1162,6 +1259,9 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         None
     };
     let status = wait_foreground(paths, &id, &mut child, init_pid)?;
+    if args.rm {
+        let _ = supervise::remove(paths, &id, true);
+    }
     Ok(ExitCode::from(status.min(255) as u8))
 }
 

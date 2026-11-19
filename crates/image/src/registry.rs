@@ -130,11 +130,14 @@ fn two() -> u32 {
 }
 
 /// The public repositories of a Docker Hub namespace: `(name, pulls,
-/// last updated)`, most recently updated first, one page of a hundred.
+/// last updated)`, most pulled first.
 ///
 /// Hub's own API rather than the registry protocol, which has no way
-/// to list a namespace. Unauthenticated, so private repositories are
-/// not in it.
+/// to list a namespace. Unauthenticated, which has two consequences:
+/// private repositories are not in it, and **only the first hundred
+/// come back** - Hub refuses an anonymous caller any further page
+/// ("pagination offset too large for anonymous requests"). Most pulled
+/// first is the ordering that makes a hundred the useful hundred.
 pub fn hub_repositories(namespace: &str) -> Result<Vec<(String, u64, String)>, String> {
     if namespace.is_empty()
         || !namespace
@@ -144,7 +147,7 @@ pub fn hub_repositories(namespace: &str) -> Result<Vec<(String, u64, String)>, S
         return Err(format!("{namespace:?} is not a Docker Hub namespace"));
     }
     let url = format!(
-        "https://hub.docker.com/v2/repositories/{namespace}/?page_size=100&ordering=last_updated"
+        "https://hub.docker.com/v2/repositories/{namespace}/?page_size=100&ordering=pull_count"
     );
     let resp = ureq::Agent::config_builder()
         .http_status_as_error(false)
