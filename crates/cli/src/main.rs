@@ -379,6 +379,21 @@ enum StackCmd {
     /// worse than one that notices a second late, and inotify's queue
     /// overflows silently under a build that touches a thousand files.
     Watch(StackArgs),
+    /// Replace a service's containers with what the file now says, and
+    /// put the old ones back if the new ones are not healthy.
+    ///
+    /// Compose's `deploy.rollback_config`, in the one form a single
+    /// host can honour: the service's own healthcheck decides. The old
+    /// container is stopped and set aside - not removed - the new one
+    /// is started in its place with the same name and address, and
+    /// only once it passes its healthcheck is the old one deleted. If
+    /// it never passes, the new one is removed and the old one is
+    /// started again exactly as it was, files and all.
+    ///
+    /// There is a gap in service while this happens. Two containers
+    /// cannot hold one published port, so "start the new one first" is
+    /// not available without a proxy in front, and there is none here.
+    Update(StackRunArgs),
     /// Run a one-off container with a service's settings.
     ///
     /// The stack's `compose run`: same image, environment, volumes and
@@ -1899,6 +1914,10 @@ fn cmd_stack(paths: &Paths, cmd: StackCmd) -> Result<ExitCode> {
             let st = read_stack(&a.file, &a.profile)?;
             stack_run(paths, &st, &a)
         }
+        StackCmd::Update(a) => {
+            let st = read_stack(&a.file, &a.profile)?;
+            stack_update(paths, &st, &a.file, &a.service)
+        }
     }
 }
 
@@ -2337,9 +2356,24 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
             continue;
         }
         for (n, id) in st.container_names(name).into_iter().enumerate() {
-            let lease = rustainer_core::net::allocate(&paths_root(paths))
-                .with_context(|| format!("allocating an address for {id}"))?;
-            let ip = lease.ip.to_string();
+            // A container that already exists keeps the address it has.
+            // Allocating a fresh one for it here put an address nothing
+            // answers on into the /etc/hosts of every service started
+            // afterwards - `up` on a half-running stack produced
+            // services that could not find the ones already running.
+            // The same holds for a container set aside by `update`:
+            // its replacement takes over its address, so nothing that
+            // already resolved it has to be told.
+            let recorded = [id.clone(), set_aside(&id)]
+                .iter()
+                .find_map(|c| Config::load(paths, c).ok()?.ip);
+            let ip = match recorded {
+                Some(ip) => ip,
+                None => rustainer_core::net::allocate(&paths_root(paths))
+                    .with_context(|| format!("allocating an address for {id}"))?
+                    .ip
+                    .to_string(),
+            };
             // Both names resolve: the container name, which is what `ps`
             // shows, and - for the FIRST replica - the service's own
             // short name, which is what a config file inside a container
@@ -2512,6 +2546,123 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
         started,
         wanted - started
     );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The name a container is kept under while its replacement is tried.
+fn set_aside(id: &str) -> String {
+    format!("{id}-rollback")
+}
+
+/// Where a container's two directories live: its state, and its
+/// writable layer. Moving both is moving the container.
+fn container_dirs(paths: &Paths, id: &str) -> [PathBuf; 2] {
+    [
+        paths.dir(id),
+        Store::default_root().join("containers").join(id),
+    ]
+}
+
+fn move_container(paths: &Paths, from: &str, to: &str) -> Result<()> {
+    for (a, b) in container_dirs(paths, from)
+        .iter()
+        .zip(container_dirs(paths, to))
+    {
+        if a.exists() {
+            std::fs::rename(a, &b)
+                .with_context(|| format!("moving {} to {}", a.display(), b.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn stack_update(
+    paths: &Paths,
+    st: &stack::Stack,
+    files: &[PathBuf],
+    service: &str,
+) -> Result<ExitCode> {
+    let Some(svc) = st.services.get(service) else {
+        bail!(
+            "this stack has no service called {service:?}. It defines: {}",
+            st.services.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    };
+    // Without one there is nothing to decide by. "It started" is not
+    // evidence that it works, and rolling back on a guess is worse than
+    // not offering to.
+    let Some(health) = &svc.healthcheck else {
+        bail!(
+            "service {service:?} has no healthcheck, and an update is rolled back by \
+             one. Add `[services.{service}.healthcheck]`, or use `stack down` and \
+             `stack up` to replace it unconditionally."
+        );
+    };
+    for id in st.container_names(service) {
+        let aside = set_aside(&id);
+        if container_dirs(paths, &aside).iter().any(|d| d.exists()) {
+            bail!(
+                "{aside} is left over from an update that did not finish. It is the \
+                 previous {id}: delete {} to discard it, or move it back to keep it.",
+                container_dirs(paths, &aside)
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            );
+        }
+    }
+
+    for id in st.container_names(service) {
+        let aside = set_aside(&id);
+        let had_old = paths.dir(&id).exists();
+        if had_old {
+            supervise::stop(paths, &id, Duration::from_secs(10))
+                .with_context(|| format!("stopping {id}"))?;
+            // Moved, not copied and not renamed in its config: the two
+            // directories are the container, and moving them back is
+            // an exact undo.
+            move_container(paths, &id, &aside)?;
+        }
+        println!("{id}  replacing");
+        let tried = stack_up(paths, st, files)
+            .map(|_| ())
+            .and_then(|()| wait_until_healthy(paths, &id, service, health));
+        match tried {
+            Ok(()) => {
+                for d in container_dirs(paths, &aside) {
+                    let _ = std::fs::remove_dir_all(d);
+                }
+                rustainer_core::events::record(paths, "update", &id, serde_json::json!({}));
+                println!("{id}  updated");
+            }
+            Err(e) => {
+                if paths.dir(&id).exists() {
+                    let _ = supervise::remove(paths, &id, true);
+                }
+                if had_old {
+                    move_container(paths, &aside, &id)?;
+                    let _ = cmd_start(paths, &id).with_context(|| {
+                        format!("the update failed AND the previous {id} would not start again")
+                    })?;
+                }
+                rustainer_core::events::record(
+                    paths,
+                    "rollback",
+                    &id,
+                    serde_json::json!({ "why": format!("{e:#}") }),
+                );
+                bail!(
+                    "{id} was rolled back: {e:#}. {}",
+                    if had_old {
+                        "The previous container is running again."
+                    } else {
+                        "There was no previous container to restore."
+                    }
+                );
+            }
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
