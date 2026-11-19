@@ -121,26 +121,41 @@ the variance is the internet's, so treat this as "not slower" rather than as a
 result. Both engines fetch the same bytes from the same host; the difference
 is in how much work happens between them.
 
-### Build — 2.8 to 3.5×, and parity against a warm cache
+### Build — 2.6 to 3.4× cold, 2.3 to 3.3× from cache
 
 Measured later than the rows above, with `scripts/bench-build-net.sh`,
 because a comparison that only times process start-up is a comparison
 of the one thing this architecture is good at. Three runs, ten builds
-each, of a five-step Dockerfile with no network:
+each, no network in the build:
 
 | measurement | rustainer | Docker | ratio |
 |---|---:|---:|---:|
-| build, no cache (median) | 57–77 ms | 198–215 ms | **2.8–3.5×** |
-| rebuild with nothing changed | 57–77 ms | 71–74 ms (cached) | 0.9–1.3× |
+| build a 5-step image, no cache | 61–90 ms | 208–240 ms | **2.6–3.4×** |
+| rebuild with nothing changed | 33–37 ms | 75–91 ms | **2.3–2.5×** |
+| rebuild after a 2 s step | 33–42 ms | 79–139 ms | **2.4–3.3×** |
 
-The first row is the same advantage as everywhere else: each `RUN` is a
-container start, and that is what is fast here. The second row is the
-one to read. **This engine has no layer cache**: it does every step
-again every time, and it ties with Docker's cache only because the steps
-in this file take milliseconds. A build that compiles something for a
-minute is a minute here on every rebuild and a fraction of a second in
-Docker when nothing changed. For real builds, Docker's cache wins, and
-by as much as the build is long.
+The first time this was measured the second row read "0.9–1.3×", and
+the text under it said what that hid: **there was no layer cache**, the
+tie existed only because the steps took milliseconds, and any build
+that compiled something would lose to Docker by as long as the build
+was. That was the largest real gap this document had found, so the
+cache was written, and the third row is the case it exists for - a
+two-second step that neither engine runs again.
+
+A step's key is a hash of everything beneath it and of how it runs: the
+base image, each `COPY` by the content it copied, each earlier `RUN` by
+its own key, then this step's command, environment, working directory,
+user and network. Layers are committed as they are produced rather than
+when the image is tagged, so a build that fails at step nine starts the
+next attempt at step nine. Stage 21 checks this with steps that write a
+random value: a reused step is one whose value did not change.
+
+Two limits. A hit re-hashes the layer it is about to reuse, so that a
+damaged layer is never built upon - which makes a hit cost time
+proportional to the layer's size, where Docker's costs nothing. And the
+key cannot see the outside world: `RUN apk add curl` is one key whatever
+the package index says today, here as in Docker, and `--no-cache` is the
+answer in both.
 
 ### Network — the same
 
@@ -156,12 +171,11 @@ the data path. The one 1.3× is the first run of three and did not
 repeat - the other two were 950 against 939 - so it is noise, and is
 left in the range rather than trimmed out of it.
 
-So the honest summary of "how much better" is not one number. Starting,
-stopping and inspecting containers is **2.4 to 9.7 times faster** and
-uses a fraction of the memory, because there is no daemon in the way.
-Moving bytes is **the same**, because the kernel does it. And building
-is faster cold and **slower in practice** for anything that benefits
-from a cache.
+So the summary of "how much better" is two numbers, not one. Starting,
+stopping, inspecting and building are **2.3 to 9.7 times faster** and
+use a fraction of the memory, because there is no daemon in the way.
+Moving bytes is **the same**, because the kernel does it and neither
+engine is involved.
 
 ---
 

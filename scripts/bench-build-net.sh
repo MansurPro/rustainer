@@ -71,14 +71,30 @@ build_times() {
         e=$(now_us); echo $(( (e - s) / 1000 ))
     done
 }
-R=$(build_times "$B" build --network none -t bn-built:1 "$CTX" | median)
+R=$(build_times "$B" build --no-cache --network none -t bn-built:1 "$CTX" | median)
 D=$(build_times docker build --no-cache --network none -q -t bn-built "$CTX" | median)
 row "build a 5-step image, no cache (median)" "${R} ms" "${D} ms" "$(ratio "$D" "$R")"
 
 # What a rebuild costs when nothing changed - the case a layer cache
-# exists for, and the one this engine has no answer to.
+# exists for. Both engines have one; each is primed by the builds above.
+"$B" build --network none -t bn-built:1 "$CTX" >/dev/null 2>&1
+R2=$(build_times "$B" build --network none -t bn-built:1 "$CTX" | median)
 D2=$(build_times docker build --network none -q -t bn-built "$CTX" | median)
-row "rebuild with nothing changed (median)" "${R} ms (no cache)" "${D2} ms (cached)" "$(ratio "$D2" "$R")"
+row "rebuild with nothing changed, cached (median)" "${R2} ms" "${D2} ms" "$(ratio "$D2" "$R2")"
+
+# And the case the cache is FOR: a step that takes real time. One slow
+# RUN, then a rebuild that should not repeat it.
+cat > "$CTX/Dockerfile" <<DOCKERFILE
+FROM $IMG
+RUN sleep 2 && echo slow > /slow
+COPY blob /blob
+RUN sha256sum /blob > /sum
+DOCKERFILE
+"$B" build --network none -t bn-built:2 "$CTX" >/dev/null 2>&1
+docker build --network none -q -t bn-built "$CTX" >/dev/null 2>&1
+R3=$(build_times "$B" build --network none -t bn-built:2 "$CTX" | median)
+D3=$(build_times docker build --network none -q -t bn-built "$CTX" | median)
+row "rebuild after a 2 s step, cached (median)" "${R3} ms" "${D3} ms" "$(ratio "$D3" "$R3")"
 
 # --- network: container to container ------------------------------------
 # One gigabyte of zeroes through busybox nc, between two containers on
