@@ -290,6 +290,12 @@ contains "images lists it" "$("$B" images)" "demo_1"
 timeout 60 "$B" rmi demo:3 >/dev/null 2>&1 \
     && ok "rmi removes it" || bad "rmi failed on a built image"
 contains "the build is in the event log" "$("$B" events --since 900 --limit 400)" "build"
+# A build history is opened to find out what went wrong, so the builds
+# that failed have to be in it, with why.
+EV=$("$B" events --since 900 --limit 400)
+contains "with how long it took and what it reused" "$EV" '"reused":2'
+contains "a failed build is recorded too" "$EV" "build-failed"
+contains "with the reason" "$EV" "failed with exit status 7"
 
 echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"

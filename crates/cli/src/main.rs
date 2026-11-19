@@ -3669,7 +3669,39 @@ fn new_id() -> Result<String> {
 /// Which means the build inherits the engine's isolation, cgroups,
 /// networking and security posture for free, because it is not a second
 /// implementation of any of them.
+/// Build, and write down how it went either way.
+///
+/// A build that fails is recorded as well as one that succeeds: a
+/// history that only lists the builds that worked cannot answer the
+/// question it is opened for, which is what went wrong.
 fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
+    let started = std::time::Instant::now();
+    let tag = args.tag.clone();
+    let about = serde_json::json!({
+        "context": args.context.canonicalize().unwrap_or(args.context.clone()).display().to_string(),
+        "file": args.file.as_ref().map(|f| f.display().to_string()),
+        "network": args.network,
+    });
+    let result = build_image(paths, args);
+    let mut detail = about;
+    detail["duration_ms"] = serde_json::json!(started.elapsed().as_millis() as u64);
+    match &result {
+        Ok((digest, steps, reused)) => {
+            detail["digest"] = serde_json::json!(digest);
+            detail["steps"] = serde_json::json!(steps);
+            detail["reused"] = serde_json::json!(reused);
+            rustainer_core::events::record(paths, "build", &tag, detail);
+        }
+        Err(e) => {
+            detail["error"] = serde_json::json!(format!("{e:#}"));
+            rustainer_core::events::record(paths, "build-failed", &tag, detail);
+        }
+    }
+    result.map(|_| ExitCode::SUCCESS)
+}
+
+/// The build itself: `(image digest, steps, steps reused)`.
+fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)> {
     use crate::dockerfile::Instruction;
     use std::collections::BTreeMap;
 
@@ -3984,13 +4016,7 @@ fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
         .context("storing the built image")?;
     cleanup_staging();
 
-    rustainer_core::events::record(
-        paths,
-        "build",
-        &args.tag,
-        serde_json::json!({ "digest": digest, "steps": total }),
-    );
     println!("{digest}");
     println!("tagged {}", args.tag);
-    Ok(ExitCode::SUCCESS)
+    Ok((digest, total, reused))
 }
