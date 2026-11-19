@@ -874,6 +874,10 @@ container inside Docker's VM inherits a host someone already arranged:
   `/sys/fs/cgroup/rustainer`, directly under the root, whenever that has
   more controllers than the cgroup the command was typed in - where
   Docker's cgroupfs driver keeps `/docker`, and for the same reason.
+  The same scope also refused `--memory` and `--cpus` to *every*
+  container started from a root shell, since it cannot enable a
+  controller while it holds that shell; a container with a limit goes
+  to the same place now.
 - **A host on systemd-resolved got public DNS, on a network that blocks
   it.** `/etc/resolv.conf` there names only `127.0.0.53`, which means
   nothing in another network namespace, so containers were given
@@ -885,6 +889,12 @@ container inside Docker's VM inherits a host someone already arranged:
 One thing it needs that it will not do for you: `sysctl -w
 net.ipv4.ip_forward=1`. A fresh distribution has it off, the engine
 refuses to change a host-wide setting, and says so.
+
+With those fixed, the whole stage suite was run on that host as root:
+23 of the 24 stages, 653 assertions, none failing and none skipped
+(stage 11 is the rootless stage and refuses to run as root; two
+assertions of stage 18 failed once in the first run and not in three
+repeats).
 
 Root and Linux only; there is no rootless cluster - tried, on a shared
 machine without root: bridged networking needs a firewall tool the
