@@ -797,6 +797,15 @@ database is SQLite. An image where it finds nothing is reported as
 having nothing to look up rather than nothing wrong. A package an upper
 layer deleted is still reported, which errs toward saying too much.
 
+**A Builds view**, which Docker Desktop has as its own section, lists
+every build this engine has done - taken from the event log, so there
+is no second record to disagree with it - with how long it took, how
+many steps came from the cache, and for a build that failed, the step
+and exit status. Each can be rebuilt from the page, with or without the
+cache. It was not compared against Docker Desktop's Builds screen, which
+also shows per-step timings, logs and build provenance; this shows none
+of those.
+
 What is still missing is what needs an identity: private repositories,
 and anything else behind a Docker Hub sign-in. This has no notion of an
 account and was not given one. Search, bulk selection, totals, the added/modified marks and

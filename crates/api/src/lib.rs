@@ -759,6 +759,19 @@ impl Server {
             args.push("-f");
             args.push(f);
         }
+        if let Some(n) = spec["network"]
+            .as_str()
+            .filter(|s| !s.is_empty() && !s.starts_with('-'))
+        {
+            args.push("--network");
+            args.push(n);
+        }
+        if spec["no_cache"] == true {
+            args.push("--no-cache");
+        }
+        if context.starts_with('-') {
+            return http::error(stream, 400, "not a build context");
+        }
         args.push(context);
         self.run_cli(stream, &args)
     }

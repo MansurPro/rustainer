@@ -242,6 +242,7 @@
     <button data-view="networks">Networks</button>
     <button data-view="events">Events</button>
     <button data-view="images">Images</button>
+    <button data-view="builds">Builds</button>
     <button data-view="volumes">Volumes</button>
   </nav>
   <div class="spacer"></div>
@@ -284,6 +285,15 @@
     <div class="card">
       <h2>Networks</h2>
       <div id="networks"></div>
+    </div>
+  </section>
+
+  <section id="view-builds" hidden>
+    <div class="card">
+      <h2>Builds <span class="spacer"></span>
+        <span class="dim" style="font-size:11px;text-transform:none;letter-spacing:0">newest first, from the event log</span>
+      </h2>
+      <div id="builds"></div>
     </div>
   </section>
 
@@ -410,7 +420,7 @@ const ago = (secs) => {
 };
 
 // --- state --------------------------------------------------------------
-const VIEWS = ["containers", "stacks", "networks", "events", "images", "volumes"];
+const VIEWS = ["containers", "stacks", "networks", "events", "images", "builds", "volumes"];
 let view = "containers";
 let filter = "";
 let openRow = null;           // container id whose detail panel is open
@@ -1812,6 +1822,50 @@ function renderNetworks(list) {
   box.replaceChildren(t);
 }
 
+// Every build this engine has done, worked or not, read back out of the
+// event log - there is no separate build database to drift from it.
+function renderBuilds(events) {
+  const box = $("#builds");
+  const list = events.filter((e) => e.kind === "build" || e.kind === "build-failed").reverse();
+  if (!list.length) {
+    box.replaceChildren(el("div", { className: "empty" }, [
+      el("div", {}, "No builds yet."),
+      el("div", { className: "hint", style: "margin-top:6px" }, "rustainer build -t name:tag ."),
+    ]));
+    return;
+  }
+  const rows = list.map((e) => {
+    const d = e.detail || {};
+    const ok = e.kind === "build";
+    const again = (noCache) => async (ev) => {
+      ev.target.disabled = true;
+      const r = await post("/api/build", { tag: e.id, context: d.context, file: d.file, network: d.network, no_cache: noCache });
+      logCommand(["build", ...(noCache ? ["--no-cache"] : []), "--network", d.network || "bridge", "-t", e.id, d.context || "."], r);
+      refresh();
+    };
+    return el("tr", {}, [
+      el("td", { className: "mono dim nowrap", title: new Date((e.at || 0) * 1000).toLocaleString() }, ago(e.at) + " ago"),
+      el("td", { className: "mono" }, String(e.id ?? "")),
+      el("td", {}, el("span", { className: "pill " + (ok ? "h-healthy" : "h-unhealthy"), title: d.error || "" },
+        [el("span", { className: "dot" }), ok ? "built" : "failed"])),
+      el("td", { className: "mono dim nowrap" }, d.duration_ms == null ? "—"
+        : d.duration_ms < 1000 ? Math.max(1, d.duration_ms) + "ms" : (d.duration_ms / 1000).toFixed(1) + "s"),
+      el("td", { className: "mono dim nowrap hide-s" },
+        ok && d.steps != null ? d.steps + " steps" + (d.reused ? ", " + d.reused + " cached" : "") : "—"),
+      el("td", { className: "mono dim truncate hide-s", title: ok ? d.context || "" : d.error || "" },
+        ok ? d.context || "" : d.error || ""),
+      el("td", {}, el("div", { className: "actions" }, d.context ? [
+        el("button", { className: "act", textContent: "rebuild", onclick: again(false) }),
+        el("button", { className: "act", textContent: "no cache", title: "Rebuild, running every step again.", onclick: again(true) }),
+      ] : [])),
+    ]);
+  });
+  box.replaceChildren(el("table", {}, [
+    el("thead", {}, el("tr", {}, ["When", "Tag", "Result", "Took"].map((h) => el("th", {}, h))
+      .concat([el("th", { className: "hide-s" }, "Steps"), el("th", { className: "hide-s" }, "Context, or why it failed"), el("th", {}, "")]))),
+    el("tbody", {}, rows)]));
+}
+
 function renderEvents(list) {
   const box = $("#events");
   if (!list.length) {
@@ -2002,6 +2056,9 @@ async function refresh() {
   } else if (view === "events") {
     const evs = await api("/api/events?limit=300");
     renderEvents(Array.isArray(evs) ? evs : []);
+  } else if (view === "builds") {
+    const evs = await api("/api/events?limit=2000");
+    renderBuilds(Array.isArray(evs) ? evs : []);
   } else if (view === "images") {
     renderImages(await api("/api/images") || []);
   } else {
