@@ -262,6 +262,23 @@ pub struct Config {
     pub userns: bool,
 }
 
+/// The nameservers of a resolv.conf that mean something in another
+/// network namespace: everything but the loopback stubs.
+fn usable_nameservers(resolv_conf: &str) -> Vec<String> {
+    resolv_conf
+        .lines()
+        .filter_map(|l| l.strip_prefix("nameserver"))
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.starts_with("127.") && !s.is_empty())
+        .collect()
+}
+
+#[test]
+fn loopback_stubs_are_not_usable_nameservers() {
+    let got = usable_nameservers("# x\nnameserver 127.0.0.53\nnameserver 10.0.2.3\nsearch .\n");
+    assert_eq!(got, ["10.0.2.3"]);
+}
+
 impl Config {
     pub fn path(paths: &Paths, id: &str) -> std::path::PathBuf {
         paths.dir(id).join("config.json")
@@ -370,15 +387,18 @@ impl Config {
     /// naively produces a container whose DNS silently never answers -
     /// which every user misdiagnoses as "networking is broken".
     fn write_resolv_conf(&self, dir: &Path) -> std::io::Result<PathBuf> {
-        let mut servers: Vec<String> = std::fs::read_to_string("/etc/resolv.conf")
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| l.strip_prefix("nameserver"))
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.starts_with("127.") && !s.is_empty())
-            .collect();
+        let usable =
+            |file: &str| usable_nameservers(&std::fs::read_to_string(file).unwrap_or_default());
+        let mut servers = usable("/etc/resolv.conf");
         if servers.is_empty() {
-            // Every nameserver the host has is a local stub. Fall back to
+            // systemd-resolved keeps the resolvers it forwards to in a
+            // file of its own. They are the right answer, and on a
+            // network that blocks outside DNS they are the only one.
+            servers = usable("/run/systemd/resolve/resolv.conf");
+        }
+        if servers.is_empty() {
+            // Every nameserver the host has is a local stub, and nothing
+            // says where the stub forwards. Fall back to
             // a public resolver and say so in the file, rather than
             // writing something that cannot work.
             servers.push("1.1.1.1".into());

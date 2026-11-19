@@ -12,6 +12,9 @@ cd "$(dirname "$0")/.." || exit 1
 B="${RUSTAINER_BIN:-target/release/rustainer}"
 [ -x "$B" ] || { echo "no rustainer binary at '$B'" >&2; exit 2; }
 [ "$(id -u)" -eq 0 ] || { echo "needs root" >&2; exit 2; }
+# Not set for you: forwarding is a host-wide setting and the engine
+# refuses to flip it, so say what is missing before ten minutes of pulls.
+[ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] || { echo "needs: sysctl -w net.ipv4.ip_forward=1" >&2; exit 2; }
 PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); echo "  PASS  $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  FAIL  $1"; }

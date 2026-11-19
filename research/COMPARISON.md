@@ -861,9 +861,35 @@ all three are compatibility fixes in their own right:
 two-replica nginx deployment rolls out, its service answers on a cluster
 address, the API server is reachable from the host, and after `kube
 down` and `kube up` the deployment is still there. It is not in CI - it
-needs root, three image pulls and several minutes - and it has only been
-run nested inside Docker Desktop's VM, never on a bare Linux host. Root
-and Linux only; there is no rootless cluster. Docker Desktop's own
+needs root, three image pulls and several minutes. It passes 8 of 8 in
+two places: nested inside Docker Desktop's VM, and on a stock Debian 13
+host (kernel 6.12, systemd, booted for the purpose under KVM) as root.
+
+The second place found two things the first could not, because a
+container inside Docker's VM inherits a host someone already arranged:
+
+- **A login session's cgroup has no `cpu` controller to give.** systemd
+  hands a session scope `memory` and `pids`; k3s stopped with *"failed
+  to find cpu cgroup (v2)"*. A privileged container is now placed in
+  `/sys/fs/cgroup/rustainer`, directly under the root, whenever that has
+  more controllers than the cgroup the command was typed in - where
+  Docker's cgroupfs driver keeps `/docker`, and for the same reason.
+- **A host on systemd-resolved got public DNS, on a network that blocks
+  it.** `/etc/resolv.conf` there names only `127.0.0.53`, which means
+  nothing in another network namespace, so containers were given
+  `1.1.1.1` - and every image pull inside the cluster timed out on a
+  name lookup. The resolvers systemd-resolved forwards to are in
+  `/run/systemd/resolve/resolv.conf`, and they are used now, as Docker
+  uses them. The public pair remains the last resort.
+
+One thing it needs that it will not do for you: `sysctl -w
+net.ipv4.ip_forward=1`. A fresh distribution has it off, the engine
+refuses to change a host-wide setting, and says so.
+
+Root and Linux only; there is no rootless cluster - tried, on a shared
+machine without root: bridged networking needs a firewall tool the
+unprivileged user cannot drive, and a single-uid user namespace cannot
+unpack the images a cluster pulls. Docker Desktop's own
 Kubernetes was switched off on the machine this was compared on, so its
 screen was seen only in that state: a "create cluster" button.
 
