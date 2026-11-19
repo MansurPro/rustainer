@@ -923,6 +923,16 @@ Credentials come from `RUSTAINER_REGISTRY_AUTH` in preference to
 `--creds`, because a password on a command line is in `ps` for everyone on
 the machine and in the shell history forever.
 
+The same variable signs reads in to **Docker Hub**: `rustainer repos`
+lists your own repositories, private ones included, and `pull`, `run`
+and `tags` can reach private images. It is sent to Docker Hub only on
+reads - one credential cannot be right for two registries - and a pull
+whose credentials are refused carries on anonymously, so a token for
+somewhere else does not break `pull alpine`.
+
+    set -a; . ./.env; set +a      # RUSTAINER_REGISTRY_AUTH=user:dckr_pat_...
+    rustainer repos               # yours, private marked
+
 **The test is a round trip**: build, push, pull into a *clean* store, run.
 Anything less proves the request succeeded, not that the right bytes
 arrived — and the first version of this code pushed an image whose

@@ -129,16 +129,29 @@ fn two() -> u32 {
     2
 }
 
-/// The public repositories of a Docker Hub namespace: `(name, pulls,
-/// last updated)`, most pulled first.
+/// One repository of a Docker Hub namespace.
+pub struct HubRepo {
+    pub name: String,
+    pub pulls: u64,
+    /// The date only, `YYYY-MM-DD`.
+    pub updated: String,
+    pub private: bool,
+}
+
+/// The repositories of a Docker Hub namespace. This is Hub's own API,
+/// not part of the registry protocol, which has no way to list a
+/// namespace.
 ///
-/// Hub's own API rather than the registry protocol, which has no way
-/// to list a namespace. Unauthenticated, which has two consequences:
-/// private repositories are not in it, and **only the first hundred
-/// come back** - Hub refuses an anonymous caller any further page
-/// ("pagination offset too large for anonymous requests"). Most pulled
-/// first is the ordering that makes a hundred the useful hundred.
-pub fn hub_repositories(namespace: &str) -> Result<Vec<(String, u64, String)>, String> {
+/// Without `creds` it is anonymous, which has two consequences: private
+/// repositories are not in it, and **only the first hundred come back**:
+/// Hub refuses an anonymous caller any further page ("pagination
+/// offset too large for anonymous requests"). Most pulled first is the
+/// ordering that makes a hundred the useful hundred.
+///
+/// With `creds` (`user:token`, a personal access token is enough) it
+/// signs in first, and then private repositories are listed and every
+/// page is followed.
+pub fn hub_repositories(namespace: &str, creds: Option<&str>) -> Result<Vec<HubRepo>, String> {
     if namespace.is_empty()
         || !namespace
             .chars()
@@ -146,48 +159,98 @@ pub fn hub_repositories(namespace: &str) -> Result<Vec<(String, u64, String)>, S
     {
         return Err(format!("{namespace:?} is not a Docker Hub namespace"));
     }
-    let url = format!(
-        "https://hub.docker.com/v2/repositories/{namespace}/?page_size=100&ordering=pull_count"
-    );
-    let resp = ureq::Agent::config_builder()
+    // Overridable so the test can stand a fake in for Hub; nothing else
+    // should ever set it, since the token goes wherever it points.
+    let base =
+        std::env::var("RUSTAINER_HUB_URL").unwrap_or_else(|_| "https://hub.docker.com".into());
+    let agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .build()
-        .new_agent()
-        .get(&url)
-        .call()
-        .map_err(|e| format!("{url}: {e}"))?;
-    let status = resp.status().as_u16();
-    let mut body = Vec::new();
-    resp.into_body()
-        .into_reader()
-        .take(8 * 1024 * 1024)
-        .read_to_end(&mut body)
-        .map_err(|e| format!("{url}: {e}"))?;
-    if status == 404 {
-        return Err(format!("Docker Hub has no namespace called {namespace}"));
+        .new_agent();
+    let read = |resp: ureq::http::Response<ureq::Body>, url: &str| {
+        let status = resp.status().as_u16();
+        let mut body = Vec::new();
+        resp.into_body()
+            .into_reader()
+            .take(8 * 1024 * 1024)
+            .read_to_end(&mut body)
+            .map_err(|e| format!("{url}: {e}"))?;
+        let doc = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+        Ok::<_, String>((status, doc))
+    };
+    let token = match creds {
+        None => None,
+        Some(c) => {
+            let (user, secret) = c
+                .split_once(':')
+                .ok_or("RUSTAINER_REGISTRY_AUTH must be user:token")?;
+            let url = format!("{base}/v2/users/login");
+            let resp = agent
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .send(
+                    serde_json::json!({ "username": user, "password": secret })
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(|e| format!("{url}: {e}"))?;
+            let (status, doc) = read(resp, &url)?;
+            match doc["token"].as_str() {
+                Some(t) if status == 200 => Some(t.to_owned()),
+                // Never the body: an error page may echo what was sent.
+                _ => {
+                    return Err(format!(
+                        "Docker Hub refused the sign-in for {user} (HTTP {status})"
+                    ));
+                }
+            }
+        }
+    };
+    let mut url = format!("{base}/v2/repositories/{namespace}/?page_size=100&ordering=pull_count");
+    let mut repos = Vec::new();
+    // ponytail: 50 pages is 5000 repositories; raise it for a namespace
+    // that has more and someone who wants to scroll them.
+    for _ in 0..50 {
+        let mut req = agent.get(&url);
+        if let Some(t) = &token {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        let (status, doc) = read(req.call().map_err(|e| format!("{url}: {e}"))?, &url)?;
+        if status == 404 {
+            return Err(format!("Docker Hub has no namespace called {namespace}"));
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("{url}: HTTP {status}"));
+        }
+        repos.extend(
+            doc["results"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| {
+                    Some(HubRepo {
+                        name: r["name"].as_str()?.to_owned(),
+                        pulls: r["pull_count"].as_u64().unwrap_or(0),
+                        updated: r["last_updated"]
+                            .as_str()
+                            .unwrap_or("")
+                            .chars()
+                            .take(10)
+                            .collect(),
+                        private: r["is_private"].as_bool().unwrap_or(false),
+                    })
+                }),
+        );
+        // The next page is followed only when signed in (anonymous
+        // callers are refused it) and only on the host we signed in to:
+        // the token must not follow a link somewhere else.
+        match doc["next"].as_str() {
+            Some(next) if token.is_some() && next.starts_with(&base) => url = next.to_owned(),
+            _ => break,
+        }
     }
-    if !(200..300).contains(&status) {
-        return Err(format!("{url}: HTTP {status}"));
-    }
-    let doc: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-    Ok(doc["results"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| {
-            Some((
-                r["name"].as_str()?.to_owned(),
-                r["pull_count"].as_u64().unwrap_or(0),
-                r["last_updated"]
-                    .as_str()
-                    .unwrap_or("")
-                    .chars()
-                    .take(10)
-                    .collect(),
-            ))
-        })
-        .collect())
+    Ok(repos)
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -271,6 +334,17 @@ impl Client {
             credentials: None,
             scope: "pull",
         }
+    }
+
+    /// A client carrying RUSTAINER_REGISTRY_AUTH when `r` is on Docker
+    /// Hub, and nothing otherwise.
+    // ponytail: one credential, so reads send it to Docker Hub only -
+    // a per-registry credential file when someone has two registries.
+    pub fn for_reading(r: &Reference) -> Self {
+        let creds = std::env::var("RUSTAINER_REGISTRY_AUTH")
+            .ok()
+            .filter(|c| !c.is_empty() && r.endpoint() == "registry-1.docker.io");
+        Self::new().with_credentials(creds)
     }
 
     /// Supply `user:password` for the token exchange.
@@ -621,18 +695,27 @@ impl Client {
         let scope = format!("repository:{}:{}", r.name, self.scope);
         let token_url = format!("{realm}?service={service}&scope={scope}");
 
-        let mut req = self.agent.get(&token_url);
-        if let Some(creds) = &self.credentials {
-            // Basic, over the TLS the base_url already insists on for
-            // anything that is not loopback.
-            req = req.header(
-                "Authorization",
-                &format!("Basic {}", base64(creds.as_bytes())),
-            );
+        let fetch = |creds: Option<&String>| {
+            let mut req = self.agent.get(&token_url);
+            if let Some(creds) = creds {
+                // Basic, over the TLS the base_url already insists on for
+                // anything that is not loopback.
+                req = req.header(
+                    "Authorization",
+                    &format!("Basic {}", base64(creds.as_bytes())),
+                );
+            }
+            req.call()
+                .map_err(|e| Error::Http(format!("fetching a token from {realm}: {e}")))
+        };
+        let mut resp = fetch(self.credentials.as_ref())?;
+        // A pull with credentials the registry refuses goes on without
+        // them: the one credential in the environment may belong to a
+        // different registry, and that must not break public pulls. A
+        // private repository then fails with the registry's own 401.
+        if resp.status().as_u16() == 401 && self.credentials.is_some() && self.scope == "pull" {
+            resp = fetch(None)?;
         }
-        let resp = req
-            .call()
-            .map_err(|e| Error::Http(format!("fetching a token from {realm}: {e}")))?;
         if !(200..300).contains(&resp.status().as_u16()) {
             return Err(Error::Status {
                 registry: r.endpoint(),

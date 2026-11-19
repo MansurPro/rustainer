@@ -132,9 +132,11 @@ enum Command {
     /// an organisation, or `library` for the official images.
     ///
     /// Docker Hub only - it is Hub's own API, not part of the registry
-    /// protocol - and public repositories only, since nothing here
-    /// signs in.
-    Repos { namespace: String },
+    /// protocol. Anonymous by default: public repositories, the hundred
+    /// most pulled. With RUSTAINER_REGISTRY_AUTH=user:token it signs in:
+    /// private repositories are listed too, all of them, and the
+    /// namespace defaults to the user.
+    Repos { namespace: Option<String> },
     /// List the tags a repository has in its registry.
     Tags {
         /// A repository, e.g. `alpine` or `ghcr.io/owner/name`.
@@ -1009,10 +1011,10 @@ fn real_main() -> Result<ExitCode> {
         Command::Kube(c) => cmd_kube(&paths, c),
         Command::Extension(c) => cmd_extension(&paths, c),
         Command::Mcp(McpCmd::Ls) => {
-            for (name, pulls, _) in rustainer_image::registry::hub_repositories("mcp")
+            for r in rustainer_image::registry::hub_repositories("mcp", None)
                 .map_err(|e| anyhow::anyhow!(e))?
             {
-                println!("{name}\t{pulls}");
+                println!("{}\t{}", r.name, r.pulls);
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -1058,17 +1060,30 @@ fn real_main() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Repos { namespace } => {
-            let repos = rustainer_image::registry::hub_repositories(&namespace)
+            let creds = std::env::var("RUSTAINER_REGISTRY_AUTH")
+                .ok()
+                .filter(|s| !s.is_empty());
+            // Signed in and asked for nothing in particular: your own.
+            let namespace = namespace
+                .or_else(|| Some(creds.as_deref()?.split_once(':')?.0.to_owned()))
+                .context(
+                    "a namespace is required (or sign in: RUSTAINER_REGISTRY_AUTH=user:token)",
+                )?;
+            let repos = rustainer_image::registry::hub_repositories(&namespace, creds.as_deref())
                 .map_err(|e| anyhow::anyhow!(e))?;
-            for (name, pulls, updated) in repos {
-                println!("{namespace}/{name}\t{pulls}\t{updated}");
+            for r in repos {
+                let private = if r.private { "\tprivate" } else { "" };
+                println!(
+                    "{namespace}/{}\t{}\t{}{private}",
+                    r.name, r.pulls, r.updated
+                );
             }
             Ok(ExitCode::SUCCESS)
         }
         Command::Tags { repository } => {
             let r = rustainer_image::Reference::parse(&repository)
                 .map_err(|e| anyhow::anyhow!("{repository}: {e}"))?;
-            let tags = rustainer_image::registry::Client::new()
+            let tags = rustainer_image::registry::Client::for_reading(&r)
                 .tags(&r)
                 .with_context(|| format!("listing the tags of {repository}"))?;
             for t in tags {

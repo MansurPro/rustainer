@@ -153,7 +153,12 @@ impl Server {
                 return self.run_cli(stream, &["mcp", "config", &server, "--network", &network]);
             }
             ("GET", "/api/registry/repos") => {
+                // No namespace means "mine": the CLI takes it from the
+                // credentials this server was started with.
                 let ns = req.param("namespace").unwrap_or_default();
+                if ns.is_empty() {
+                    return self.run_cli(stream, &["repos"]);
+                }
                 if !is_safe_id(&ns) {
                     return http::error(stream, 400, "not a namespace");
                 }
