@@ -245,6 +245,7 @@
     <button data-view="builds">Builds</button>
     <button data-view="volumes">Volumes</button>
     <button data-view="mcp">MCP</button>
+    <button data-view="models">Models</button>
     <button data-view="kube">Kubernetes</button>
     <button data-view="extensions">Extensions</button>
   </nav>
@@ -288,6 +289,29 @@
     <div class="card">
       <h2>Networks</h2>
       <div id="networks"></div>
+    </div>
+  </section>
+
+  <section id="view-models" hidden>
+    <div class="card">
+      <h2>Models <span id="models-state" class="dim" style="text-transform:none;letter-spacing:0"></span>
+        <span class="spacer"></span>
+        <input id="model-ref" placeholder="ai/smollm2:360M-Q4_K_M" list="model-catalogue" style="width: 260px; padding: 3px 8px; font-size: 12px;">
+        <datalist id="model-catalogue"></datalist>
+        <button class="act" id="model-pull">Pull</button>
+      </h2>
+      <div class="hint" style="padding:10px 14px;border-bottom:1px solid var(--line);margin:0">
+        GGUF models from a registry - Docker Hub's <span class="mono">ai/</span> namespace is the catalogue the box suggests from.
+        Run serves one from a llama.cpp container, with an OpenAI-compatible API at
+        <span class="mono">http://127.0.0.1:12434/v1</span>. CPU only unless you pass another server image on the command line.</div>
+      <div id="models"></div>
+      <div id="model-chat" hidden style="padding:10px 14px;border-top:1px solid var(--line)">
+        <form id="model-form" style="display:flex;gap:8px">
+          <input id="model-prompt" placeholder="Ask the running model something" style="flex:1;padding:5px 8px" aria-label="prompt">
+          <button class="act" id="model-send">Ask</button>
+        </form>
+        <pre id="model-answer" style="white-space:pre-wrap;margin:10px 0 0" hidden></pre>
+      </div>
     </div>
   </section>
 
@@ -464,7 +488,7 @@ const ago = (secs) => {
 };
 
 // --- state --------------------------------------------------------------
-const VIEWS = ["containers", "stacks", "networks", "events", "images", "builds", "volumes", "mcp", "kube", "extensions"];
+const VIEWS = ["containers", "stacks", "networks", "events", "images", "builds", "volumes", "mcp", "models", "kube", "extensions"];
 let view = "containers";
 let filter = "";
 let openRow = null;           // container id whose detail panel is open
@@ -1868,6 +1892,54 @@ function renderNetworks(list) {
   box.replaceChildren(t);
 }
 
+// Models. One request at a time changes anything, and the row says
+// which: a pull is hundreds of megabytes and a first run pulls a server.
+let modelBusy = null, modelServing = null, modelCatalogue = false;
+async function modelDo(verb, model, extra) {
+  modelBusy = verb + " " + model; refresh();
+  const r = await post("/api/models/" + verb, { model, ...extra });
+  logCommand(["model", verb, model], r);
+  modelBusy = null; refresh();
+  return r;
+}
+$("#model-pull").onclick = () => { const m = $("#model-ref").value.trim(); if (m) modelDo("pull", m); };
+$("#model-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const prompt = $("#model-prompt").value.trim(), out = $("#model-answer");
+  if (!prompt || !modelServing) return;
+  $("#model-send").disabled = true; out.hidden = false; out.textContent = "…";
+  const r = await post("/api/models/ask", { model: modelServing, prompt });
+  $("#model-send").disabled = false;
+  out.textContent = r.ok === false ? (r.stderr || r.error || "failed") : r.stdout;
+};
+function renderModels(text) {
+  const rows = (text || "").split("\n").filter(Boolean).map((l) => l.split("\t"));
+  modelServing = (rows.find((r) => r[2] === "serving") || [])[0] || null;
+  $("#models-state").textContent = modelBusy ? "· " + modelBusy + "…" : "· " + rows.length;
+  $("#model-pull").disabled = !!modelBusy;
+  $("#model-chat").hidden = !modelServing;
+  if (modelServing) $("#model-prompt").placeholder = "Ask " + modelServing + " something";
+  if (!rows.length) {
+    $("#models").replaceChildren(el("div", { className: "empty" }, "No models yet. Type a reference above and Pull."));
+    return;
+  }
+  $("#models").replaceChildren(el("table", {}, [
+    el("thead", {}, el("tr", {}, ["Model", "Size", "", ""].map((h) => el("th", {}, h)))),
+    el("tbody", {}, rows.map(([name, bytes, state]) => el("tr", {}, [
+      el("td", { className: "mono" }, name),
+      el("td", { className: "mono dim" }, (bytes / 1048576).toFixed(0) + " MiB"),
+      el("td", {}, state ? el("span", { className: "pill h-healthy" }, [el("span", { className: "dot" }), "serving"]) : ""),
+      el("td", { style: "text-align:right" }, [
+        el("button", { className: "act", disabled: !!modelBusy, textContent: state ? "Stop" : "Run",
+          onclick: () => modelDo(state ? "stop" : "run", name) }),
+        " ",
+        el("button", { className: "act danger", disabled: !!modelBusy, textContent: "Remove",
+          onclick: () => modelDo("rm", name) }),
+      ]),
+    ]))),
+  ]));
+}
+
 let kubeBusy = null;   // "starting" / "stopping" while a request is out
 for (const [id, action, label] of [["kube-up", "up", "starting"], ["kube-down", "down", "stopping"]]) {
   $("#" + id).onclick = async () => {
@@ -2273,6 +2345,14 @@ async function refresh() {
     renderEvents(Array.isArray(evs) ? evs : []);
   } else if (view === "mcp") {
     await loadMcp();
+  } else if (view === "models") {
+    renderModels((await api("/api/models")).stdout);
+    if (!modelCatalogue) {
+      modelCatalogue = true;   // once: it is a request to Docker Hub
+      const r = await api("/api/registry/repos?namespace=ai");
+      $("#model-catalogue").replaceChildren(...(r.stdout || "").split("\n").filter(Boolean)
+        .map((l) => el("option", { value: l.split("\t")[0] })));
+    }
   } else if (view === "kube") {
     if (kubeBusy) return;
     const r = await api("/api/kube");

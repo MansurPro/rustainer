@@ -652,7 +652,8 @@ MEMORY, AGE with details / stop / remove.
 | column chooser | yes | **yes** — added because of this comparison |
 | per-container CPU history | full charts | a sparkline in the row |
 | Image and Port(s) columns | yes | ports fold into ADDRESS |
-| Kubernetes, Models, MCP Toolkit, Hub, Extensions, Gordon, Sign in | yes | no, and not planned |
+| Kubernetes, Models, MCP Toolkit, Hub, Extensions | yes | **yes, all five** - built after this table was first written; see below |
+| Gordon (the assistant), a sign-in screen | yes | no |
 | Settings for CPU/memory/disk | yes - it owns a VM | nothing to allocate |
 
 **Where Docker Desktop was better, and what was done about it.** Three
@@ -941,6 +942,31 @@ unprivileged user cannot drive, and a single-uid user namespace cannot
 unpack the images a cluster pulls. Docker Desktop's own
 Kubernetes was switched off on the machine this was compared on, so its
 screen was seen only in that state: a "create cluster" button.
+
+**Models.** Docker publishes models in Docker Hub's `ai/` namespace as
+OCI artifacts whose layer is a GGUF file, and its Model Runner serves
+them on port 12434. Here `rustainer model pull ai/smollm2:135M-Q4_K_M`
+downloads that layer - streamed to disk and verified against its
+digest, since a model does not fit in memory the way an image layer
+does - and `model run` starts a llama.cpp server container with the
+file mounted read-only and an OpenAI-compatible API on the same port.
+The page lists them, runs and stops them, and has a box to ask the
+running one a question. `scripts/model-test.sh` (12 assertions, its own
+CI job) pulls a real model and gets an answer out of it.
+
+What it is not: Docker's runner is a host process with Metal and CUDA
+behind it. This is a container on the CPU unless you name a GPU build
+of the server with `--image`, and nothing here was measured against
+Docker's for speed. It loads GGUF only; the `-mlx` and `-safetensors`
+tags in the same catalogue are refused with a sentence saying why.
+
+Building it found a bug that had nothing to do with models. The server
+died at start with *"Operation not permitted"*: the default seccomp
+filter answered `clone3` with EPERM, and glibc since 2.34 starts every
+thread with `clone3`, falling back to `clone` only when told the call
+does not exist. It is answered ENOSYS now, as Docker's profile does,
+which meant teaching the filter compiler to carry two error codes.
+`unshare` and the rest are still EPERM.
 
 Private repositories work with a personal access token in
 `RUSTAINER_REGISTRY_AUTH`: checked against a real account, the private

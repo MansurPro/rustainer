@@ -9,6 +9,7 @@
 //! this code runs in the same process that later calls `clone3`.
 
 pub mod extract;
+pub mod model;
 pub mod osv;
 pub mod reference;
 pub mod registry;
