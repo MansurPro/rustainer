@@ -607,25 +607,51 @@ config more than once is what a restart policy already had to do. One
 limit: a stack's healthcheck watcher is not restarted with it, so a
 started container reports no health rather than a stale one.
 
-### The three screens, against Docker's own documentation
+### The three screens, against the running application
 
-The running application could not be driven, so this compares against
-what Docker **documents** those screens as doing - the Images, Volumes
-and Containers pages under `docs.docker.com/desktop/use-desktop/`, read
-in November 2026. It is a comparison of features that exist, not of how
-well either one works, and a documented feature was not checked to be
-present in the installed version.
+First compared against Docker's documentation, because the window could
+not be driven; then against the application itself - Docker Desktop
+4.98.0, engine 29.9.2 - once a way in was found. A **second** dashboard
+window started with its own profile directory and
+`--remote-debugging-port` attaches to the same engine, and the Chrome
+DevTools protocol then navigates it and reads each screen back as text
+and as a screenshot. Nothing about the engine is disturbed.
+
+That is not how the first attempt went, and it is worth writing down:
+restarting the *existing* dashboard process with the flag took the whole
+engine down with it, stopping every running container. The dashboard is
+not a view that can be closed independently. Leave it alone and start
+another.
+
+What the application shows that the documentation did not make plain:
+
+- **Images** list an in-use marker, a disk-in-use bar with a total, a
+  search box, a filter, a column picker and bulk selection. An image's
+  page lists **every layer with its command and size, grouped by which
+  base image it came from**, beside Scout's vulnerabilities and packages
+  - 18 and 187 for `caddy:2` - searchable and filterable by "fixable".
+- **Volumes** have search, a filter, a column picker, bulk selection and
+  a creation date. A volume's page has three tabs: stored data, the
+  containers using it, and its exports.
+- **A container's Files tab marks each entry `ADDED` or `MODIFIED`
+  against the image**, which is a diff, not just a listing, and offers a
+  file editor. Its Stats tab is four charts with axes, limits and zoom:
+  CPU, memory, disk read/write and network I/O.
+
+The tables below are corrected against that.
 
 **Images**
 
 | | Docker Desktop | this page |
 | --- | --- | --- |
 | In use / unused shown | yes, plus "dangling" | yes; no dangling state |
+| Search, filter, column picker, bulk select | yes | **no**; "remove unused" is the only bulk action |
+| Disk used by images, as a total | yes | **no** |
 | Remove unused | bulk select, shows space reclaimed | two-click "remove unused", no space figure |
 | Run from an image, with options | yes | yes, the same dialog as Run |
 | Pull | yes | yes |
 | Size | on disk | compressed layers, labelled |
-| Layers and history | yes, per layer | per-layer sizes and the build history |
+| Layers and history | each layer with its command and size, grouped by base image | per-layer sizes and the build history, as two lists |
 | Packages and CVEs (Scout) | yes | **no** |
 | Push from the UI | yes | yes, with the credentials the server was started with |
 | Registry | "My Hub": your repositories | the tags of any repository you name; no account view |
@@ -635,6 +661,7 @@ present in the installed version.
 | | Docker Desktop | this page |
 | --- | --- | --- |
 | Which containers use it | yes | yes |
+| Search, filter, column picker, bulk select, creation date | yes | **no** |
 | Browse stored files | yes | yes |
 | Size | yes | yes, a floor past 20,000 entries |
 | Delete, and remove unused | yes | yes |
@@ -650,10 +677,11 @@ present in the installed version.
 | Logs | live, with search and timestamps | tail, polled, with a line filter and timestamps to 0.1 s |
 | Inspect | yes | yes |
 | Run a command | Exec, or Docker Debug | one-shot exec, and a pty terminal |
-| Files: browse | running containers | running, and a stopped one's own writes |
+| Files: browse | yes | running, and a stopped one's own writes |
+| Files: what differs from the image | each entry marked ADDED or MODIFIED | **no** for a running container; a stopped one shows only its own writes |
 | Files: download | yes | yes |
 | Files: edit, upload | yes | yes, up to 64M per upload; mode and owner kept on edit |
-| Stats | CPU, memory, network, disk over time | the same four over the last minute; disk only with the io controller |
+| Stats | four charts with axes, limits and zoom | the same four series as sparklines over the last minute, no axes; disk only with the io controller |
 | Bind mounts tab | yes | listed under inspect |
 | Start / stop / restart / delete | yes | yes |
 
