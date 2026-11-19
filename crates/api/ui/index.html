@@ -1858,7 +1858,7 @@ async function loadMcp() {
 function renderMcp() {
   const all = mcpCatalogue || [];
   const list = all.filter((s) => !mcpQuery || s.name.toLowerCase().includes(mcpQuery));
-  $("#mcp-total").textContent = all.length ? "· " + list.length + " of " + all.length + ", most pulled first" : "";
+  $("#mcp-total").textContent = all.length ? "· " + list.length + " of the " + all.length + " most pulled" : "";
   const show = async (name, network) => {
     const r = await api("/api/mcp/config?server=" + encodeURIComponent(name) + "&network=" + network);
     const box = $("#mcp-config");
@@ -1883,7 +1883,14 @@ function renderMcp() {
       el("pre", { className: "log", style: "max-height:36vh", textContent: text }));
   };
   if (!list.length) {
-    $("#mcp").replaceChildren(el("div", { className: "empty" }, all.length ? "No server matches." : "The catalogue is empty."));
+    // Docker Hub lists only a namespace's first hundred to an anonymous
+    // caller, so a server can exist and not be here. Its name is enough.
+    const typed = /^[\w.-]+$/.test(mcpQuery) ? mcpQuery : "";
+    $("#mcp").replaceChildren(el("div", { className: "empty" }, [
+      el("div", {}, all.length ? "Not among the " + all.length + " most pulled, which is all Docker Hub lists without a sign-in." : "The catalogue is empty."),
+      typed ? el("button", { className: "act", style: "margin-top:10px", textContent: "config for mcp/" + typed + " anyway",
+        onclick: () => show(typed, "bridge") }) : "",
+    ]));
     return;
   }
   $("#mcp").replaceChildren(el("table", {}, [

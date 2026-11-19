@@ -130,11 +130,14 @@ fn two() -> u32 {
 }
 
 /// The public repositories of a Docker Hub namespace: `(name, pulls,
-/// last updated)`, most recently updated first, one page of a hundred.
+/// last updated)`, most pulled first.
 ///
 /// Hub's own API rather than the registry protocol, which has no way
-/// to list a namespace. Unauthenticated, so private repositories are
-/// not in it.
+/// to list a namespace. Unauthenticated, which has two consequences:
+/// private repositories are not in it, and **only the first hundred
+/// come back** - Hub refuses an anonymous caller any further page
+/// ("pagination offset too large for anonymous requests"). Most pulled
+/// first is the ordering that makes a hundred the useful hundred.
 pub fn hub_repositories(namespace: &str) -> Result<Vec<(String, u64, String)>, String> {
     if namespace.is_empty()
         || !namespace
@@ -143,61 +146,48 @@ pub fn hub_repositories(namespace: &str) -> Result<Vec<(String, u64, String)>, S
     {
         return Err(format!("{namespace:?} is not a Docker Hub namespace"));
     }
-    let agent = ureq::Agent::config_builder()
+    let url = format!(
+        "https://hub.docker.com/v2/repositories/{namespace}/?page_size=100&ordering=pull_count"
+    );
+    let resp = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .build()
-        .new_agent();
-    let mut out = Vec::new();
-    // A hundred at a time, and at most ten pages: enough for every
-    // namespace anybody browses, and a bound on one that is not.
-    for page in 1..=10 {
-        let url = format!(
-            "https://hub.docker.com/v2/repositories/{namespace}/?page_size=100&page={page}&ordering=last_updated"
-        );
-        let resp = agent.get(&url).call().map_err(|e| format!("{url}: {e}"))?;
-        let status = resp.status().as_u16();
-        let mut body = Vec::new();
-        resp.into_body()
-            .into_reader()
-            .take(8 * 1024 * 1024)
-            .read_to_end(&mut body)
-            .map_err(|e| format!("{url}: {e}"))?;
-        if status == 404 && page == 1 {
-            return Err(format!("Docker Hub has no namespace called {namespace}"));
-        }
-        if !(200..300).contains(&status) {
-            // Past the last page is a 404 too, and not an error.
-            if page > 1 {
-                break;
-            }
-            return Err(format!("{url}: HTTP {status}"));
-        }
-        let doc: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-        let before = out.len();
-        out.extend(
-            doc["results"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|r| {
-                    Some((
-                        r["name"].as_str()?.to_owned(),
-                        r["pull_count"].as_u64().unwrap_or(0),
-                        r["last_updated"]
-                            .as_str()
-                            .unwrap_or("")
-                            .chars()
-                            .take(10)
-                            .collect(),
-                    ))
-                }),
-        );
-        if doc["next"].is_null() || out.len() == before {
-            break;
-        }
+        .new_agent()
+        .get(&url)
+        .call()
+        .map_err(|e| format!("{url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let mut body = Vec::new();
+    resp.into_body()
+        .into_reader()
+        .take(8 * 1024 * 1024)
+        .read_to_end(&mut body)
+        .map_err(|e| format!("{url}: {e}"))?;
+    if status == 404 {
+        return Err(format!("Docker Hub has no namespace called {namespace}"));
     }
-    Ok(out)
+    if !(200..300).contains(&status) {
+        return Err(format!("{url}: HTTP {status}"));
+    }
+    let doc: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+    Ok(doc["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            Some((
+                r["name"].as_str()?.to_owned(),
+                r["pull_count"].as_u64().unwrap_or(0),
+                r["last_updated"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(10)
+                    .collect(),
+            ))
+        })
+        .collect())
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
