@@ -400,6 +400,7 @@ let detailTab = "logs";
 const cpuSamples = new Map(); // id -> {usec, at} for turning a counter into a rate
 const cpuPercent = new Map();
 const cpuHistory = new Map();
+const series = new Map();     // id -> bounded histories of memory, network and disk
 const SPARK_N = 30;
 
 // Which columns are shown. Kept in localStorage because it is a
@@ -425,9 +426,9 @@ let onlyRunning = false;
 
 /// A sparkline of the last samples, or nothing when there is no history
 /// worth drawing. Inline SVG: no library, and it scales with the text.
-function spark(values) {
+function spark(values, w = 46, h = 12) {
   if (!values || values.length < 3) return "";
-  const w = 46, h = 12, max = Math.max(1, ...values);
+  const max = Math.max(1, ...values);
   const step = w / (values.length - 1);
   const d = values
     .map((v, i) => `${i ? "L" : "M"}${(i * step).toFixed(1)},${(h - (v / max) * h).toFixed(1)}`)
@@ -705,7 +706,7 @@ function buildDetail() {
     el("span", { className: "mono", style: "text-transform:none;letter-spacing:0;color:var(--text)" }, c.id),
     el("span", { className: "spacer" }),
   ]);
-  for (const name of ["logs", "terminal", "exec", "files", "inspect"]) {
+  for (const name of ["logs", "terminal", "exec", "files", "stats", "inspect"]) {
     head.append(el("button", {
       className: "act", textContent: name,
       style: detailTab === name ? "border-color:var(--accent);color:var(--accent)" : "",
@@ -751,6 +752,8 @@ function buildDetail() {
         "One shot, output collected. Not a terminal — a pty needs a second protocol, " +
         "and `rustainer exec -it` already is one."));
     body.append(pad);
+  } else if (detailTab === "stats") {
+    body.append(statsPane(c));
   } else if (detailTab === "files") {
     // Keyed by state as well as id: running shows the whole tree and
     // stopped shows only the writable layer, and one must not be left
@@ -764,6 +767,33 @@ function buildDetail() {
     body.append(inspectTable(c));
   }
   box.replaceChildren(head, body);
+}
+
+function statsPane(c) {
+  const ser = series.get(c.id) || {};
+  const last = (a) => (a && a.length ? a[a.length - 1] : null);
+  const rows = [
+    ["CPU", cpuHistory.get(c.id), (v) => v.toFixed(1) + "%"],
+    ["Memory", ser.mem, bytes],
+    ["Network in", ser.rx, (v) => bytes(v) + "/s"],
+    ["Network out", ser.tx, (v) => bytes(v) + "/s"],
+    ["Disk read", ser.rd, (v) => bytes(v) + "/s"],
+    ["Disk write", ser.wr, (v) => bytes(v) + "/s"],
+  ].filter(([, a]) => a && a.length);
+  const box = el("div", { id: "statspane" });
+  if (c.status !== "running" || !rows.length) {
+    box.append(el("div", { className: "empty" },
+      c.status === "running" ? "Collecting — two samples make a rate." : "Not running."));
+    return box;
+  }
+  box.append(el("table", {}, el("tbody", {}, rows.map(([k, a, fmt]) => el("tr", {}, [
+    el("td", { className: "dim nowrap", style: "width:150px" }, k),
+    el("td", { className: "mono nowrap", style: "width:110px" }, fmt(last(a))),
+    el("td", {}, spark(a, 420, 34)),
+  ])))));
+  box.append(el("div", { className: "hint", style: "padding:8px 14px" },
+    "The last minute, each line scaled to its own peak. Disk needs the io controller and is absent without it."));
+  return box;
 }
 
 function inspectTable(c) {
@@ -1024,7 +1054,13 @@ function buildDetailIfStale() {
   if (!openRow) return;
   const c = lastContainers.find((x) => x.id === openRow);
   if (!c) { openRow = null; buildDetail(); return; }
-  if (detailTab === "inspect" && c.status !== detailStatus) {
+  if (detailTab === "stats") {
+    // Redrawn in place every tick: it is the one tab whose whole point
+    // is that it moves, and it holds nothing a redraw could lose.
+    const pane = $("#statspane");
+    if (pane) pane.replaceWith(statsPane(c));
+    detailStatus = c.status;
+  } else if (detailTab === "inspect" && c.status !== detailStatus) {
     detailStatus = c.status;
     buildDetail();
   } else {
@@ -1198,7 +1234,10 @@ function fileBrowser(base, variant = "") {
     })));
     const r = await api(base + "?path=" + encodeURIComponent(path));
     if (r.kind === "dir") {
-      if (!r.entries.length) { pane.replaceChildren(el("div", { className: "empty" }, "Empty directory.")); return; }
+      if (!r.entries.length) {
+        pane.replaceChildren(el("div", { className: "empty" }, "Empty directory."), uploader(path));
+        return;
+      }
       const tb = el("tbody");
       for (const e of r.entries) {
         const child = "/" + [...parts, e.name].join("/");
@@ -1220,7 +1259,8 @@ function fileBrowser(base, variant = "") {
         el("th", { className: "hide-s" }, "Mode, owner"), el("th", { className: "hide-s" }, "Modified"),
       ])), tb]);
       pane.replaceChildren(t, r.truncated
-        ? el("div", { className: "hint", style: "padding:8px 14px" }, "Only the first " + r.entries.length + " entries are shown.") : "");
+        ? el("div", { className: "hint", style: "padding:8px 14px" }, "Only the first " + r.entries.length + " entries are shown.") : "",
+        uploader(path));
     } else if (r.kind === "file") {
       pane.replaceChildren(
         el("div", { className: "hint", style: "padding:8px 14px" }, [
@@ -1228,11 +1268,46 @@ function fileBrowser(base, variant = "") {
           el("a", { href: base + "?raw=1&path=" + encodeURIComponent(path), download: parts[parts.length - 1],
                     textContent: "download", style: "color:var(--accent)" }),
         ]),
-        r.binary ? "" : el("pre", { className: "log", textContent: r.text }));
+        r.binary ? "" : el("pre", { className: "log", textContent: r.text }),
+        // Only a file that is shown whole can be edited: saving the
+        // first 64K of something larger would be a truncation.
+        r.binary || r.truncated || variant ? "" : el("div", { style: "padding:8px 14px" },
+          el("button", { className: "act", textContent: "edit", onclick: () => {
+            const ta = el("textarea", { value: r.text, spellcheck: false,
+              style: "width:100%;min-height:40vh;font:12px/1.5 ui-monospace,monospace;" +
+                     "background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:8px" });
+            const msg = el("span", { className: "hint" });
+            pane.replaceChildren(el("div", { style: "padding:8px 14px" }, [ta, el("div", { style: "margin-top:8px;display:flex;gap:8px;align-items:center" }, [
+              el("button", { className: "act", textContent: "save", onclick: async () => {
+                if (await save(path, ta.value, msg)) go(path);
+              } }),
+              el("button", { className: "act", textContent: "cancel", onclick: () => go(path) }), msg,
+            ])]));
+            ta.focus();
+          } })));
     } else {
       pane.replaceChildren(el("div", { className: "empty" },
         r.kind === "other" ? "Not a file or a directory (a device, socket or pipe)." : (r.error || "unreadable")));
     }
+  };
+  // PUT the bytes to a path; the server refuses over its request limit.
+  const save = async (path, data, msg) => {
+    const r = await api(base + "?path=" + encodeURIComponent(path), { method: "PUT", body: data });
+    logCommand(["put", base.split("/")[3], path], r);
+    if (r.ok === false || r.error) { msg.textContent = (r.stderr || r.error || "failed").split("\n")[0]; return false; }
+    return true;
+  };
+  const uploader = (dir) => {
+    if (variant) return "";   // a stopped container's layer is read-only here
+    const msg = el("span", { className: "hint" });
+    const pick = el("input", { type: "file", style: "font-size:12px;width:auto;border:0;padding:0", onchange: async () => {
+      const f = pick.files[0];
+      if (!f) return;
+      if (f.size > 1024 * 1024) { msg.textContent = "Over the 1M upload limit; use a volume import for more."; return; }
+      if (await save(dir.replace(/\/$/, "") + "/" + f.name, await f.arrayBuffer(), msg)) go(dir);
+    } });
+    return el("div", { style: "padding:8px 14px;display:flex;gap:8px;align-items:center" },
+      [el("span", { className: "hint nowrap", style: "margin:0" }, "upload here:"), pick, msg]);
   };
   go("/");
   return box;
@@ -1653,6 +1728,21 @@ async function refresh() {
         }
         cpuSamples.set(c.id, { usec: s.cpu_usec, at: s.sampled_at_usec });
       }
+      // The other series, for the stats tab. Counters become per-second
+      // rates the same way; memory is already a level.
+      const ser = series.get(c.id) || { at: 0, last: {}, mem: [], rx: [], tx: [], rd: [], wr: [] };
+      const dt = (s.sampled_at_usec - ser.at) / 1e6;
+      const push = (k, v) => { ser[k].push(v); while (ser[k].length > SPARK_N) ser[k].shift(); };
+      const mem = s.memory_current ?? s.memory_rss;
+      if (mem != null) push("mem", mem);
+      for (const [k, field] of [["rx", "net_rx"], ["tx", "net_tx"], ["rd", "io_read"], ["wr", "io_write"]]) {
+        if (s[field] == null) continue;
+        if (ser.at && dt > 0 && ser.last[field] != null && s[field] >= ser.last[field])
+          push(k, (s[field] - ser.last[field]) / dt);
+        ser.last[field] = s[field];
+      }
+      ser.at = s.sampled_at_usec;
+      series.set(c.id, ser);
     }));
     renderContainers(list);
     buildDetailIfStale();

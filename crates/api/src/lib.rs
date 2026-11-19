@@ -184,6 +184,7 @@ impl Server {
                 ("GET", "logs") => self.logs(stream, &id, req),
                 ("GET", "stats") => http::json(stream, 200, &self.stats(&id)),
                 ("GET", "files") => self.container_files(stream, &id, req),
+                ("PUT", "files") => self.put_file(stream, &[&id], req),
                 ("POST", "stop") => self.run_cli(stream, &["stop", "-t", "5", &id]),
                 ("POST", "kill") => self.run_cli(stream, &["stop", "-t", "0", &id]),
                 ("POST", "start") => self.run_cli(stream, &["start", &id]),
@@ -229,6 +230,7 @@ impl Server {
                 let root = Store::default_root().join("volumes").join(&name);
                 return match (method, action) {
                     ("GET", "files") => browse_reply(stream, &root, req),
+                    ("PUT", "files") => self.put_file(stream, &["--volume", &name], req),
                     ("GET", "export") if root.is_dir() => self.export_volume(stream, &name),
                     ("POST", "empty") => self.run_cli(stream, &["volume", "empty", &name]),
                     ("POST", "clone") => {
@@ -719,13 +721,57 @@ impl Server {
     /// Every mutation goes through here, and the reason is at the top of
     /// this file: a container is created by a process that has never had a
     /// second thread, and this one has many.
+    /// Save the request body as a file. Through the CLI like every
+    /// other write, with the body on its stdin; the size is already
+    /// bounded by the request limit, which is what makes this an editor
+    /// for config files and not a way to ship a database.
+    fn put_file(
+        &self,
+        stream: &mut TcpStream,
+        target: &[&str],
+        req: &http::Request,
+    ) -> std::io::Result<()> {
+        let Some(path) = req
+            .param("path")
+            .filter(|p| !p.trim_matches('/').is_empty())
+        else {
+            return http::error(stream, 400, "a path is required");
+        };
+        let mut args = vec!["put"];
+        args.extend_from_slice(target);
+        args.push(&path);
+        self.run_cli_with(stream, &args, &req.body)
+    }
+
     fn run_cli(&self, stream: &mut TcpStream, args: &[&str]) -> std::io::Result<()> {
+        self.run_cli_with(stream, args, &[])
+    }
+
+    fn run_cli_with(
+        &self,
+        stream: &mut TcpStream,
+        args: &[&str],
+        stdin: &[u8],
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::process::Stdio;
         let mut cmd = std::process::Command::new(&self.exe);
         if let Some(root) = &self.root_arg {
             cmd.arg("--root").arg(root);
         }
-        cmd.args(args);
-        let out = match cmd.output() {
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = cmd.spawn().and_then(|mut child| {
+            // Written and closed before waiting: the child reads to EOF.
+            // At most the request limit, so it cannot fill both pipes.
+            if let Some(mut input) = child.stdin.take() {
+                let _ = input.write_all(stdin);
+            }
+            child.wait_with_output()
+        });
+        let out = match out {
             Ok(o) => o,
             Err(e) => return http::error(stream, 500, &format!("running the engine: {e}")),
         };
