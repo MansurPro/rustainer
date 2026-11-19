@@ -102,6 +102,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Add something to the page: a stack plus the address of its UI.
+    ///
+    /// An extension here is a directory with two files - a stack file,
+    /// which says what to run, and `extension.toml`, which says what it
+    /// is for and where its page is. Enabling one is `stack up`;
+    /// the page then shows its UI in a tab. That is the whole format.
+    /// It is NOT Docker's extension format and cannot load Docker's
+    /// extensions.
+    #[command(subcommand)]
+    Extension(ExtensionCmd),
     /// Find MCP servers and say how to plug one into a client.
     ///
     /// An MCP server packaged as an image is a program that speaks a
@@ -353,6 +363,154 @@ struct PullArgs {
 #[derive(Args)]
 struct RmiArgs {
     image: String,
+}
+
+#[derive(Subcommand)]
+enum ExtensionCmd {
+    /// Copy an extension directory into the store.
+    Install { dir: PathBuf },
+    /// List installed extensions.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start an extension's containers.
+    Enable { name: String },
+    /// Stop and remove an extension's containers.
+    Disable { name: String },
+    /// Disable an extension and delete it from the store.
+    Rm { name: String },
+}
+
+/// What `extension.toml` may say. Deliberately two fields.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtensionManifest {
+    #[serde(default)]
+    description: String,
+    /// Where the extension's page is once it is enabled. Loopback only:
+    /// the page embeds it, and an extension that could point that frame
+    /// at an arbitrary site would be a way to put somebody else's page
+    /// inside this one.
+    ui: String,
+}
+
+fn extensions_root() -> PathBuf {
+    Store::default_root().join("extensions")
+}
+
+/// An installed extension: its directory, its stack and its manifest.
+fn load_extension(dir: &Path) -> Result<(stack::Stack, ExtensionManifest)> {
+    let st = read_stack(&[dir.join("rustainer.toml")], &[])
+        .with_context(|| format!("{} has no usable rustainer.toml", dir.display()))?;
+    let text = std::fs::read_to_string(dir.join("extension.toml"))
+        .with_context(|| format!("{} has no extension.toml", dir.display()))?;
+    let m: ExtensionManifest = toml::from_str(&text).context("extension.toml")?;
+    let local = ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"];
+    if !local.iter().any(|p| m.ui.starts_with(p)) {
+        bail!(
+            "extension.toml: ui is {:?}, and an extension's page must be on this \
+             machine (http://127.0.0.1:<port>/).",
+            m.ui
+        );
+    }
+    Ok((st, m))
+}
+
+fn cmd_extension(paths: &Paths, cmd: ExtensionCmd) -> Result<ExitCode> {
+    let root = extensions_root();
+    let installed = |name: &str| -> Result<PathBuf> {
+        if name.is_empty() || name.contains('/') || name.starts_with('.') {
+            bail!("{name:?} is not an extension name");
+        }
+        let d = root.join(name);
+        if !d.is_dir() {
+            bail!("no extension called {name} is installed");
+        }
+        Ok(d)
+    };
+    match cmd {
+        ExtensionCmd::Install { dir } => {
+            let (st, _) = load_extension(&dir)?;
+            let dest = root.join(&st.name);
+            if dest.exists() {
+                bail!(
+                    "an extension called {} is already installed; `extension rm {}` first",
+                    st.name,
+                    st.name
+                );
+            }
+            std::fs::create_dir_all(&dest)?;
+            // ponytail: `cp -a`, as for volumes - it is the copy that
+            // already gets links and modes right.
+            let ok = std::process::Command::new("cp")
+                .arg("-a")
+                .arg(dir.join("."))
+                .arg(&dest)
+                .status()
+                .context("running cp")?
+                .success();
+            if !ok {
+                let _ = std::fs::remove_dir_all(&dest);
+                bail!("copying the extension failed");
+            }
+            println!("{}", st.name);
+        }
+        ExtensionCmd::Ls { json } => {
+            let mut rows = Vec::new();
+            for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+                let Ok((st, m)) = load_extension(&e.path()) else {
+                    continue;
+                };
+                // Enabled means running, not "was asked to run": read
+                // off the containers, like everything else here.
+                let running = st
+                    .services
+                    .keys()
+                    .flat_map(|svc| st.container_names(svc))
+                    .filter(|id| {
+                        State::load(paths, id).is_ok_and(|s| s.observed_status() == Status::Running)
+                    })
+                    .count();
+                rows.push(serde_json::json!({
+                    "name": st.name, "description": m.description, "ui": m.ui,
+                    "running": running, "services": st.services.len(),
+                }));
+            }
+            rows.sort_by_key(|r| r["name"].as_str().unwrap_or("").to_owned());
+            if json {
+                println!("{}", serde_json::Value::Array(rows));
+            } else {
+                for r in rows {
+                    println!(
+                        "{}\t{}/{} running\t{}",
+                        r["name"].as_str().unwrap_or(""),
+                        r["running"],
+                        r["services"],
+                        r["ui"].as_str().unwrap_or("")
+                    );
+                }
+            }
+        }
+        ExtensionCmd::Enable { name } => {
+            let file = installed(&name)?.join("rustainer.toml");
+            let st = read_stack(std::slice::from_ref(&file), &[])?;
+            return stack_up(paths, &st, &[file]);
+        }
+        ExtensionCmd::Disable { name } => {
+            let file = installed(&name)?.join("rustainer.toml");
+            let st = read_stack(&[file], &[])?;
+            return stack_down(paths, &st, 5);
+        }
+        ExtensionCmd::Rm { name } => {
+            let dir = installed(&name)?;
+            let st = read_stack(&[dir.join("rustainer.toml")], &[])?;
+            let _ = stack_down(paths, &st, 5);
+            std::fs::remove_dir_all(&dir)?;
+            println!("{name}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[derive(Subcommand)]
@@ -705,6 +863,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
         Command::Scan { image, json } => cmd_scan(&image, json),
+        Command::Extension(c) => cmd_extension(&paths, c),
         Command::Mcp(McpCmd::Ls) => {
             for (name, pulls, _) in rustainer_image::registry::hub_repositories("mcp")
                 .map_err(|e| anyhow::anyhow!(e))?

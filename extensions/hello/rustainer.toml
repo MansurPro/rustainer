@@ -1,0 +1,9 @@
+name = "hello"
+
+# One container answering every request with one page. `nc` rather than
+# a web server because it is in the base image: an example that needs a
+# package installed first is an example of something else.
+[services.web]
+image = "alpine:3.21"
+command = ["/bin/sh", "-c", "while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Type: text/html\\r\\n\\r\\n<!doctype html><title>hello</title><body style=\"font:16px system-ui;background:#0f1115;color:#e6e6e6;padding:24px\"><h1>hello from an extension</h1><p>This page is served by a container the extension started.</p>' | nc -l -p 80; done"]
+ports = ["127.0.0.1:18765:80"]
