@@ -729,6 +729,12 @@ how healthchecks come to be ignored. The page shows it as a second pill
 beside the status, because a container that is running *and* unhealthy
 is both of those things.
 
+**`stack update <service>`** replaces a service with what the file now
+says and rolls back if it is not healthy: the old container is set
+aside, the new one takes its name and address, and the service's
+healthcheck decides which of the two survives. It needs a healthcheck,
+and there is a gap in service while it happens.
+
 **`stack watch`** rebuilds or restarts a service when its files change,
 which is Compose's `develop.watch`, in all three actions: `rebuild`
 builds the image again and replaces the container, `restart` replaces

@@ -568,5 +568,68 @@ wait "$WPID" 2>/dev/null
 timeout 300 "$B" stack down -t 0 -f "$Y/rustainer.toml" >/dev/null 2>&1
 
 echo
+echo "15. update replaces a service, and puts the old one back if the new one is unwell"
+# The healthcheck decides. Each version of the service writes its own
+# name into its own filesystem, so "the old one is back" is checked by
+# reading a file only the old container could have written.
+U="$SCRATCH/update"
+mkdir -p "$U/gate"
+touch "$U/gate/ok"
+ufile() {
+    cat > "$U/rustainer.toml" <<EOF
+name = "ustack"
+
+[services.peer]
+image = "$IMG"
+command = ["/bin/sleep", "300"]
+
+[services.app]
+image = "$IMG"
+command = ["/bin/sh", "-c", "echo $1 > /version; exec sleep 300"]
+volumes = ["$U/gate:/gate:ro"]
+
+[services.app.healthcheck]
+test = ["/bin/sh", "-c", "test -f /gate/ok"]
+interval = 1
+retries = 3
+EOF
+}
+uver() { timeout 60 "$B" exec ustack-app /bin/cat /version 2>/dev/null | tail -1; }
+uip() { timeout 60 "$B" exec ustack-peer /bin/sh -c 'grep -w app /etc/hosts' 2>/dev/null | awk '{print $1}' | tail -1; }
+ufile one
+timeout 300 "$B" stack up -f "$U/rustainer.toml" >/dev/null 2>&1
+check "version one is what runs" "$(uver)" "one"
+PEER_SEES=$(uip)
+if [ -n "$PEER_SEES" ]; then ok "the peer resolves the service"; else bad "the peer resolves the service"; fi
+
+# A new version that cannot become healthy.
+ufile two
+rm "$U/gate/ok"
+OUT=$(timeout 300 "$B" stack update -f "$U/rustainer.toml" app 2>&1); RC=$?
+check "an update whose healthcheck fails is an error" "$RC" "1"
+contains "and it says what it did" "$OUT" "rolled back"
+check "the container is running" "$("$B" ps | awk '$1 == "ustack-app" {print $2}')" "running"
+check "and it is the OLD one, with the file only it wrote" "$(uver)" "one"
+check "nothing is left set aside" "$("$B" ps -a | grep -c rollback)" "0"
+contains "the rollback is in the event log" "$("$B" events --since 900 --limit 400)" "rollback"
+
+# The same new version, now able to pass.
+touch "$U/gate/ok"
+OUT=$(timeout 300 "$B" stack update -f "$U/rustainer.toml" app 2>&1); RC=$?
+check "an update that becomes healthy succeeds" "$RC" "0"
+check "and the new version is what runs" "$(uver)" "two"
+check "nothing is left set aside this time either" "$("$B" ps -a | grep -c rollback)" "0"
+# The replacement takes over the address, so a service that was already
+# running and already resolved it does not have to be told anything.
+check "the new container has the address the peer already knows" \
+    "$(timeout 60 "$B" exec ustack-app /bin/sh -c "ip -4 -o addr show | grep -v ' lo ' | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null | tail -1)" "$PEER_SEES"
+check "the peer was not restarted to achieve that" "$("$B" ps | awk '$1 == "ustack-peer" {print $2}')" "running"
+
+printf 'name = "nh"\n\n[services.a]\nimage = "%s"\ncommand = ["/bin/true"]\n' "$IMG" > "$U/nohealth.toml"
+refuses "a service with no healthcheck cannot be updated this way" "has no healthcheck" \
+    timeout 60 "$B" stack update -f "$U/nohealth.toml" a
+timeout 300 "$B" stack down -t 0 -f "$U/rustainer.toml" >/dev/null 2>&1
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

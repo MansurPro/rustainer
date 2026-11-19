@@ -460,14 +460,29 @@ And `watch`, in all three of Compose's actions:
 
 ### What Compose still has that these stacks do not
 
-The parts of `deploy` beyond `replicas`: **placement constraints and
-rollback policy**, which are orchestrator concepts this deliberately is
-not - there is no scheduler to place anything and no rolling update to
-roll back. `deploy.resources` has no equivalent spelling because the
-limits themselves already do: `memory`, `cpus` and `pids_limit` are
-service keys here.
+**Placement constraints**, the part of `deploy` that needs more than one
+host: there is no scheduler here to place anything. `deploy.resources`
+has no equivalent spelling because the limits themselves already do:
+`memory`, `cpus` and `pids_limit` are service keys here.
 
-And `watch`'s `sync` propagating deletions, above.
+Rollback, the other part, is here in the one form a single host can
+honour. `stack update <service>` stops the old container and **sets it
+aside** rather than removing it, starts the new one under the same name
+and address, and lets the service's own healthcheck decide: healthy, and
+the old one is deleted; not, and the new one is removed and the old one
+started again exactly as it was. Stage 18 gives each version a file only
+it could have written and reads it back after a failed update. Two
+things it is not: zero-downtime, because two containers cannot hold one
+published port and there is no proxy in front; and available without a
+healthcheck, because "it started" is not evidence that it works.
+
+Writing it found a bug in `up`: on a half-running stack it allocated a
+fresh address for every service, including the running ones, and wrote
+those into the new services' `/etc/hosts` - so a service started later
+could not find one already running. An existing container now keeps the
+address it has.
+
+`watch`'s `sync` propagating deletions, above.
 
 That is the list.
 
