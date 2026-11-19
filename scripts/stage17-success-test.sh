@@ -410,5 +410,29 @@ check "a server name that is a flag is refused" \
     "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/mcp/config?server=--help")" "400"
 
 echo
+echo "16. --privileged removes the confinement, and only when asked"
+# The same probe in both, so the difference between the two lines IS
+# what the flag does - and the first line is a regression test for
+# every ordinary container.
+PROBE='grep CapEff /proc/self/status | cut -f2; mount -t tmpfs none /mnt 2>/dev/null && echo can-mount || echo cannot-mount; (echo 1 > /proc/sys/kernel/sysrq) 2>/dev/null && echo procsys-rw || echo procsys-ro; ls /dev/kmsg >/dev/null 2>&1 && echo kmsg || echo no-kmsg'
+# Real root, not uid 0 in a user namespace: there the kernel still
+# refuses /proc/sys and device nodes whatever this engine allows, so
+# the flag has less to give and the assertions below would be about
+# the namespace rather than about the flag.
+if grep -q '^ *0 *0 *4294967295' /proc/self/uid_map 2>/dev/null; then
+    ORD=$(timeout 60 "$B" run --rm --network none --layer "$BASE" /bin/sh -c "$PROBE" 2>/dev/null | tr '\n' ' ')
+    PRV=$(timeout 60 "$B" run --rm --network none --privileged --layer "$BASE" /bin/sh -c "$PROBE" 2>/dev/null | tr '\n' ' ')
+    contains "an ordinary container cannot mount" "$ORD" "cannot-mount"
+    contains "nor write /proc/sys" "$ORD" "procsys-ro"
+    contains "nor see the kernel log device" "$ORD" "no-kmsg"
+    contains "a privileged one can mount" "$PRV" " can-mount"
+    contains "and write /proc/sys" "$PRV" "procsys-rw"
+    contains "and has the kernel log device" "$PRV" " kmsg"
+    if [ "${ORD%% *}" != "${PRV%% *}" ]; then ok "and holds capabilities the ordinary one does not"; else bad "capabilities are the same (${ORD%% *})"; fi
+else
+    skip "--privileged is only asserted as real root; a user namespace keeps limits of its own"
+fi
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

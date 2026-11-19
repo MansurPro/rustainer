@@ -285,6 +285,20 @@ else
 fi
 
 echo
+echo "7c. What follows the image name is arguments to its ENTRYPOINT"
+# Docker's rule, and the one every image with an entrypoint is written
+# for: `run image a b` is `<entrypoint> a b`, and CMD is only the default
+# arguments. This engine used to replace the entrypoint too.
+N="$SCRATCH/epctx"; mkdir -p "$N"
+printf 'FROM %s\nENTRYPOINT ["/bin/echo", "entry"]\nCMD ["default-arg"]\n' "$IMG" > "$N/Dockerfile"
+timeout 600 "$B" build --network none -t ep:1 "$N" >/dev/null 2>&1
+epr() { timeout 60 "$B" run --network none "$@" 2>/dev/null | tail -1; }
+check "with no arguments, CMD supplies them" "$(epr ep:1)" "entry default-arg"
+check "arguments replace CMD and keep the entrypoint" "$(epr ep:1 one two)" "entry one two"
+check "--entrypoint replaces it, and drops CMD with it" "$(epr --entrypoint /bin/pwd ep:1)" "/"
+check "an empty --entrypoint makes the arguments the whole command" "$(epr --entrypoint "" ep:1 /bin/echo bare)" "bare"
+
+echo
 echo "8. The built image is an ordinary image"
 contains "images lists it" "$("$B" images)" "demo_1"
 timeout 60 "$B" rmi demo:3 >/dev/null 2>&1 \

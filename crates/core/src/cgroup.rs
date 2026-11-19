@@ -97,6 +97,11 @@ pub struct Limits {
     pub cpus: Option<f64>,
     /// Tasks — threads, not processes — to `pids.max`.
     pub pids: Option<u64>,
+    /// Hand the container every controller the parent has, not just the
+    /// ones a limit needs. For a privileged container that will manage
+    /// cgroups of its own - a nested engine, a kubelet - and refuses to
+    /// start when one it expects is missing.
+    pub all_controllers: bool,
 }
 
 impl Limits {
@@ -260,7 +265,24 @@ impl Cgroup {
             }
         }
 
+        // Best effort, unlike the loop above: nothing was promised about
+        // these, and a host that will not delegate `rdma` is not a reason
+        // to refuse a container that never mentioned it.
+        if limits.all_controllers {
+            let _ = enter_own_leaf();
+            let have = std::fs::read_to_string(base.join("cgroup.controllers")).unwrap_or_default();
+            for c in have.split_whitespace() {
+                if !subtree_has(&base, c) {
+                    let _ = write_file(&base.join("cgroup.subtree_control"), &format!("+{c}"));
+                }
+            }
+        }
+
         let dir = base.join(format!("rustainer-{id}"));
+        // A previous container of this name may have left a tree here.
+        if dir.is_dir() {
+            remove_children(&dir);
+        }
         if let Err(source) = std::fs::create_dir_all(&dir) {
             // Nothing was asked for, so nothing was promised: run without a
             // cgroup rather than refusing. A *requested* limit takes the
@@ -375,7 +397,40 @@ impl Cgroup {
     pub fn remove(&self) {
         // A cgroup with live tasks cannot be removed; that is the kernel
         // telling us the truth, so there is nothing to do about it here.
+        remove_children(&self.dir);
         let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// Remove the cgroups a container made beneath its own.
+///
+/// An ordinary container cannot make any - its cgroup is read-only to
+/// it. A privileged one can and does: a kubelet builds a tree several
+/// levels deep. Left behind, that tree makes the parent impossible to
+/// remove and, worse, impossible to REUSE: it still has controllers in
+/// `subtree_control`, and a cgroup in that state may not hold a process,
+/// so the next container of the same name fails at `clone3` with EBUSY.
+///
+/// Depth first, because a cgroup is removable only once it is empty of
+/// both tasks and children; and with a few retries, because the tasks
+/// of a container that was just killed take a moment to be reaped.
+fn remove_children(dir: &Path) {
+    for attempt in 0..20 {
+        let mut left = false;
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                remove_children(&e.path());
+                left |= std::fs::remove_dir(e.path()).is_err();
+            }
+        }
+        if !left {
+            return;
+        }
+        // Ask the kernel to finish the job, then give it a moment.
+        if attempt == 0 {
+            let _ = write_file(&dir.join("cgroup.kill"), "1");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -563,6 +618,7 @@ mod tests {
             memory: Some(1),
             cpus: Some(1.0),
             pids: Some(1),
+            ..Default::default()
         };
         let c = l.controllers();
         assert!(c.contains(&"memory") && c.contains(&"cpu") && c.contains(&"pids"));
