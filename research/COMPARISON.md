@@ -652,8 +652,8 @@ present in the installed version.
 | Run a command | Exec, or Docker Debug | one-shot exec, and a pty terminal |
 | Files: browse | running containers | running, and a stopped one's own writes |
 | Files: download | yes | yes |
-| Files: edit, upload | yes | **no** |
-| Stats | CPU, memory, network, disk over time | CPU over time; memory, network and disk as totals |
+| Files: edit, upload | yes | yes, up to 1M per file; mode and owner kept on edit |
+| Stats | CPU, memory, network, disk over time | the same four over the last minute; disk only with the io controller |
 | Bind mounts tab | yes | listed under inspect |
 | Start / stop / restart / delete | yes | yes |
 
@@ -667,8 +667,10 @@ appears there.
 
 What is still missing, and is not close: **package and CVE data**, which
 needs a vulnerability database this project does not have; a registry
-browser; editing and uploading files; log timestamps; and charts for
-anything but CPU. It is nearer parity than it was, and it is not parity.
+browser; log timestamps; importing a volume from the page; and files
+over 1M in the editor. Editing a file and the memory, network and disk
+charts followed in a second pass. It is nearer parity than it was, and
+it is not parity.
 
 ### What the page does that is worth something
 

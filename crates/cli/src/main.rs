@@ -122,6 +122,18 @@ enum Command {
         to: String,
     },
 
+    /// Internal: write stdin to a file in a running container, or in a
+    /// volume with `--volume`. What the page's editor and upload call.
+    #[command(hide = true)]
+    Put {
+        #[arg(long)]
+        volume: bool,
+        /// A container id, or a volume name.
+        target: String,
+        /// Where in it, as an absolute path.
+        path: String,
+    },
+
     /// Internal: keep running a container's healthcheck and record what
     /// it says.
     ///
@@ -618,6 +630,25 @@ fn real_main() -> Result<ExitCode> {
         Command::Stack(a) => cmd_stack(&paths, a),
         Command::Supervise { id } => cmd_supervise(&paths, &id),
         Command::Forward { fd, to } => cmd_forward(fd, &to),
+        Command::Put {
+            volume,
+            target,
+            path,
+        } => {
+            let root = if volume {
+                volume_dir(&target, true)?
+            } else {
+                let pid = State::load(&paths, &target)
+                    .ok()
+                    .filter(|s| s.observed_status() == Status::Running)
+                    .and_then(|s| s.init_pid)
+                    .with_context(|| format!("{target} is not a running container"))?;
+                PathBuf::from(format!("/proc/{pid}/root"))
+            };
+            write_confined(&root, Path::new(&path), &mut std::io::stdin().lock(), None)?;
+            println!("{path}");
+            Ok(ExitCode::SUCCESS)
+        }
         Command::HealthWatch {
             id,
             interval,
@@ -1933,15 +1964,51 @@ fn sync_scan(root: &Path) -> Seen {
 /// planted-symlink case above, or a read-only mount - is reported and
 /// does not hold up the rest of the batch.
 fn sync_into(pid: i32, src: &Path, target: &str, rels: &[PathBuf]) -> Result<usize> {
-    use rustix::fs::{Mode, OFlags, ResolveFlags};
     use std::os::unix::fs::PermissionsExt;
+    let root = PathBuf::from(format!("/proc/{pid}/root"));
+    let single = src.is_file();
+    let mut done = 0;
+    for rel in rels {
+        let from = if single {
+            src.to_path_buf()
+        } else {
+            src.join(rel)
+        };
+        let dest = Path::new(target.trim_start_matches('/')).join(rel);
+        let one = || -> Result<()> {
+            let mode = std::fs::metadata(&from)?.permissions().mode();
+            write_confined(&root, &dest, &mut std::fs::File::open(&from)?, Some(mode))
+        };
+        match one() {
+            Ok(()) => done += 1,
+            Err(e) => eprintln!("rustainer: sync: {}: {e:#}", rel.display()),
+        }
+    }
+    Ok(done)
+}
+
+/// Write `reader` to `dest`, a path relative to `root`, without leaving
+/// `root` - the one way this engine writes into a tree it does not own.
+///
+/// Missing parent directories are made. With no `mode`, a file that is
+/// being replaced keeps its mode and its owner: an edit that quietly
+/// turned nginx's config from `nginx:nginx 0640` into `root:root 0644`
+/// would be a different change from the one that was asked for.
+fn write_confined(
+    root: &Path,
+    dest: &Path,
+    reader: &mut dyn Read,
+    mode: Option<u32>,
+) -> Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let root = rustix::fs::open(
-        format!("/proc/{pid}/root"),
+        root,
         OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .context("opening the container's filesystem")?;
+    .with_context(|| format!("opening {}", root.display()))?;
     let inside = |rel: &Path| {
         rustix::fs::openat2(
             &root,
@@ -1955,59 +2022,55 @@ fn sync_into(pid: i32, src: &Path, target: &str, rels: &[PathBuf]) -> Result<usi
             ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
         )
     };
-    let single = src.is_file();
-    let mut done = 0;
-    for rel in rels {
-        let one = || -> Result<()> {
-            let from = if single {
-                src.to_path_buf()
-            } else {
-                src.join(rel)
-            };
-            let dest = Path::new(target.trim_start_matches('/')).join(rel);
-            let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
-                return Ok(());
-            };
-            // mkdir -p, one component at a time, each one looked up from
-            // the root again so the confinement holds at every step.
-            let mut walked = PathBuf::new();
-            for comp in parent.components() {
-                let here = inside(&walked).with_context(|| format!("/{}", walked.display()))?;
-                match rustix::fs::mkdirat(&here, comp.as_os_str(), Mode::from_bits_truncate(0o755))
-                {
-                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                    Err(e) => bail!("creating /{}: {e}", walked.join(comp).display()),
-                }
-                walked.push(comp);
-            }
-            let dir = inside(parent).with_context(|| format!("/{}", parent.display()))?;
-            let mode = std::fs::metadata(&from)
-                .map(|m| m.permissions().mode())
-                .unwrap_or(0o644);
-            let tmp = format!(".{}.rustainer-sync", name.to_string_lossy());
-            let _ = rustix::fs::unlinkat(&dir, tmp.as_str(), rustix::fs::AtFlags::empty());
-            let fd = rustix::fs::openat(
-                &dir,
-                tmp.as_str(),
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::from_bits_truncate(mode & 0o7777),
-            )
-            .with_context(|| format!("writing /{}", dest.display()))?;
-            let mut out = std::fs::File::from(fd);
-            std::io::copy(&mut std::fs::File::open(&from)?, &mut out)
-                .with_context(|| format!("copying {}", from.display()))?;
-            // The mode again, explicitly: the create was subject to our umask.
-            let _ = out.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777));
-            rustix::fs::renameat(&dir, tmp.as_str(), &dir, name)
-                .with_context(|| format!("replacing /{}", dest.display()))?;
-            Ok(())
-        };
-        match one() {
-            Ok(()) => done += 1,
-            Err(e) => eprintln!("rustainer: sync: {}: {e:#}", rel.display()),
+    let dest = dest.strip_prefix("/").unwrap_or(dest);
+    let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
+        bail!("{} is not a file path", dest.display());
+    };
+    // mkdir -p, one component at a time, each one looked up from the
+    // root again so the confinement holds at every step.
+    let mut walked = PathBuf::new();
+    for comp in parent.components() {
+        let here = inside(&walked).with_context(|| format!("/{}", walked.display()))?;
+        match rustix::fs::mkdirat(&here, comp.as_os_str(), Mode::from_bits_truncate(0o755)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(e) => bail!("creating /{}: {e}", walked.join(comp).display()),
         }
+        walked.push(comp);
     }
-    Ok(done)
+    let dir = inside(parent).with_context(|| format!("/{}", parent.display()))?;
+    // What is there now, not following a link: a link at the final name
+    // is replaced, never written through.
+    let before = rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)
+        .ok()
+        .filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG);
+    let mode = mode
+        .or(before.as_ref().map(|st| st.st_mode))
+        .unwrap_or(0o644)
+        & 0o7777;
+    // Written beside the destination and renamed over it, so a reader
+    // sees the old file or the new one and never half of either.
+    let tmp = format!(".{}.rustainer-tmp", name.to_string_lossy());
+    let _ = rustix::fs::unlinkat(&dir, tmp.as_str(), AtFlags::empty());
+    let fd = rustix::fs::openat(
+        &dir,
+        tmp.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_bits_truncate(mode),
+    )
+    .with_context(|| format!("writing /{}", dest.display()))?;
+    let mut out = std::fs::File::from(fd);
+    std::io::copy(reader, &mut out).with_context(|| format!("writing /{}", dest.display()))?;
+    // The mode again, explicitly: the create was subject to our umask.
+    let _ = out.set_permissions(std::fs::Permissions::from_mode(mode));
+    if let Some(st) = before
+        && let Ok(now) = out.metadata()
+        && (now.uid(), now.gid()) != (st.st_uid, st.st_gid)
+    {
+        let _ = std::os::unix::fs::fchown(&out, Some(st.st_uid), Some(st.st_gid));
+    }
+    rustix::fs::renameat(&dir, tmp.as_str(), &dir, name)
+        .with_context(|| format!("replacing /{}", dest.display()))?;
+    Ok(())
 }
 
 fn stack_watch(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitCode> {
