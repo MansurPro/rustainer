@@ -513,6 +513,11 @@ struct BuildArgs {
     #[arg(long, default_value = "bridge")]
     network: String,
 
+    /// Run every step again, even ones an earlier build already ran
+    /// with the same inputs.
+    #[arg(long)]
+    no_cache: bool,
+
     /// The build context: the directory COPY may read from.
     #[arg(default_value = ".")]
     context: PathBuf,
@@ -2353,6 +2358,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 file: None,
                 build_args: Vec::new(),
                 network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
+                no_cache: false,
                 context,
             },
         )
@@ -3712,6 +3718,22 @@ fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
         let _ = std::fs::remove_dir_all(&staging);
     };
 
+    // The cache. A RUN step's result depends on the filesystem it ran
+    // over and on how it was run, so its key is a hash of both: `chain`
+    // is the identity of everything beneath it - the base image, every
+    // COPY by the content it copied, every RUN by its own key - and the
+    // step adds its command, environment, working directory, user and
+    // network. Change any of those, or anything earlier, and the key
+    // changes; that is the whole invalidation rule.
+    //
+    // What a key cannot see is the outside world. `RUN apk add curl` is
+    // one key whatever the package index says today, here as in Docker,
+    // and `--no-cache` is the answer to that.
+    let cache_dir = Store::default_root().join("build-cache");
+    let hash = |parts: &[&str]| rustainer_image::registry::sha256_hex(parts.join("\0").as_bytes());
+    let mut chain = String::new();
+    let mut reused = 0usize;
+
     let total = instructions.len();
     for (n, ins) in instructions.iter().enumerate() {
         println!("[{}/{}] {}", n + 1, total, build::describe(ins));
@@ -3761,6 +3783,7 @@ fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
                 built.user = base.user.clone();
                 built.cmd = base.cmd.clone();
                 built.entrypoint = base.entrypoint.clone();
+                chain = hash(&["from", &base.digest, &base_diff_ids.join(",")]);
             }
             Instruction::Env(k, v) => {
                 let v = build::expand(v, &vars);
@@ -3814,12 +3837,52 @@ fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
                     build::copy_into(&from_path, &target)
                         .with_context(|| format!("copying {src} into the image"))?;
                 }
+                // A COPY is not looked up - doing it is as cheap as
+                // checking - but what it copied is part of the identity
+                // of every step after it, and the diff_id is exactly a
+                // hash of that.
                 let (diff_id, tar) = build::seal_layer(&layer_dir)?;
+                chain = hash(&[&chain, "copy", &diff_id]);
+                let layer_dir = store.commit_layer(&diff_id, &layer_dir)?;
                 built.layers.push(layer_dir.clone());
                 built.diff_ids.push(diff_id.clone());
                 sealed.push((diff_id, layer_dir, tar));
             }
             Instruction::Run(argv) => {
+                let expanded: Vec<String> = argv.iter().map(|a| build::expand(a, &vars)).collect();
+                let key = hash(&[
+                    &chain,
+                    "run",
+                    &expanded.join("\u{1f}"),
+                    &built.env.join("\u{1f}"),
+                    built.workdir.as_deref().unwrap_or(""),
+                    built.user.as_deref().unwrap_or(""),
+                    &args.network,
+                ]);
+                chain = key.clone();
+                let record = cache_dir.join(key.trim_start_matches("sha256:"));
+                // A hit needs three things to agree: a record of what
+                // this step produced, that layer still being in the
+                // store, and the layer still hashing to what the record
+                // says. The third is what stops a damaged or edited
+                // layer being built on as if it were the step's result.
+                let hit = (!args.no_cache)
+                    .then(|| std::fs::read_to_string(&record).ok())
+                    .flatten()
+                    .map(|d| d.trim().to_owned())
+                    .and_then(|d| {
+                        let dir = store.layer_path(&d);
+                        let (now, tar) = dir.is_dir().then(|| build::seal_layer(&dir).ok())??;
+                        (now == d).then_some((d, dir, tar))
+                    });
+                if let Some((diff_id, dir, tar)) = hit {
+                    println!("        cached");
+                    reused += 1;
+                    built.layers.push(dir.clone());
+                    built.diff_ids.push(diff_id.clone());
+                    sealed.push((diff_id, dir, tar));
+                    continue;
+                }
                 let step_id = format!("build-{}", new_id()?);
                 let mut command: Vec<OsString> =
                     vec![built.layers.first().cloned().unwrap_or_default().into()];
@@ -3837,10 +3900,7 @@ fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
                     workdir: built.workdir.clone(),
                     user: built.user.clone(),
                     env: built.env.clone(),
-                    command: argv
-                        .iter()
-                        .map(|a| OsString::from(build::expand(a, &vars)))
-                        .collect(),
+                    command: expanded.iter().map(OsString::from).collect(),
                     ..Default::default()
                 };
                 let _ = cmd_run(paths, run).with_context(|| format!("running step {}", n + 1))?;
@@ -3870,11 +3930,20 @@ fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
                 let _ = supervise::remove(paths, &step_id, true);
 
                 let (diff_id, tar) = build::seal_layer(&layer_dir)?;
+                // Committed and recorded now, not when the image is
+                // tagged: if a later step fails, the next build still
+                // starts from here.
+                let layer_dir = store.commit_layer(&diff_id, &layer_dir)?;
+                let _ = std::fs::create_dir_all(&cache_dir);
+                let _ = std::fs::write(&record, &diff_id);
                 built.layers.push(layer_dir.clone());
                 built.diff_ids.push(diff_id.clone());
                 sealed.push((diff_id, layer_dir, tar));
             }
         }
+    }
+    if reused > 0 {
+        println!("{reused} step(s) reused from an earlier build");
     }
 
     if built.layers.is_empty() {

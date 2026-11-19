@@ -225,6 +225,66 @@ AFTER=$(find "$RUSTAINER_IMAGE_ROOT"/layers* -mindepth 1 -maxdepth 1 -type d 2>/
 check "rebuilding adds no new layer" "$AFTER" "$BEFORE"
 
 echo
+echo "7b. A step that already ran with the same inputs is not run again"
+# Each RUN writes a value nobody could reproduce, so "the step did not
+# run" is checked by the value being the same one, not by reading the
+# build's own claim that it was cached.
+K="$SCRATCH/cachectx"; mkdir -p "$K"
+echo "v1" > "$K/input.txt"
+kfile() {
+    cat > "$K/Dockerfile" <<EOF
+FROM $IMG
+RUN cat /proc/sys/kernel/random/uuid > /first
+COPY input.txt /input.txt
+RUN cat /proc/sys/kernel/random/uuid > /second
+$1
+EOF
+}
+kval() { timeout 60 "$B" run --network none "$1" /bin/cat "$2" 2>/dev/null | tail -1; }
+kfile ""
+timeout 600 "$B" build --network none -t kc:1 "$K" >/dev/null 2>&1
+F1=$(kval kc:1 /first); S1=$(kval kc:1 /second)
+# Without this, every "same value" check below would pass on two empty
+# strings - which is how the first version of this section passed.
+if [ "${#F1}" -eq 36 ] && [ "${#S1}" -eq 36 ] && [ "$F1" != "$S1" ]; then
+    ok "each step wrote a value of its own"
+else
+    bad "each step wrote a value of its own (got '$F1' and '$S1')"
+fi
+OUT=$(timeout 600 "$B" build --network none -t kc:2 "$K" 2>&1)
+contains "the second build says what it reused" "$OUT" "2 step(s) reused"
+check "and the first step really did not run again" "$(kval kc:2 /first)" "$F1"
+check "nor the second" "$(kval kc:2 /second)" "$S1"
+
+# Change what COPY copies: the step before it is still good, the step
+# after it is not.
+echo "v2" > "$K/input.txt"
+timeout 600 "$B" build --network none -t kc:3 "$K" >/dev/null 2>&1
+check "a step before a changed COPY is still reused" "$(kval kc:3 /first)" "$F1"
+if [ "$(kval kc:3 /second)" != "$S1" ] && [ -n "$(kval kc:3 /second)" ]; then
+    ok "and the step after it runs again"
+else
+    bad "and the step after it runs again (got '$(kval kc:3 /second)')"
+fi
+check "with the new file in the image" "$(kval kc:3 /input.txt)" "v2"
+
+# A build that fails late keeps the work it did early.
+kfile "RUN exit 7"
+timeout 600 "$B" build --network none -t kc:4 "$K" >/dev/null 2>&1
+check "a failing step fails the build" "$?" "1"
+kfile "RUN echo fixed > /fixed"
+OUT=$(timeout 600 "$B" build --network none -t kc:5 "$K" 2>&1)
+contains "the steps before a failure are reused once it is fixed" "$OUT" "2 step(s) reused"
+check "and the fixed step ran" "$(kval kc:5 /fixed)" "fixed"
+
+timeout 600 "$B" build --no-cache --network none -t kc:6 "$K" >/dev/null 2>&1
+if [ "$(kval kc:6 /first)" != "$F1" ] && [ -n "$(kval kc:6 /first)" ]; then
+    ok "--no-cache runs every step again"
+else
+    bad "--no-cache runs every step again (got '$(kval kc:6 /first)')"
+fi
+
+echo
 echo "8. The built image is an ordinary image"
 contains "images lists it" "$("$B" images)" "demo_1"
 timeout 60 "$B" rmi demo:3 >/dev/null 2>&1 \

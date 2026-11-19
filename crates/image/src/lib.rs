@@ -160,6 +160,35 @@ impl Store {
             .join(diff_id.trim_start_matches("sha256:"))
     }
 
+    /// Where a layer with this `diff_id` lives, or would live, for the
+    /// kind of mount this process can make.
+    pub fn layer_path(&self, diff_id: &str) -> PathBuf {
+        self.layer_dir(diff_id, Self::userxattr())
+    }
+
+    /// Put a built layer in the store now, rather than when its image
+    /// is tagged, and return where it is. A layer already there is the
+    /// same content by definition and the new copy is dropped.
+    ///
+    /// This is what makes a build's steps reusable by the NEXT build
+    /// even when this one fails further on: the work done so far is
+    /// kept under the name its content gives it.
+    pub fn commit_layer(&self, diff_id: &str, dir: &Path) -> Result<PathBuf, Error> {
+        let dest = self.layer_path(diff_id);
+        if dir == dest {
+            return Ok(dest);
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(io("creating the layer store", parent))?;
+        }
+        if dest.exists() {
+            let _ = std::fs::remove_dir_all(dir);
+        } else {
+            std::fs::rename(dir, &dest).map_err(io("committing a built layer", &dest))?;
+        }
+        Ok(dest)
+    }
+
     /// Are we outside the initial user namespace?
     fn userxattr() -> bool {
         std::fs::read_to_string("/proc/self/uid_map")
@@ -383,7 +412,11 @@ impl Store {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(io("creating the layer store", parent))?;
             }
-            if dest.exists() {
+            if dir == &dest {
+                // Committed while it was being built, so there is
+                // nothing to move - and removing "the duplicate" here
+                // would be removing the layer.
+            } else if dest.exists() {
                 // Identical content under an identical name. Dropping the
                 // duplicate is the whole benefit of content addressing.
                 let _ = std::fs::remove_dir_all(dir);
