@@ -420,6 +420,9 @@ const cpuPercent = new Map();
 const cpuHistory = new Map();
 const series = new Map();     // id -> bounded histories of memory, network and disk
 const SPARK_N = 30;
+// What is kept for the stats tab: fifteen minutes at one sample every
+// two seconds. Still bounded, for the same reason the sparkline is.
+const HISTORY_N = 450;
 
 // Which columns are shown. Kept in localStorage because it is a
 // per-viewer convenience and nothing else: it must never be the reason
@@ -647,7 +650,7 @@ function renderContainers(list) {
       show("address") ? el("td", { className: "mono dim nowrap hide-s" },
         (c.ip || "—") + (c.ports && c.ports.length ? "  " + c.ports.map((p) => p.host + "→" + p.container).join(" ") : "")) : "",
       show("cpu") ? el("td", { className: "mono nowrap" }, running && pct != null
-        ? [pct.toFixed(1) + "%", spark(cpuHistory.get(c.id))] : "—") : "",
+        ? [pct.toFixed(1) + "%", spark((cpuHistory.get(c.id) || []).slice(-SPARK_N))] : "—") : "",
       show("memory") ? el("td", { className: "nowrap" }, running && memVal != null
         ? el("span", {
             className: "mono",
@@ -795,6 +798,7 @@ function buildDetail() {
 // A sparkline with the two things that make it readable as a chart:
 // what the top of it is worth, and how far back it goes.
 let zoomed = false;   // one switch for all four: they are read together
+let chartRange = SPARK_N;   // how many samples the charts show
 function chart(values, fmt, limit) {
   const [w, h] = zoomed ? [760, 120] : [420, 40];
   // With a limit, the chart is scaled to it and its top edge IS the
@@ -812,7 +816,7 @@ function chart(values, fmt, limit) {
                   onclick: () => { zoomed = !zoomed; const c = lastContainers.find((x) => x.id === openRow); if (c) $("#statspane").replaceWith(statsPane(c)); } },
         spark(values, w, h, limit || 0) || el("div", { style: `width:${w}px;height:${h}px` })),
       el("div", { style: `display:flex;justify-content:space-between;width:${w + 2}px` },
-        [axis(values.length * 2 + "s ago", ""), axis("now", "")]),
+        [axis(values.length < 60 ? values.length * 2 + "s ago" : Math.round(values.length / 30) + " min ago", ""), axis("now", "")]),
     ]),
   ]);
 }
@@ -834,10 +838,18 @@ function statsPane(c) {
       c.status === "running" ? "Collecting — two samples make a rate." : "Not running."));
     return box;
   }
+  // The page only has what it has seen: a range longer than it has been
+  // open shows what there is, and the axis says how far back that goes.
+  box.append(el("div", { style: "padding:8px 14px;display:flex;gap:6px;align-items:center" },
+    [el("span", { className: "hint", style: "margin:0 6px 0 0" }, "show the last"),
+     ...[["1 min", 30], ["5 min", 150], ["15 min", 450]].map(([label, n]) => el("button", {
+       className: "act", textContent: label,
+       style: chartRange === n ? "border-color:var(--accent);color:var(--accent)" : "",
+       onclick: () => { chartRange = n; $("#statspane").replaceWith(statsPane(c)); } }))]));
   box.append(el("table", {}, el("tbody", {}, rows.map(([k, a, fmt]) => el("tr", {}, [
     el("td", { className: "dim nowrap", style: "width:150px" }, k),
     el("td", { className: "mono nowrap", style: "width:110px" }, fmt(last(a))),
-    el("td", {}, chart(a, fmt, k === "Memory" ? c.memory : 0)),
+    el("td", {}, chart(a.slice(-chartRange), fmt, k === "Memory" ? c.memory : 0)),
   ])))));
   box.append(el("div", { className: "hint", style: "padding:8px 14px" },
     "Each chart is scaled to its own peak, which is the number at its top. Disk needs the io controller and is absent without it."));
@@ -1955,7 +1967,7 @@ async function refresh() {
             // the page's memory problem.
             const h = cpuHistory.get(c.id) || [];
             h.push(pct);
-            while (h.length > SPARK_N) h.shift();
+            while (h.length > HISTORY_N) h.shift();
             cpuHistory.set(c.id, h);
           }
         }
@@ -1965,7 +1977,7 @@ async function refresh() {
       // rates the same way; memory is already a level.
       const ser = series.get(c.id) || { at: 0, last: {}, mem: [], rx: [], tx: [], rd: [], wr: [] };
       const dt = (s.sampled_at_usec - ser.at) / 1e6;
-      const push = (k, v) => { ser[k].push(v); while (ser[k].length > SPARK_N) ser[k].shift(); };
+      const push = (k, v) => { ser[k].push(v); while (ser[k].length > HISTORY_N) ser[k].shift(); };
       const mem = s.memory_current ?? s.memory_rss;
       if (mem != null) push("mem", mem);
       for (const [k, field] of [["rx", "net_rx"], ["tx", "net_tx"], ["rd", "io_read"], ["wr", "io_write"]]) {

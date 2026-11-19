@@ -704,7 +704,7 @@ The tables below are corrected against that.
 | Files: what differs from the image | each entry marked ADDED or MODIFIED | the same two marks, from the writable layer; deletions are not shown |
 | Files: download | yes | yes |
 | Files: edit, upload | yes | yes, up to 64M per upload; mode and owner kept on edit |
-| Stats | four charts with axes, limits and zoom | the same four series over the last minute, each with its peak and time span, a click to enlarge, and the memory limit drawn as the top of its chart; disk only with the io controller |
+| Stats | four charts with axes, limits and zoom | the same four series over the last minute, each with its peak and time span, a choice of the last 1, 5 or 15 minutes, a click to enlarge, and the memory limit drawn as the top of its chart; history starts when the page is opened; disk only with the io controller |
 | Bind mounts tab | yes | listed under inspect |
 | Start / stop / restart / delete | yes | yes |
 
