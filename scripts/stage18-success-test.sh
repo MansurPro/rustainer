@@ -652,5 +652,40 @@ refuses "a constraint only an orchestrator could judge is refused by name" "not 
     timeout 120 "$B" stack up -f "$PL/rustainer.toml"
 
 echo
+echo "17. An extension is a stack and the address of its page"
+E="$SCRATCH/ext/probe"; mkdir -p "$E"
+EPORT=$((41000 + ($$ % 9000)))
+printf 'description = "a test extension"\nui = "http://127.0.0.1:%s/"\n' "$EPORT" > "$E/extension.toml"
+cat > "$E/rustainer.toml" <<EOF
+name = "probe"
+
+[services.web]
+image = "$IMG"
+command = ["/bin/sh", "-c", "while true; do printf 'HTTP/1.0 200 OK\\r\\n\\r\\nextension-page\\n' | nc -l -p 80; done"]
+ports = ["127.0.0.1:$EPORT:80"]
+EOF
+check "install names it after its stack" "$(timeout 60 "$B" extension install "$E" 2>&1 | tail -1)" "probe"
+contains "it is listed, and off" "$("$B" extension ls)" "0/1 running"
+refuses "installing it twice is refused" "already installed" timeout 60 "$B" extension install "$E"
+timeout 300 "$B" extension enable probe >/dev/null 2>&1
+contains "enabling it starts its container" "$("$B" extension ls)" "1/1 running"
+PAGE=
+for _ in $(seq 30); do
+    PAGE=$(curl -fsS --max-time 3 "http://127.0.0.1:$EPORT/" 2>/dev/null) && break
+    sleep 0.3
+done
+check "and its page is served where the manifest says" "$PAGE" "extension-page"
+contains "the listing a page reads is JSON" "$("$B" extension ls --json)" '"ui":"http://127.0.0.1:'
+timeout 120 "$B" extension disable probe >/dev/null 2>&1
+contains "disabling it stops it" "$("$B" extension ls)" "0/1 running"
+timeout 120 "$B" extension rm probe >/dev/null 2>&1
+check "removing it leaves nothing listed" "$("$B" extension ls | grep -c probe)" "0"
+# The page embeds the extension's UI, so where that may point is a
+# security property and not a preference.
+printf 'ui = "https://example.com/"\n' > "$E/extension.toml"
+refuses "an extension whose page is not on this machine is refused" "must be on this" \
+    timeout 60 "$B" extension install "$E"
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

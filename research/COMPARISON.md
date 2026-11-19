@@ -820,6 +820,17 @@ fill in rather than written on a command line. What it does not have is
 Docker's **gateway**: one endpoint that fronts many servers, holds their
 secrets and handles their OAuth. Here each client starts its own.
 
+**Extensions**, in a format of this project's own and deliberately a
+small one: a directory with a stack file, which says what to run, and
+an `extension.toml`, which says what it is for and where its page is.
+Enabling one is `stack up`; the page then shows its UI in a sandboxed
+frame. The address must be on this machine, because a frame that an
+extension could point anywhere is somebody else's page inside this one.
+It is **not Docker's extension format** and cannot load anything from
+Docker's marketplace: there is one extension, the example in
+`extensions/hello`, and no SDK for an extension to call back into the
+engine.
+
 What is still missing is what needs an identity: private repositories,
 and anything else behind a Docker Hub sign-in. This has no notion of an
 account and was not given one. Search, bulk selection, totals, the added/modified marks and

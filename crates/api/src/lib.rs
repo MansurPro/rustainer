@@ -123,6 +123,9 @@ impl Server {
             ("POST", "/api/containers") => return self.create(stream, req),
             ("GET", "/api/images") => return http::json(stream, 200, &self.images()),
             ("POST", "/api/images/pull") => return self.pull(stream, req),
+            ("GET", "/api/extensions") => {
+                return self.run_cli(stream, &["extension", "ls", "--json"]);
+            }
             ("GET", "/api/mcp") => return self.run_cli(stream, &["mcp", "ls"]),
             ("GET", "/api/mcp/config") => {
                 let server = req.param("server").unwrap_or_default();
@@ -237,6 +240,20 @@ impl Server {
                 ("DELETE", "") => self.run_cli(stream, &["rm", "--force", &id]),
                 ("GET", "") => http::json(stream, 200, &self.one(&id)),
                 _ => http::error(stream, 405, "no such container action"),
+            };
+        }
+
+        if let Some(rest) = path.strip_prefix("/api/extensions/") {
+            let (name, action) = rest.split_once('/').unwrap_or((rest, ""));
+            let name = http::percent_decode(name);
+            if !is_safe_id(&name) {
+                return http::error(stream, 400, "not an extension name");
+            }
+            return match (method, action) {
+                ("POST", "enable") => self.run_cli(stream, &["extension", "enable", &name]),
+                ("POST", "disable") => self.run_cli(stream, &["extension", "disable", &name]),
+                ("DELETE", "") => self.run_cli(stream, &["extension", "rm", &name]),
+                _ => http::error(stream, 405, "no such extension action"),
             };
         }
 

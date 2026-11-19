@@ -245,6 +245,7 @@
     <button data-view="builds">Builds</button>
     <button data-view="volumes">Volumes</button>
     <button data-view="mcp">MCP</button>
+    <button data-view="extensions">Extensions</button>
   </nav>
   <div class="spacer"></div>
   <div class="sys" id="sys"></div>
@@ -286,6 +287,17 @@
     <div class="card">
       <h2>Networks</h2>
       <div id="networks"></div>
+    </div>
+  </section>
+
+  <section id="view-extensions" hidden>
+    <div class="card">
+      <h2>Extensions</h2>
+      <div class="hint" style="padding:10px 14px;border-bottom:1px solid var(--line);margin:0">
+        An extension is a stack plus the address of its page: <span class="mono">rustainer extension install &lt;dir&gt;</span>.
+        This is not Docker's extension format and cannot load Docker's extensions.</div>
+      <div id="extensions"></div>
+      <div id="extension-frame" hidden></div>
     </div>
   </section>
 
@@ -436,7 +448,7 @@ const ago = (secs) => {
 };
 
 // --- state --------------------------------------------------------------
-const VIEWS = ["containers", "stacks", "networks", "events", "images", "builds", "volumes", "mcp"];
+const VIEWS = ["containers", "stacks", "networks", "events", "images", "builds", "volumes", "mcp", "extensions"];
 let view = "containers";
 let filter = "";
 let openRow = null;           // container id whose detail panel is open
@@ -1838,6 +1850,58 @@ function renderNetworks(list) {
   box.replaceChildren(t);
 }
 
+let openExtension = null;
+function renderExtensions(list) {
+  const box = $("#extensions"), frame = $("#extension-frame");
+  if (!list.length) {
+    box.replaceChildren(el("div", { className: "empty" }, [
+      el("div", {}, "No extensions installed."),
+      el("div", { className: "hint", style: "margin-top:6px" }, "rustainer extension install extensions/hello"),
+    ]));
+    frame.hidden = true;
+    return;
+  }
+  const call = (name, action, method = "POST") => async (e) => {
+    e.target.disabled = true;
+    const r = await api("/api/extensions/" + encodeURIComponent(name) + (action ? "/" + action : ""), { method });
+    logCommand(["extension", action || "rm", name], r);
+    if (action !== "enable" && openExtension === name) openExtension = null;
+    refresh();
+  };
+  box.replaceChildren(el("table", {}, [
+    el("thead", {}, el("tr", {}, ["Name", "", "What it is", ""].map((h) => el("th", {}, h)))),
+    el("tbody", {}, list.map((x) => {
+      const on = x.running > 0;
+      return el("tr", {}, [
+        el("td", { className: "mono" }, x.name),
+        el("td", {}, el("span", { className: "pill " + (on ? "h-healthy" : "") },
+          [el("span", { className: "dot" }), on ? x.running + " / " + x.services + " running" : "off"])),
+        el("td", { className: "dim" }, x.description),
+        el("td", {}, el("div", { className: "actions" }, [
+          on ? el("button", { className: "act", textContent: openExtension === x.name ? "close" : "open",
+            onclick: () => { openExtension = openExtension === x.name ? null : x.name; renderExtensions(list); } }) : "",
+          on ? el("button", { className: "act", textContent: "disable", onclick: call(x.name, "disable") })
+             : el("button", { className: "act", textContent: "enable", onclick: call(x.name, "enable") }),
+          sure("ext:" + x.name, "remove", () => renderExtensions(list), () => call(x.name, "", "DELETE")({ target: {} })),
+        ])),
+      ]);
+    }))]));
+  // The frame is kept while its extension stays open: the list is
+  // redrawn every two seconds and reloading somebody's page each time
+  // would make it unusable.
+  const x = list.find((e) => e.name === openExtension && e.running > 0);
+  if (!x) { frame.hidden = true; frame.replaceChildren(); frame.dataset.src = ""; return; }
+  frame.hidden = false;
+  if (frame.dataset.src !== x.ui) {
+    frame.dataset.src = x.ui;
+    // Sandboxed: it may run its own scripts and talk to its own origin,
+    // and may not reach into this page or navigate it.
+    frame.replaceChildren(el("iframe", { src: x.ui, title: x.name + " extension",
+      sandbox: "allow-scripts allow-forms allow-same-origin",
+      style: "width:100%;height:60vh;border:0;border-top:1px solid var(--line);background:#fff" }));
+  }
+}
+
 // The catalogue is fetched once per visit, not every two seconds: it is
 // a few hundred rows from somebody else's service and does not change
 // while you are looking at it.
@@ -2139,6 +2203,11 @@ async function refresh() {
     renderEvents(Array.isArray(evs) ? evs : []);
   } else if (view === "mcp") {
     await loadMcp();
+  } else if (view === "extensions") {
+    const r = await api("/api/extensions");
+    let list = [];
+    try { list = JSON.parse(r.stdout || "[]"); } catch { /* shown as none */ }
+    renderExtensions(list);
   } else if (view === "builds") {
     const evs = await api("/api/events?limit=2000");
     renderBuilds(Array.isArray(evs) ? evs : []);
