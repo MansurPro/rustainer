@@ -67,6 +67,9 @@
   nav button:hover { color: var(--text); background: var(--panel-2); }
   nav button[aria-current="true"] { color: var(--text); background: var(--panel-2); border-color: var(--line); }
   .spacer { flex: 1; }
+  /* An inline `display` beats the `hidden` attribute, which left empty
+     strips on screen where a closed menu was. */
+  [hidden] { display: none !important; }
   .toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
             font-weight: 400; color: var(--dim); cursor: pointer; user-select: none; }
   .toggle input { accent-color: var(--accent); margin: 0; cursor: pointer; }
@@ -299,6 +302,9 @@
         Images <span id="images-total" class="dim" style="text-transform:none;letter-spacing:0"></span>
         <span class="spacer"></span>
         <input id="image-q" placeholder="search" style="width: 130px; padding: 3px 8px; font-size: 12px;">
+        <select id="image-state" aria-label="show images" style="width:auto;padding:3px 6px;font-size:12px">
+          <option value="">all</option><option value="used">in use</option><option value="unused">unused</option></select>
+        <button class="act" id="image-cols">columns</button>
         <input id="pullref" placeholder="alpine:3.21" style="width: 200px; padding: 3px 8px; font-size: 12px;">
         <button class="act" id="pull">Pull</button>
         <button class="act" id="tags" title="List this repository's tags in its registry.">Tags</button>
@@ -306,6 +312,7 @@
         <button class="act danger" id="picked-images" hidden></button>
         <button class="act danger" id="prune-images" hidden></button>
       </h2>
+      <div id="image-colmenu" hidden style="padding:8px 14px;border-bottom:1px solid var(--line);display:flex;gap:14px"></div>
       <div id="taglist" hidden style="padding:10px 14px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:5px"></div>
       <div id="images"></div>
     </div>
@@ -316,9 +323,13 @@
       <h2>Volumes <span id="volumes-total" class="dim" style="text-transform:none;letter-spacing:0"></span>
         <span class="spacer"></span>
         <input id="volume-q" placeholder="search" style="width: 130px; padding: 3px 8px; font-size: 12px;">
+        <select id="volume-state" aria-label="show volumes" style="width:auto;padding:3px 6px;font-size:12px">
+          <option value="">all</option><option value="used">in use</option><option value="unused">unused</option></select>
+        <button class="act" id="volume-cols">columns</button>
         <button class="act danger" id="picked-volumes" hidden></button>
         <button class="act" id="new-volume">Create…</button>
         <button class="act danger" id="prune-volumes" hidden></button></h2>
+      <div id="volume-colmenu" hidden style="padding:8px 14px;border-bottom:1px solid var(--line);display:flex;gap:14px"></div>
       <div id="volumes"></div>
     </div>
   </section>
@@ -783,16 +794,20 @@ function buildDetail() {
 
 // A sparkline with the two things that make it readable as a chart:
 // what the top of it is worth, and how far back it goes.
+let zoomed = false;   // one switch for all four: they are read together
 function chart(values, fmt) {
+  const [w, h] = zoomed ? [760, 120] : [420, 40];
   const peak = Math.max(...values);
   const axis = (text, style) => el("div", { className: "mono dim", style: "font-size:10px;" + style }, text);
   return el("div", { style: "display:flex;gap:8px;align-items:stretch" }, [
     el("div", { style: "display:flex;flex-direction:column;justify-content:space-between;text-align:right;min-width:64px" },
       [axis(fmt(peak), ""), axis(fmt(0), "")]),
     el("div", {}, [
-      el("div", { style: "border-left:1px solid var(--line);border-bottom:1px solid var(--line);padding:2px 0 0 2px" },
-        spark(values, 420, 40) || el("div", { style: "width:420px;height:40px" })),
-      el("div", { style: "display:flex;justify-content:space-between;width:422px" },
+      el("div", { style: "border-left:1px solid var(--line);border-bottom:1px solid var(--line);padding:2px 0 0 2px;cursor:zoom-" + (zoomed ? "out" : "in"),
+                  title: "Click to zoom " + (zoomed ? "out" : "in"),
+                  onclick: () => { zoomed = !zoomed; const c = lastContainers.find((x) => x.id === openRow); if (c) $("#statspane").replaceWith(statsPane(c)); } },
+        spark(values, w, h) || el("div", { style: `width:${w}px;height:${h}px` })),
+      el("div", { style: `display:flex;justify-content:space-between;width:${w + 2}px` },
         [axis(values.length * 2 + "s ago", ""), axis("now", "")]),
     ]),
   ]);
@@ -1378,15 +1393,18 @@ function scanPanel(report) {
     el("td", { className: "mono" }, f.package),
     el("td", { className: "mono dim nowrap hide-s" }, f.version),
     el("td", { className: "mono nowrap hide-s" }, f.fixed || "—"),
+    el("td", { className: "mono dim nowrap hide-s",
+               title: f.layer ? "The lowest layer that has this package at this version: where to fix it." : "" },
+      f.layer ? f.layer + " / " + report.layers : "—"),
     el("td", { className: "dim truncate hide-s", title: f.summary || "" }, f.summary || ""),
   ]));
   return el("div", { style: "border-bottom:1px solid var(--line)" }, [head,
     el("div", { style: "max-height:44vh;overflow:auto" }, el("table", {}, [
-      el("thead", {}, el("tr", {}, ["Score", "Id", "Package", "Installed", "Fixed in", ""].map((h, k) =>
+      el("thead", {}, el("tr", {}, ["Score", "Id", "Package", "Installed", "Fixed in", "Layer", ""].map((h, k) =>
         el("th", { className: k > 2 ? "hide-s" : "" }, h)))),
       el("tbody", {}, rows)])),
     el("div", { className: "hint", style: "padding:8px 14px" },
-      "From osv.dev, for the distribution's own packages only: application dependencies and static binaries are not seen." +
+      "From osv.dev: the distribution's packages, and Python and Node packages found on disk. Static binaries and compiled-in modules are not seen." +
       (report.details_truncated ? " Only the first 300 have a score and a fix listed." : ""))]);
 }
 let openVolume = null;  // name whose files are shown
@@ -1409,6 +1427,34 @@ const pickedImages = new Set(), pickedVolumes = new Set();
 let imageQuery = "", volumeQuery = "";
 $("#image-q").oninput = (e) => { imageQuery = e.target.value.toLowerCase(); refresh(); };
 $("#volume-q").oninput = (e) => { volumeQuery = e.target.value.toLowerCase(); refresh(); };
+let imageState = "", volumeState = "";
+$("#image-state").onchange = (e) => { imageState = e.target.value; refresh(); };
+$("#volume-state").onchange = (e) => { volumeState = e.target.value; refresh(); };
+const inState = (state, usedBy) => !state || (state === "used") === !!(usedBy && usedBy.length);
+
+// Optional columns for a list, hidden by a stylesheet rule rather than
+// by leaving cells out: the tables are rebuilt every two seconds and
+// the choice has to survive that without every row knowing about it.
+function columnMenu(name, cols) {
+  const key = "rustainer.cols." + name;
+  let off = new Set();
+  try { off = new Set(JSON.parse(localStorage.getItem(key) || "[]")); } catch (_) { /* defaults */ }
+  const sheet = document.head.appendChild(document.createElement("style"));
+  const apply = () => {
+    sheet.textContent = [...off].map((c) => `#${name}s .c-${c}{display:none}`).join("");
+    try { localStorage.setItem(key, JSON.stringify([...off])); } catch (_) { /* nothing to do */ }
+  };
+  apply();
+  $("#" + name + "-cols").onclick = () => {
+    const box = $("#" + name + "-colmenu");
+    box.hidden = !box.hidden;
+    box.replaceChildren(...cols.map((c) => el("label", { className: "toggle" }, [
+      el("input", { type: "checkbox", checked: !off.has(c), style: "width:auto",
+        onchange: (e) => { e.target.checked ? off.delete(c) : off.add(c); apply(); } }), c])));
+  };
+}
+columnMenu("image", ["size", "layers", "created", "digest"]);
+columnMenu("volume", ["size", "entries", "created", "path"]);
 
 function renderImages(all) {
   const box = $("#images");
@@ -1420,9 +1466,10 @@ function renderImages(all) {
   // it twice, so this is what they would cost to pull, not disk used.
   $("#images-total").textContent = all.length
     ? "· " + all.length + " · " + bytes(all.reduce((n, i) => n + (i.compressed_size || 0), 0)) + " to pull" : "";
-  const list = all.filter((i) => !imageQuery || (i.name || i.reference).toLowerCase().includes(imageQuery));
+  const list = all.filter((i) => inState(imageState, i.used_by)
+    && (!imageQuery || (i.name || i.reference).toLowerCase().includes(imageQuery)));
   if (all.length && !list.length) {
-    box.replaceChildren(el("div", { className: "empty" }, "No image matches the search."));
+    box.replaceChildren(el("div", { className: "empty" }, "No image matches."));
     return;
   }
   if (!list.length) {
@@ -1432,9 +1479,9 @@ function renderImages(all) {
   const t = el("table");
   t.append(el("thead", {}, el("tr", {}, [
     el("th", { style: "width:28px" }, ""), el("th", {}, "Reference"), el("th", {}, ""),
-    el("th", { title: "The compressed layers: what a pull transfers." }, "Size"),
-    el("th", { className: "hide-s" }, "Layers"), el("th", { className: "hide-s" }, "Created"),
-    el("th", { className: "hide-s" }, "Config digest"), el("th", {}, ""),
+    el("th", { className: "c-size", title: "The compressed layers: what a pull transfers." }, "Size"),
+    el("th", { className: "hide-s c-layers" }, "Layers"), el("th", { className: "hide-s c-created" }, "Created"),
+    el("th", { className: "hide-s c-digest" }, "Config digest"), el("th", {}, ""),
   ])));
   const body = el("tbody");
   for (const i of list) {
@@ -1444,10 +1491,10 @@ function renderImages(all) {
       el("td", {}, picker(pickedImages, i.reference, inUse, () => renderImages(all))),
       el("td", { className: "mono truncate", title: i.reference }, i.name || i.reference),
       el("td", {}, usedPill(i.used_by)),
-      el("td", { className: "mono dim" }, bytes(i.compressed_size)),
-      el("td", { className: "mono dim hide-s" }, String(i.layers ?? "—")),
-      el("td", { className: "mono dim hide-s", title: i.created || "" }, created > 0 ? ago(created) : "—"),
-      el("td", { className: "mono dim truncate hide-s" }, i.digest),
+      el("td", { className: "mono dim c-size" }, bytes(i.compressed_size)),
+      el("td", { className: "mono dim hide-s c-layers" }, String(i.layers ?? "—")),
+      el("td", { className: "mono dim hide-s c-created", title: i.created || "" }, created > 0 ? ago(created) : "—"),
+      el("td", { className: "mono dim truncate hide-s c-digest" }, i.digest),
       el("td", {}, el("div", { className: "actions" }, [
         el("button", { className: "act", textContent: "run",
           onclick: () => { $("#new-container").click(); $("#dlg-body input").value = i.name || i.reference; } }),
@@ -1509,9 +1556,10 @@ function renderVolumes(all) {
   $("#volumes-total").textContent = all.length
     ? "· " + all.length + " · " + (all.some((v) => v.size_partial) ? "≥ " : "") +
       bytes(all.reduce((n, v) => n + v.size, 0)) : "";
-  const list = all.filter((v) => !volumeQuery || v.name.toLowerCase().includes(volumeQuery));
+  const list = all.filter((v) => inState(volumeState, v.used_by)
+    && (!volumeQuery || v.name.toLowerCase().includes(volumeQuery)));
   if (all.length && !list.length) {
-    box.replaceChildren(el("div", { className: "empty" }, "No volume matches the search."));
+    box.replaceChildren(el("div", { className: "empty" }, "No volume matches."));
     return;
   }
   if (!list.length) {
@@ -1521,9 +1569,9 @@ function renderVolumes(all) {
   }
   const t = el("table");
   t.append(el("thead", {}, el("tr", {}, [
-    el("th", { style: "width:28px" }, ""), el("th", {}, "Name"), el("th", {}, ""), el("th", {}, "Size"),
-    el("th", { className: "hide-s" }, "Entries"), el("th", { className: "hide-s" }, "Created"),
-    el("th", { className: "hide-s" }, "Path"), el("th", {}, ""),
+    el("th", { style: "width:28px" }, ""), el("th", {}, "Name"), el("th", {}, ""), el("th", { className: "c-size" }, "Size"),
+    el("th", { className: "hide-s c-entries" }, "Entries"), el("th", { className: "hide-s c-created" }, "Created"),
+    el("th", { className: "hide-s c-path" }, "Path"), el("th", {}, ""),
   ])));
   const body = el("tbody");
   for (const v of list) {
@@ -1532,12 +1580,12 @@ function renderVolumes(all) {
       el("td", {}, picker(pickedVolumes, v.name, inUse, () => renderVolumes(all))),
       el("td", { className: "mono nowrap" }, v.name),
       el("td", {}, usedPill(v.used_by)),
-      el("td", { className: "mono dim",
+      el("td", { className: "mono dim c-size",
                  title: v.size_partial ? "Too many files to count on every refresh; at least this much." : "" },
         (v.size_partial ? "≥ " : "") + bytes(v.size)),
-      el("td", { className: "mono dim hide-s" }, String(v.entries)),
-      el("td", { className: "mono dim hide-s" }, ago(v.created)),
-      el("td", { className: "mono dim truncate hide-s" }, v.path),
+      el("td", { className: "mono dim hide-s c-entries" }, String(v.entries)),
+      el("td", { className: "mono dim hide-s c-created" }, ago(v.created)),
+      el("td", { className: "mono dim truncate hide-s c-path" }, v.path),
       el("td", {}, el("div", { className: "actions" }, [
         el("button", { className: "act", textContent: "files",
           onclick: () => { openVolume = openVolume === v.name ? null : v.name; renderVolumes(all); } }),

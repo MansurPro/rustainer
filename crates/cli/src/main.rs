@@ -3239,45 +3239,130 @@ fn cmd_scan(image: &str, as_json: bool) -> Result<ExitCode> {
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     let os_release = read_from_layers(&roots, "etc/os-release");
-    let apk = osv::parse_apk(&read_from_layers(&roots, "lib/apk/db/installed"));
-    let packages = if apk.is_empty() {
-        osv::parse_dpkg(&read_from_layers(&roots, "var/lib/dpkg/status"))
-    } else {
-        apk
+    let os_db = |roots: &[String]| {
+        let apk = osv::parse_apk(&read_from_layers(roots, "lib/apk/db/installed"));
+        if apk.is_empty() {
+            osv::parse_dpkg(&read_from_layers(roots, "var/lib/dpkg/status"))
+        } else {
+            apk
+        }
     };
-    if packages.is_empty() {
+    let os_packages = os_db(&roots);
+    // Which layer brought a package in: each layer's own copy of the
+    // database lists everything installed up to that point, so the
+    // lowest one that names a package at this version is where it came
+    // from - and the place to fix it.
+    let per_layer: Vec<Vec<osv::Package>> = local
+        .layers
+        .iter()
+        .map(|l| os_db(&[l.to_string_lossy().into_owned()]))
+        .collect();
+    let app = osv::app_packages(&local.layers);
+
+    // (ecosystem, packages), one lookup each.
+    let mut sets: Vec<(String, Vec<osv::Package>)> = Vec::new();
+    let os_ecosystem = osv::ecosystem(&os_release);
+    if let (Some(eco), false) = (&os_ecosystem, os_packages.is_empty()) {
+        sets.push((eco.clone(), os_packages.clone()));
+    }
+    for eco in ["PyPI", "npm"] {
+        let ps: Vec<osv::Package> = app
+            .iter()
+            .filter(|(e, _, _)| *e == eco)
+            .map(|(_, p, _)| p.clone())
+            .collect();
+        if !ps.is_empty() {
+            sets.push((eco.to_owned(), ps));
+        }
+    }
+    if sets.is_empty() {
+        if !os_packages.is_empty() {
+            bail!(
+                "{image} has {} packages, but its /etc/os-release does not name a release \
+                 OSV has advisories for (Alpine, Debian and Ubuntu are supported).",
+                os_packages.len()
+            );
+        }
         bail!(
-            "{image} has no apk or dpkg package database, so there is nothing to look up. \
-             That is not the same as having no vulnerabilities."
+            "{image} has no apk or dpkg package database and no Python or Node packages, \
+             so there is nothing to look up. That is not the same as having no \
+             vulnerabilities."
         );
     }
-    let Some(ecosystem) = osv::ecosystem(&os_release) else {
-        bail!(
-            "{image} has {} packages, but its /etc/os-release does not name a release \
-             OSV has advisories for (Alpine, Debian and Ubuntu are supported).",
-            packages.len()
-        );
-    };
+    let total: usize = sets.iter().map(|(_, p)| p.len()).sum();
     let base = std::env::var("RUSTAINER_OSV_URL").unwrap_or_else(|_| "https://api.osv.dev".into());
     if !as_json {
         eprintln!(
-            "sending {} package names and versions ({ecosystem}) to {base}",
-            packages.len()
+            "sending {total} package names and versions ({}) to {base}",
+            sets.iter()
+                .map(|(e, _)| e.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
-    let report = osv::scan(&base, &ecosystem, &packages).map_err(|e| anyhow::anyhow!(e))?;
+    let mut findings: Vec<serde_json::Value> = Vec::new();
+    let mut truncated = false;
+    for (eco, packages) in &sets {
+        let report = osv::scan(&base, eco, packages).map_err(|e| anyhow::anyhow!(e))?;
+        truncated |= report["details_truncated"] == true;
+        for mut f in report["findings"].as_array().cloned().unwrap_or_default() {
+            let p = osv::Package {
+                name: f["package"].as_str().unwrap_or("").to_owned(),
+                version: f["version"].as_str().unwrap_or("").to_owned(),
+            };
+            let layer = if Some(eco) == os_ecosystem.as_ref() {
+                per_layer.iter().position(|l| l.contains(&p)).map(|i| i + 1)
+            } else {
+                app.iter()
+                    .find(|(e, q, _)| e == eco && *q == p)
+                    .map(|(_, _, l)| *l)
+            };
+            f["ecosystem"] = serde_json::json!(eco);
+            f["layer"] = serde_json::json!(layer);
+            findings.push(f);
+        }
+    }
+    findings.sort_by(|a, b| {
+        b["score"]
+            .as_f64()
+            .unwrap_or(-1.0)
+            .total_cmp(&a["score"].as_f64().unwrap_or(-1.0))
+    });
+    // One advisory is often filed twice - by the ecosystem's own
+    // database and by GitHub's - under the same CVE. Sorted worst first,
+    // so the copy that is kept is the one that carries a score.
+    let mut seen = std::collections::BTreeSet::new();
+    findings.retain(|f| {
+        seen.insert((
+            f["cve"]
+                .as_str()
+                .or(f["id"].as_str())
+                .unwrap_or("")
+                .to_owned(),
+            f["package"].as_str().unwrap_or("").to_owned(),
+            f["version"].as_str().unwrap_or("").to_owned(),
+        ))
+    });
     if as_json {
-        println!("{report}");
+        println!(
+            "{}",
+            serde_json::json!({
+                "ecosystem": sets.iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>().join(", "),
+                "packages": total,
+                "layers": local.layers.len(),
+                "findings": findings,
+                "details_truncated": truncated,
+            })
+        );
         return Ok(ExitCode::SUCCESS);
     }
-    let findings = report["findings"].as_array().cloned().unwrap_or_default();
     println!(
-        "{:<6} {:<22} {:<24} {:<20} FIXED IN",
-        "SCORE", "ID", "PACKAGE", "INSTALLED"
+        "{:<6} {:<22} {:<24} {:<20} {:<16} LAYER",
+        "SCORE", "ID", "PACKAGE", "INSTALLED", "FIXED IN"
     );
     for f in &findings {
         println!(
-            "{:<6} {:<22} {:<24} {:<20} {}",
+            "{:<6} {:<22} {:<24} {:<20} {:<16} {}",
             f["score"]
                 .as_f64()
                 .map_or("-".into(), |s| format!("{s:.1}")),
@@ -3285,13 +3370,10 @@ fn cmd_scan(image: &str, as_json: bool) -> Result<ExitCode> {
             f["package"].as_str().unwrap_or("?"),
             f["version"].as_str().unwrap_or("?"),
             f["fixed"].as_str().unwrap_or("-"),
+            f["layer"].as_u64().map_or("-".into(), |l| l.to_string()),
         );
     }
-    println!(
-        "{} packages, {} known vulnerabilities",
-        packages.len(),
-        findings.len()
-    );
+    println!("{total} packages, {} known vulnerabilities", findings.len());
     Ok(ExitCode::SUCCESS)
 }
 

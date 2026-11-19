@@ -661,14 +661,14 @@ The tables below are corrected against that.
 | --- | --- | --- |
 | In use / unused shown | yes, plus "dangling" | yes; no dangling state |
 | Search and bulk select | yes | yes |
-| Filter by state, column picker | yes | **no** |
+| Filter by state, column picker | yes | yes |
 | Disk used by images, as a total | yes, on disk | the sum of what the images would cost to pull, labelled as that |
 | Remove unused | bulk select, shows space reclaimed | two-click "remove unused", no space figure |
 | Run from an image, with options | yes | yes, the same dialog as Run |
 | Pull | yes | yes |
 | Size | on disk | compressed layers, labelled |
 | Layers and history | each layer with its command and size, grouped by base image | per-layer sizes and the build history, as two lists |
-| Packages and CVEs | Scout: OS and application packages, grouped by layer | a scan against OSV: the distribution's packages only (apk, dpkg), not grouped by layer |
+| Packages and CVEs | Scout: OS and application packages, grouped by layer | a scan against OSV: apk and dpkg packages, Python and Node packages, each finding with the layer that introduced it |
 | Push from the UI | yes | yes, with the credentials the server was started with |
 | Registry | "My Hub": your repositories | the tags of any repository you name; no account view |
 
@@ -678,7 +678,7 @@ The tables below are corrected against that.
 | --- | --- | --- |
 | Which containers use it | yes | yes |
 | Search, bulk select, creation date, total size | yes | yes |
-| Filter by state, column picker | yes | **no** |
+| Filter by state, column picker | yes | yes |
 | Browse stored files | yes | yes |
 | Size | yes | yes, a floor past 20,000 entries |
 | Delete, and remove unused | yes | yes |
@@ -698,7 +698,7 @@ The tables below are corrected against that.
 | Files: what differs from the image | each entry marked ADDED or MODIFIED | the same two marks, from the writable layer; deletions are not shown |
 | Files: download | yes | yes |
 | Files: edit, upload | yes | yes, up to 64M per upload; mode and owner kept on edit |
-| Stats | four charts with axes, limits and zoom | the same four series over the last minute, each with its peak and time span; no zoom, no limit line; disk only with the io controller |
+| Stats | four charts with axes, limits and zoom | the same four series over the last minute, each with its peak and time span, and a click to enlarge; no limit line; disk only with the io controller |
 | Bind mounts tab | yes | listed under inspect |
 | Start / stop / restart / delete | yes | yes |
 
@@ -719,17 +719,24 @@ request. For `nginx:1.27-alpine` it reports 142 known vulnerabilities in
 58 packages in about five seconds, worst first, each with the release it
 is fixed in.
 
-Its limits are the limits of what it reads. It sees `apk` and `dpkg`
-packages on Alpine, Debian and Ubuntu; it does not see application
-dependencies, statically linked binaries, or anything RPM-based, and an
-image with no package database is reported as having nothing to look up
-rather than nothing wrong. Scout sees more, and attributes each finding
-to the layer that introduced it.
+It reads more than it first did. Beside the distribution's database it
+finds Python distributions (`*.dist-info`) and Node packages
+(`node_modules/*/package.json`) wherever they sit in the layers, and it
+says **which layer introduced each package** - the lowest one whose copy
+of the database, or whose files, has it at that version - because that
+is the layer to rebuild. `python:3.9-alpine` reports 73 findings across
+Alpine and PyPI in about two seconds, `pip` and `setuptools` among them
+at layer 3 of 4.
+
+What it still cannot see is anything that leaves no record on disk: a
+statically linked binary, the modules compiled into a Go or Rust
+program, a vendored copy without metadata; and nothing RPM-based, whose
+database is SQLite. An image where it finds nothing is reported as
+having nothing to look up rather than nothing wrong. A package an upper
+layer deleted is still reported, which errs toward saying too much.
 
 What is still missing: an account's own repositories, which needs a
-sign-in this has no notion of; filtering the lists by state and choosing
-their columns; zoom on the charts; and Scout's attribution of a finding
-to a layer. Search, bulk selection, totals, the added/modified marks and
+sign-in this has no notion of, and a limit line on the charts. Search, bulk selection, totals, the added/modified marks and
 chart axes were added after seeing the application have them.
 
 ### What the page does that is worth something
