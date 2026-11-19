@@ -130,6 +130,27 @@ for line in open(sys.argv[1]):
 print(",".join(sorted(keys)))' "$SCRATCH/osv.log")
 check "a query is a name, a release and a version" "$KEYS" "package,package.ecosystem,package.name,version"
 kill "$OSV_PID" 2>/dev/null
+
+echo
+echo "0b. Signed in, a namespace lists its private repositories"
+# Against a stand-in for hub.docker.com that hides one repository behind
+# a sign-in AND a second page, which anonymous callers are refused.
+HPORT=$((OPORT + 1))
+python3 scripts/fake-hub.py "$HPORT" > "$SCRATCH/hub.out" 2>&1 &
+OSV_PID=$!   # reuses the cleanup slot: the scan's stand-in is gone
+for _ in $(seq 60); do grep -q '^ready ' "$SCRATCH/hub.out" 2>/dev/null && break; sleep 0.2; done
+HUB="http://127.0.0.1:$HPORT"
+ANON=$(RUSTAINER_REGISTRY_AUTH= RUSTAINER_HUB_URL=$HUB "$B" repos tester 2>&1)
+check "anonymous sees the public one only" "$ANON" "$(printf 'tester/open\t9\t2026-01-01')"
+MINE=$(RUSTAINER_REGISTRY_AUTH=tester:secret RUSTAINER_HUB_URL=$HUB "$B" repos 2>&1)
+contains "signed in, the namespace defaults to the user" "$MINE" "tester/open"
+contains "and the private one on the next page is there, marked" "$MINE" "$(printf 'tester/hidden\t3\t2026-02-02\tprivate')"
+WRONG=$(RUSTAINER_REGISTRY_AUTH=tester:hunter2 RUSTAINER_HUB_URL=$HUB "$B" repos 2>&1)
+contains "a refused sign-in says so" "$WRONG" "refused the sign-in for tester"
+case "$WRONG" in *hunter2*) bad "and does not repeat the secret" ;; *) ok "and does not repeat the secret" ;; esac
+check "with no namespace and no sign-in there is nothing to list" \
+    "$(RUSTAINER_REGISTRY_AUTH= "$B" repos >/dev/null 2>&1; echo $?)" "1"
+kill "$OSV_PID" 2>/dev/null
 refuses "an image that was never pulled cannot be scanned" "not in the local store" \
     "$B" scan nosuchimage:9
 

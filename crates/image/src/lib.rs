@@ -581,7 +581,7 @@ impl Store {
         let r = Reference::parse(reference).map_err(Error::Reference)?;
         self.prepare()?;
 
-        let mut client = Client::new();
+        let mut client = Client::for_reading(&r);
 
         // Step 4: the manifest or index, classified by what arrived.
         let (fetched, digest, _body) = client.manifest(&r)?;

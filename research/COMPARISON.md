@@ -732,7 +732,7 @@ The tables below are corrected against that.
 | Layers and history | each layer with its command and size, grouped by base image | per-layer sizes and the build history, as two lists |
 | Packages and CVEs | Scout: OS and application packages, grouped by layer | a scan against OSV: apk and dpkg packages, Python and Node packages, each finding with the layer that introduced it |
 | Push from the UI | yes | yes, with the credentials the server was started with |
-| Registry | "My Hub": your repositories, signed in | the public repositories of any Docker Hub namespace, and the tags of any repository; nothing private, because nothing signs in |
+| Registry | "My Hub": your repositories, signed in | the repositories of any Docker Hub namespace and the tags of any repository; with `RUSTAINER_REGISTRY_AUTH=user:token` in the environment, your own including private ones, every page, and pulls of private images |
 
 **Volumes**
 
@@ -867,9 +867,13 @@ and Linux only; there is no rootless cluster. Docker Desktop's own
 Kubernetes was switched off on the machine this was compared on, so its
 screen was seen only in that state: a "create cluster" button.
 
-What is still missing is what needs an identity: private repositories,
-and anything else behind a Docker Hub sign-in. This has no notion of an
-account and was not given one. Search, bulk selection, totals, the added/modified marks and
+Private repositories work with a personal access token in
+`RUSTAINER_REGISTRY_AUTH`: checked against a real account, the private
+repository was listed, its 102 tags were listed, and its manifest was
+served signed in and refused (401) anonymously. There is no sign-in
+*screen* - the token comes from the environment the server was started
+in, never from the browser - and nothing else of an account (teams,
+subscriptions, Scout). Search, bulk selection, totals, the added/modified marks and
 chart axes were added after seeing the application have them.
 
 ### What the page does that is worth something

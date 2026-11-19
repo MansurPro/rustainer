@@ -361,7 +361,7 @@
         <button class="act" id="image-cols">columns</button>
         <input id="pullref" placeholder="alpine:3.21" style="width: 200px; padding: 3px 8px; font-size: 12px;">
         <button class="act" id="pull">Pull</button>
-        <button class="act" id="tags" title="List this repository's tags in its registry. Type `name/` to list a Docker Hub namespace's public repositories.">Tags</button>
+        <button class="act" id="tags" title="List this repository's tags in its registry. Type `name/` to list a Docker Hub namespace's repositories, or `/` for your own when the server was started with RUSTAINER_REGISTRY_AUTH.">Tags</button>
         <button class="act" id="build">Build…</button>
         <button class="act danger" id="picked-images" hidden></button>
         <button class="act danger" id="prune-images" hidden></button>
@@ -1731,7 +1731,8 @@ $("#tags").onclick = async (e) => {
   const typed = $("#pullref").value.trim();
   // `name/` asks for that Docker Hub namespace's repositories instead:
   // the way to find what an account has before knowing what to pull.
-  if (/^[\w.-]+\/$/.test(typed)) {
+  // A bare `/` asks for the signed-in account's own, private included.
+  if (/^[\w.-]*\/$/.test(typed)) {
     const ns = typed.slice(0, -1);
     e.target.disabled = true;
     const r = await api("/api/registry/repos?namespace=" + encodeURIComponent(ns));
@@ -1739,10 +1740,11 @@ $("#tags").onclick = async (e) => {
     logCommand(["repos", ns], r);
     box.hidden = false;
     const rows = (r.stdout || "").split("\n").filter(Boolean).map((l) => l.split("\t"));
-    box.replaceChildren(...(rows.length ? rows.map(([name, pulls, updated]) => el("button", {
-      className: "act mono", textContent: name, title: pulls + " pulls, updated " + updated,
+    box.replaceChildren(...(rows.length ? rows.map(([name, pulls, updated, priv]) => el("button", {
+      className: "act mono", textContent: name + (priv ? " 🔒" : ""),
+      title: pulls + " pulls, updated " + updated + (priv ? ", private" : ""),
       onclick: () => { $("#pullref").value = name; $("#tags").click(); },
-    })) : [el("span", { className: "hint", style: "margin:0" }, (r.stderr || r.error || "No public repositories.").split("\n")[0])]));
+    })) : [el("span", { className: "hint", style: "margin:0" }, (r.stderr || r.error || "No repositories.").split("\n")[0])]));
     return;
   }
   const repo = typed.replace(/[:@][^/]*$/, "");
