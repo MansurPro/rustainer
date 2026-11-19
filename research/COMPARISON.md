@@ -891,7 +891,7 @@ net.ipv4.ip_forward=1`. A fresh distribution has it off, the engine
 refuses to change a host-wide setting, and says so.
 
 With those fixed, the whole stage suite was run on that host as root:
-23 of the 24 stages, 653 assertions, none failing and none skipped
+23 of the 24 stages, 642 assertions, none failing and none skipped
 (stage 11 is the rootless stage and refuses to run as root; two
 assertions of stage 18 failed once in the first run and not in three
 repeats).
