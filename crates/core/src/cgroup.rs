@@ -224,13 +224,14 @@ impl Cgroup {
         }
 
         let mut base = delegating_parent();
-        // A privileged container is promised every controller, and the
-        // cgroup we happen to be in may not have them to give: a login
-        // session's scope on a stock systemd host has no `cpu`, and a
-        // kubelet refuses to start without it. Root has a place that has
-        // them all - a cgroup of our own directly under the root, which
+        // The cgroup we happen to be in may not have the controllers to
+        // give. A login session's scope on a stock systemd host has no
+        // `cpu` at all - a kubelet refuses to start without it - and
+        // cannot enable the ones it has, because it holds the shell the
+        // command was typed in. Root has a place with none of those
+        // problems: a cgroup of our own directly under the root, which
         // is where Docker's cgroupfs driver keeps `/docker`.
-        if limits.all_controllers
+        if (limits.all_controllers || limits.any())
             && let Some(top) = top_level()
             && controllers_of(&top) > controllers_of(&base)
         {

@@ -52,6 +52,45 @@ document reported `0 ms` across the board because busybox's `date` has no
 | binaries installed | 5.1 MiB | 200 MiB | **39.8×** |
 | pull a cold image (network) | 0.9–1.0 s | 2.6–2.7 s | 2.7–3.0× |
 
+### The same script on a second host
+
+Everything above is one machine: an arm64 laptop's VM, both engines
+inside a container. So the script was run again somewhere that shares
+none of that - a stock Debian 13 x86_64 host (kernel 6.12, systemd, 4
+vCPU under KVM), rustainer as root in a login shell, and Docker
+installed the way a distribution installs it (`apt install docker.io`:
+Docker 26.1.5, containerd 1.7.24, runc 1.1.15, started by systemd).
+Three runs of `bash scripts/bench.sh 40`:
+
+| measurement | rustainer | Docker | ratio |
+|---|---:|---:|---:|
+| run a container to exit (median) | 35 ms | 217–237 ms | **6.2–6.8×** |
+| run a container to exit (p90) | 36 ms | 251–301 ms | 7.0–8.4× |
+| start detached, stop, remove | 58–84 ms | 262–279 ms | 3.3–4.6× |
+| exec a command in a live container | 8–10 ms | 123–136 ms | 12–17× |
+| resident per running container | 2–3 MiB | 21–23 MiB | 7–11× |
+| resident with nothing running | **0 MiB** | 164–172 MiB | — |
+| binaries installed | 7.5 MiB | 228 MiB | 30.5× |
+| pull a cold image (network) | 0.41–0.45 s | 1.5–1.7 s | 3.3–3.9× |
+
+What carried over is the headline: **running a container is six to
+seven times faster on both hosts**, on different architectures, kernels,
+Docker versions and ways of installing Docker. Pull and
+start-stop-remove moved a little in rustainer's favour.
+
+What did not carry over, in both directions. `exec` is 12-17× here
+against 3.5-4.1× there, entirely because Docker's `exec` takes 123-136
+ms on this host against 28 ms on the other; why was not investigated,
+and the smaller figure is the one to quote. Memory per container is
+7-11× rather than 18×: the supervisor is 2-3 MiB on x86_64, not 1.
+And this is a different, older Docker (26 against 28), so the two
+tables are two measurements, not one measurement repeated.
+
+The idle row needed a fix to be measured at all: the script matched
+process command lines, which missed `/usr/sbin/dockerd` and counted the
+shell that had the binary's path in its arguments. It matches process
+names now.
+
 ---
 
 ## 3. Why each difference exists
@@ -874,6 +913,10 @@ container inside Docker's VM inherits a host someone already arranged:
   `/sys/fs/cgroup/rustainer`, directly under the root, whenever that has
   more controllers than the cgroup the command was typed in - where
   Docker's cgroupfs driver keeps `/docker`, and for the same reason.
+  The same scope also refused `--memory` and `--cpus` to *every*
+  container started from a root shell, since it cannot enable a
+  controller while it holds that shell; a container with a limit goes
+  to the same place now.
 - **A host on systemd-resolved got public DNS, on a network that blocks
   it.** `/etc/resolv.conf` there names only `127.0.0.53`, which means
   nothing in another network namespace, so containers were given
@@ -885,6 +928,12 @@ container inside Docker's VM inherits a host someone already arranged:
 One thing it needs that it will not do for you: `sysctl -w
 net.ipv4.ip_forward=1`. A fresh distribution has it off, the engine
 refuses to change a host-wide setting, and says so.
+
+With those fixed, the whole stage suite was run on that host as root:
+23 of the 24 stages, 642 assertions, none failing and none skipped
+(stage 11 is the rootless stage and refuses to run as root; two
+assertions of stage 18 failed once in the first run and not in three
+repeats).
 
 Root and Linux only; there is no rootless cluster - tried, on a shared
 machine without root: bridged networking needs a firewall tool the
