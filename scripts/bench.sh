@@ -148,6 +148,25 @@ rss_of() {
     echo $((total / 1024))
 }
 
+# The same by process NAME, for the idle row. A command line is the
+# wrong thing to match there: `dockerd*` misses `/usr/sbin/dockerd` on a
+# host where Docker was installed from a package, and `*rustainer*` hits
+# any shell whose arguments mention the binary's path.
+rss_comm() {
+    total=0
+    for p in /proc/[0-9]*; do
+        c=$(cat "$p/comm" 2>/dev/null) || continue
+        # shellcheck disable=SC2254  # the pattern is meant to glob
+        case "$c" in
+            $1)
+                k=$(awk '/^VmRSS:/{print $2}' "$p/status" 2>/dev/null)
+                total=$((total + ${k:-0}))
+                ;;
+        esac
+    done
+    echo $((total / 1024))
+}
+
 row() { printf '| %s | %s | %s | %s |\n' "$1" "$2" "$3" "$4"; }
 
 # --- preparation --------------------------------------------------------
@@ -245,9 +264,10 @@ fi
 # container is running: the CLI exits and the supervisors are per
 # container. Docker keeps dockerd and containerd resident whether or not
 # anything is running, because the API has to be there to answer.
-R_IDLE=$(rss_of '*rustainer*')
+R_IDLE=$(rss_comm 'rustainer*')
 if [ "$HAVE_DOCKER" = yes ]; then
-    D_IDLE=$(( $(rss_of 'dockerd*') + $(rss_of 'containerd *') + $(rss_of 'containerd') ))
+    # Exact names: the shims are `containerd-shim`, and belong to row 4.
+    D_IDLE=$(( $(rss_comm dockerd) + $(rss_comm containerd) ))
     row "resident with no containers running" "${R_IDLE} MiB" "${D_IDLE} MiB" "$(ratio "$D_IDLE" "${R_IDLE:-0}")"
 else
     row "resident with no containers running" "${R_IDLE} MiB" "n/a" "-"
