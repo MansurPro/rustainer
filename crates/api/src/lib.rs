@@ -142,6 +142,16 @@ impl Server {
                 }
                 return self.run_cli(stream, &["volume", "create", name]);
             }
+            ("POST", "/api/images/scan") => {
+                let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let Some(reference) = spec["reference"]
+                    .as_str()
+                    .filter(|s| !s.is_empty() && !s.starts_with('-'))
+                else {
+                    return http::error(stream, 400, "a reference is required");
+                };
+                return self.run_cli(stream, &["scan", "--json", reference]);
+            }
             ("POST", "/api/images/push") => {
                 let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
                 let Some(reference) = spec["reference"].as_str().filter(|s| !s.is_empty()) else {

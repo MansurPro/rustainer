@@ -1330,6 +1330,41 @@ function fileBrowser(base, variant = "") {
 }
 
 let openImage = null;   // reference whose details are shown
+const scans = new Map(); // reference -> the last scan of it, kept until the page reloads
+let scanning = null;
+
+// What a scan found, worst first. The bands are CVSS's own.
+function scanPanel(report) {
+  if (!report) return "";
+  if (report.error) return el("div", { className: "hint", style: "padding:10px 14px;color:var(--bad)" }, report.error);
+  const band = (s) => s == null ? "unscored" : s >= 9 ? "critical" : s >= 7 ? "high" : s >= 4 ? "medium" : "low";
+  const colour = { critical: "var(--bad)", high: "#e0af68", medium: "var(--text)", low: "var(--dim)", unscored: "var(--dim)" };
+  const counts = {};
+  for (const f of report.findings) counts[band(f.score)] = (counts[band(f.score)] || 0) + 1;
+  const head = el("div", { style: "padding:10px 14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap" }, [
+    el("b", {}, report.findings.length + " known vulnerabilities"),
+    el("span", { className: "dim" }, "in " + report.packages + " packages · " + report.ecosystem),
+    ...["critical", "high", "medium", "low", "unscored"].filter((b) => counts[b]).map((b) =>
+      el("span", { className: "pill", style: "color:" + colour[b] }, counts[b] + " " + b)),
+  ]);
+  if (!report.findings.length) return head;
+  const rows = report.findings.slice(0, 500).map((f) => el("tr", {}, [
+    el("td", { className: "mono nowrap", style: "color:" + colour[band(f.score)] }, f.score != null ? f.score.toFixed(1) : "—"),
+    el("td", { className: "mono nowrap" }, f.cve || f.id),
+    el("td", { className: "mono" }, f.package),
+    el("td", { className: "mono dim nowrap hide-s" }, f.version),
+    el("td", { className: "mono nowrap hide-s" }, f.fixed || "—"),
+    el("td", { className: "dim truncate hide-s", title: f.summary || "" }, f.summary || ""),
+  ]));
+  return el("div", { style: "border-bottom:1px solid var(--line)" }, [head,
+    el("div", { style: "max-height:44vh;overflow:auto" }, el("table", {}, [
+      el("thead", {}, el("tr", {}, ["Score", "Id", "Package", "Installed", "Fixed in", ""].map((h, k) =>
+        el("th", { className: k > 2 ? "hide-s" : "" }, h)))),
+      el("tbody", {}, rows)])),
+    el("div", { className: "hint", style: "padding:8px 14px" },
+      "From osv.dev, for the distribution's own packages only: application dependencies and static binaries are not seen." +
+      (report.details_truncated ? " Only the first 300 have a score and a fix listed." : ""))]);
+}
 let openVolume = null;  // name whose files are shown
 
 function usedPill(ids) {
@@ -1370,6 +1405,18 @@ function renderImages(list) {
           onclick: () => { $("#new-container").click(); $("#dlg-body input").value = i.name || i.reference; } }),
         el("button", { className: "act", textContent: "inspect",
           onclick: () => { openImage = openImage === i.reference ? null : i.reference; renderImages(list); } }),
+        el("button", { className: "act", textContent: scanning === i.reference ? "scanning…" : "scan",
+          disabled: scanning === i.reference,
+          title: "Looks up this image's packages at api.osv.dev. Sends package names and versions, nothing else.",
+          onclick: async () => {
+            scanning = i.reference; openImage = i.reference; renderImages(list);
+            const r = await post("/api/images/scan", { reference: i.name || i.reference });
+            logCommand(["scan", i.name || i.reference], r);
+            let report = null;
+            try { report = JSON.parse(r.stdout); } catch { /* an error, shown below */ }
+            scans.set(i.reference, report || { error: (r.stderr || r.error || "the scan failed").split("\n")[0] });
+            scanning = null; refresh();
+          } }),
         el("button", { className: "act", textContent: "push",
           title: "Uses the credentials this server was started with (RUSTAINER_REGISTRY_AUTH).",
           onclick: () => ask("Push " + (i.name || i.reference), "push to", i.name || "", "Push", async (to) => {
@@ -1397,7 +1444,8 @@ function renderImages(list) {
         el("td", { className: "mono", style: "white-space:pre-wrap" }, v),
       ]))));
       body.append(el("tr", {}, el("td", { colSpan: 7, style: "padding:0" },
-        facts.length ? inner : el("div", { className: "empty" }, "The image declares nothing."))));
+        [scanPanel(scans.get(i.reference)),
+         facts.length ? inner : el("div", { className: "empty" }, "The image declares nothing.")])));
     }
   }
   t.append(body);
