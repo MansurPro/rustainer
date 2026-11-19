@@ -162,6 +162,7 @@ impl Server {
             return match (method, action) {
                 ("GET", "logs") => self.logs(stream, &id, req),
                 ("GET", "stats") => http::json(stream, 200, &self.stats(&id)),
+                ("GET", "files") => self.container_files(stream, &id, req),
                 ("POST", "stop") => self.run_cli(stream, &["stop", "-t", "5", &id]),
                 ("POST", "kill") => self.run_cli(stream, &["stop", "-t", "0", &id]),
                 ("POST", "exec") => self.exec(stream, &id, req),
@@ -197,6 +198,14 @@ impl Server {
         }
 
         if let Some(name) = path.strip_prefix("/api/volumes/") {
+            if let Some(name) = name.strip_suffix("/files") {
+                let name = http::percent_decode(name);
+                if method != "GET" || !is_safe_id(&name) {
+                    return http::error(stream, 400, "not a usable volume name");
+                }
+                let root = Store::default_root().join("volumes").join(&name);
+                return browse_reply(stream, &root, req);
+            }
             let name = http::percent_decode(name);
             if method != "DELETE" {
                 return http::error(stream, 405, "only DELETE");
@@ -370,33 +379,134 @@ impl Server {
         )
     }
 
+    /// Every container's config, for the two "who is using this" answers.
+    fn configs(&self) -> Vec<Config> {
+        self.paths
+            .list()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|id| Config::load(&self.paths, id).ok())
+            .collect()
+    }
+
     fn images(&self) -> Value {
         let store = Store::new(Store::default_root());
         let list = store.list().unwrap_or_default();
+        // A container does not record the reference it was started from,
+        // only the layer directories it mounted - and those are named by
+        // diff_id, so the set of names identifies the image exactly as
+        // well as a reference would, and survives a retag.
+        let stacks: Vec<(String, std::collections::BTreeSet<String>)> = self
+            .configs()
+            .into_iter()
+            .map(|c| {
+                let names = c
+                    .layers
+                    .iter()
+                    .filter_map(|l| Some(Path::new(l).file_name()?.to_string_lossy().into_owned()))
+                    .collect();
+                (c.id, names)
+            })
+            .collect();
         Value::Array(
             list.into_iter()
-                .map(|(reference, digest)| json!({ "reference": reference, "digest": digest }))
+                .map(|(reference, digest)| {
+                    // `reference` is the store's key and is what removal
+                    // takes; `name` is what a person typed, where known.
+                    let mut row = json!({
+                        "reference": reference,
+                        "name": store.name_of(&reference),
+                        "digest": digest,
+                    });
+                    let Some((config, manifest)) = store.inspect(&reference) else {
+                        return row;
+                    };
+                    let ids: std::collections::BTreeSet<String> = config
+                        .rootfs
+                        .diff_ids
+                        .iter()
+                        .map(|d| d.trim_start_matches("sha256:").to_owned())
+                        .collect();
+                    let section = config.config.unwrap_or_default();
+                    row["created"] = json!(config.created);
+                    row["layers"] = json!(ids.len());
+                    // What the registry stores and what a pull transfers:
+                    // the COMPRESSED layers. Not the size on disk, which
+                    // would take a walk of every layer on every refresh,
+                    // and the page labels it as what it is.
+                    row["compressed_size"] =
+                        json!(manifest.map(|m| m.layers.iter().map(|l| l.size).sum::<u64>()));
+                    row["entrypoint"] = json!(section.entrypoint);
+                    row["cmd"] = json!(section.cmd);
+                    row["env"] = json!(section.env);
+                    row["working_dir"] = json!(section.working_dir);
+                    row["user"] = json!(section.user);
+                    row["used_by"] = json!(
+                        stacks
+                            .iter()
+                            .filter(|(_, names)| !ids.is_empty() && *names == ids)
+                            .map(|(id, _)| id)
+                            .collect::<Vec<_>>()
+                    );
+                    row
+                })
                 .collect(),
         )
     }
 
     fn volumes(&self) -> Value {
         let root = Store::default_root().join("volumes");
+        let configs = self.configs();
         let mut rows = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&root) {
             for e in rd.flatten() {
                 if !e.path().is_dir() {
                     continue;
                 }
+                let mut budget = DU_BUDGET;
+                let size = du(&e.path(), &mut budget);
                 rows.push(json!({
                     "name": e.file_name().to_string_lossy(),
                     "path": e.path().display().to_string(),
                     "entries": std::fs::read_dir(e.path()).map(|d| d.count()).unwrap_or(0),
+                    "size": size,
+                    // Out of budget means the number is a floor, and the
+                    // page writes it as one.
+                    "size_partial": budget == 0,
+                    "used_by": configs
+                        .iter()
+                        .filter(|c| c.volumes.iter().any(|v| v.source == e.path()))
+                        .map(|c| c.id.as_str())
+                        .collect::<Vec<_>>(),
                 }));
             }
         }
         rows.sort_by_key(|v| v["name"].as_str().unwrap_or("").to_owned());
         Value::Array(rows)
+    }
+
+    /// A container's filesystem as its own processes see it: through
+    /// `/proc/<pid>/root`, which is the overlay, the volumes and the
+    /// tmpfs mounts already assembled. Only while it runs - a stopped
+    /// container has no mount namespace left to look into.
+    fn container_files(
+        &self,
+        stream: &mut TcpStream,
+        id: &str,
+        req: &http::Request,
+    ) -> std::io::Result<()> {
+        let pid = State::load(&self.paths, id)
+            .ok()
+            .filter(|st| st.observed_status() == Status::Running)
+            .and_then(|st| st.init_pid);
+        let Some(pid) = pid else {
+            return http::error(
+                stream,
+                409,
+                "files are readable only while the container runs",
+            );
+        };
+        browse_reply(stream, Path::new(&format!("/proc/{pid}/root")), req)
     }
 
     // --- writes, all of which execute the CLI ---------------------------
@@ -518,6 +628,133 @@ impl Server {
 /// Ids come back to us in a URL and become a path. Anything that is not
 /// plainly a name is refused rather than sanitised, because sanitising is
 /// where traversal bugs live.
+/// How many directory entries a volume's size may cost to compute. The
+/// list is polled, and a volume holding a million files must not turn
+/// every poll into a million `lstat`s.
+const DU_BUDGET: usize = 20_000;
+/// How much of a file the browser shows.
+const FILE_HEAD: u64 = 64 * 1024;
+/// How many entries of one directory the browser lists.
+const DIR_MAX: usize = 2000;
+
+/// Bytes under `dir`, not following symlinks, until `budget` runs out.
+fn du(dir: &Path, budget: &mut usize) -> u64 {
+    let mut total = 0;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for e in rd.flatten() {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        let Ok(m) = e.metadata() else { continue };
+        total += if m.is_dir() {
+            du(&e.path(), budget)
+        } else {
+            m.len()
+        };
+    }
+    total
+}
+
+fn browse_reply(stream: &mut TcpStream, root: &Path, req: &http::Request) -> std::io::Result<()> {
+    match browse(root, &req.param("path").unwrap_or_default()) {
+        Ok(v) => http::json(stream, 200, &v),
+        Err(e) => http::error(stream, 404, &e),
+    }
+}
+
+/// List a directory, or show the head of a file, somewhere under `root`.
+///
+/// The path comes from a URL and the tree it names belongs to a
+/// container, so neither is trusted. `openat2(RESOLVE_IN_ROOT)` makes
+/// the kernel treat `root` as `/` for the whole walk: `..` stops there,
+/// and an absolute symlink - `/etc -> /`, or a link a container planted
+/// at `/var/log/x -> /etc/shadow` hoping the host would read its own -
+/// resolves inside the tree instead of on the host. Checking the string
+/// for `..` would not have covered the symlink.
+///
+/// Opened `O_PATH` first and reopened only once it is known to be a
+/// directory or a regular file: opening a FIFO blocks and opening a
+/// device node can have effects, and a container gets to choose what is
+/// at the path.
+fn browse(root: &Path, rel: &str) -> Result<Value, String> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let rootfd = rustix::fs::open(
+        root,
+        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("opening the root: {e}"))?;
+    let rel = rel.trim_start_matches('/');
+    let fd = rustix::fs::openat2(
+        &rootfd,
+        if rel.is_empty() { "." } else { rel },
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|e| format!("/{rel}: {e}"))?;
+    // The descriptor, by its /proc name: the one path that cannot be
+    // re-resolved to something else between the check and the use.
+    let via = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    let meta = std::fs::metadata(&via).map_err(|e| e.to_string())?;
+
+    if meta.is_dir() {
+        let mut entries = Vec::new();
+        let mut truncated = false;
+        for e in std::fs::read_dir(&via)
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
+            if entries.len() == DIR_MAX {
+                truncated = true;
+                break;
+            }
+            let Ok(m) = e.metadata() else { continue };
+            let ft = m.file_type();
+            entries.push(json!({
+                "name": e.file_name().to_string_lossy(),
+                "kind": if ft.is_dir() { "dir" } else if ft.is_symlink() { "link" }
+                        else if ft.is_file() { "file" } else { "other" },
+                "size": m.len(),
+                "mode": format!("{:04o}", m.permissions().mode() & 0o7777),
+                "uid": m.uid(),
+                "gid": m.gid(),
+                "mtime": m.mtime(),
+                "target": ft.is_symlink().then(|| std::fs::read_link(e.path()).ok()
+                    .map(|t| t.display().to_string())).flatten(),
+            }));
+        }
+        entries.sort_by_key(|e| {
+            (
+                e["kind"] != "dir",
+                e["name"].as_str().unwrap_or("").to_owned(),
+            )
+        });
+        return Ok(json!({ "kind": "dir", "entries": entries, "truncated": truncated }));
+    }
+    if meta.is_file() {
+        let mut head = Vec::new();
+        std::fs::File::open(&via)
+            .and_then(|f| f.take(FILE_HEAD).read_to_end(&mut head))
+            .map_err(|e| e.to_string())?;
+        let binary = head.contains(&0);
+        return Ok(json!({
+            "kind": "file",
+            "size": meta.len(),
+            "truncated": meta.len() > FILE_HEAD,
+            "binary": binary,
+            "text": (!binary).then(|| String::from_utf8_lossy(&head).into_owned()),
+        }));
+    }
+    Ok(json!({ "kind": "other" }))
+}
+
 fn is_safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -820,6 +1057,39 @@ mod tests {
         for good in ["9f2c1a4e7b03", "my-container", "web_1", "a.b"] {
             assert!(is_safe_id(good), "{good:?} was refused");
         }
+    }
+
+    #[test]
+    fn browsing_cannot_leave_the_root_by_dotdot_or_by_symlink() {
+        let base = std::env::temp_dir().join(format!("rustainer-browse-{}", std::process::id()));
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(base.join("outside"), "host secret").unwrap();
+        std::fs::write(root.join("sub/inside"), "hello").unwrap();
+        // The two shapes a container can plant: a link by absolute path,
+        // and a link that climbs.
+        std::os::unix::fs::symlink(base.join("outside"), root.join("abs")).unwrap();
+        std::os::unix::fs::symlink("../outside", root.join("climb")).unwrap();
+        std::os::unix::fs::symlink("/sub/inside", root.join("ok")).unwrap();
+
+        let listing = browse(&root, "/").unwrap();
+        assert_eq!(listing["kind"], "dir");
+        assert_eq!(
+            listing["entries"][0]["name"], "sub",
+            "directories sort first"
+        );
+        assert_eq!(browse(&root, "sub/inside").unwrap()["text"], "hello");
+        // An absolute link is reinterpreted against the root, which is
+        // what makes one that points inside the tree keep working.
+        assert_eq!(browse(&root, "ok").unwrap()["text"], "hello");
+        for escape in ["../outside", "sub/../../outside", "abs", "climb"] {
+            let got = browse(&root, escape);
+            assert!(
+                !format!("{got:?}").contains("host secret"),
+                "{escape} read a file outside the root: {got:?}"
+            );
+        }
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

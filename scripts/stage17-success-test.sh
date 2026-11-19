@@ -214,5 +214,35 @@ check "a volume can be removed through the API" "$RC" "200"
 contains "images are listed" "$(curl -fsS "$URL/api/images")" "["
 
 echo
+echo "10. Files: a container's and a volume's, and never the host's"
+# The tree being browsed belongs to a container, so it is hostile input:
+# a link planted in it must resolve inside it. Asserted with a marker the
+# host has and the container must never be shown.
+echo "HOSTSECRET-$$" > "$SCRATCH/hostsecret"
+FID=$(timeout 60 "$B" run -d --network none --layer "$BASE" -v filevol:/v /bin/sh -c \
+    "echo inside > /v/note; ln -s $SCRATCH/hostsecret /v/abs; \
+     ln -s ../../../../../../../..$SCRATCH/hostsecret /v/climb; exec sleep 60" 2>/dev/null | tail -1)
+for _ in $(seq 50); do
+    [ -L "$RUSTAINER_IMAGE_ROOT/volumes/filevol/climb" ] && break
+    sleep 0.1
+done
+contains "a container's root is listed" "$(curl -sS "$URL/api/containers/$FID/files?path=/")" '"name":"etc"'
+contains "a file in it is shown" "$(curl -sS "$URL/api/containers/$FID/files?path=/v/note")" '"text":"inside\n"'
+contains "the volume says who mounts it" "$(curl -sS "$URL/api/volumes")" "\"used_by\":[\"$FID\"]"
+contains "a volume's file is shown" "$(curl -sS "$URL/api/volumes/filevol/files?path=note")" '"text":"inside\n"'
+LEAK=
+for P in abs climb ../../hostsecret "..%2F..%2Fhostsecret" "/v/abs" "/v/climb"; do
+    for BASEURL in "volumes/filevol" "containers/$FID"; do
+        case "$(curl -sS "$URL/api/$BASEURL/files?path=$P")" in *HOSTSECRET*) LEAK="$LEAK $BASEURL:$P" ;; esac
+    done
+done
+check "no link or .. reads a host file" "$LEAK" ""
+check "a traversing volume name is refused" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/volumes/..%2F..%2Fstate/files")" "400"
+"$B" stop -t 0 "$FID" >/dev/null 2>&1
+check "a stopped container has no files to show" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/containers/$FID/files")" "409"
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

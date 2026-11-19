@@ -169,6 +169,29 @@ impl Store {
         self.root.join("tags").join(key)
     }
 
+    /// Point a reference at a manifest, and remember how it was spelled.
+    ///
+    /// The key is lossy on purpose - `/`, `:` and `@` all become `_` so
+    /// it can be a file name - which means it cannot be turned back into
+    /// a reference: `a_b` may have been `a/b` or `a_b`. So the spelling
+    /// is kept beside it. Best effort: an image whose name could not be
+    /// recorded is still a perfectly good image, listed by its key.
+    fn record_tag(&self, r: &Reference, digest: &str) -> Result<(), Error> {
+        let tag = self.tag_path(&r.store_key());
+        std::fs::write(&tag, digest).map_err(io("recording the tag", &tag))?;
+        let names = self.root.join("names");
+        let _ = std::fs::create_dir_all(&names);
+        let _ = std::fs::write(names.join(r.store_key()), r.to_string());
+        Ok(())
+    }
+
+    /// The reference a listed key was stored under, where that is known.
+    /// Unknown for anything stored before names were kept.
+    pub fn name_of(&self, key: &str) -> Option<String> {
+        let s = std::fs::read_to_string(self.root.join("names").join(key)).ok()?;
+        Some(s.trim().to_owned()).filter(|s| !s.is_empty())
+    }
+
     pub fn prepare(&self) -> Result<(), Error> {
         for d in ["blobs/sha256", "images", "tags", "layers", "layers-user"] {
             let p = self.root.join(d);
@@ -194,6 +217,21 @@ impl Store {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// The config and manifest behind a key that [`Store::list`] returned.
+    ///
+    /// Takes the key rather than a reference, because a reference has to
+    /// be parsed and a key is already the file name: asking by key cannot
+    /// disagree with the listing about which image is meant.
+    pub fn inspect(&self, key: &str) -> Option<(ImageConfig, Option<registry::Manifest>)> {
+        let digest = std::fs::read_to_string(self.tag_path(key)).ok()?;
+        let dir = self.image_dir(digest.trim());
+        let config = serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
+        let manifest = std::fs::read(dir.join("manifest.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        Some((config, manifest))
     }
 
     pub fn remove(&self, reference: &str) -> Result<(), Error> {
@@ -236,7 +274,20 @@ impl Store {
         }
         let digest = std::fs::read_to_string(&tag).ok();
         std::fs::remove_file(&tag).map_err(io("removing the tag", &tag))?;
-        if let Some(d) = digest {
+        if let Some(key) = tag.file_name() {
+            let _ = std::fs::remove_file(self.root.join("names").join(key));
+        }
+        // Two references to one manifest - the same image pulled from a
+        // mirror and from its origin, or simply tagged twice - share one
+        // record. Removing the first used to delete it from under the
+        // second, which then listed as present and failed to run.
+        let shared = |d: &str| {
+            self.list()
+                .unwrap_or_default()
+                .iter()
+                .any(|(_, other)| other == d.trim())
+        };
+        if let Some(d) = digest.filter(|d| !shared(d)) {
             let dir = self.image_dir(d.trim());
             // Only this image's record goes. Blobs and extracted layers
             // stay: they are content-addressed, another image may share
@@ -405,8 +456,7 @@ impl Store {
             .map_err(io("writing the manifest", &manifest_path))?;
 
         let r = Reference::parse(reference).map_err(Error::Reference)?;
-        let tag = self.tag_path(&r.store_key());
-        std::fs::write(&tag, &digest).map_err(io("recording the tag", &tag))?;
+        self.record_tag(&r, &digest)?;
         Ok(digest)
     }
 
@@ -606,8 +656,7 @@ impl Store {
             let _ = std::fs::write(&manifest_path, bytes);
         }
 
-        let tag = self.tag_path(&r.store_key());
-        std::fs::write(&tag, &manifest_digest).map_err(io("recording the tag", &tag))?;
+        self.record_tag(&r, &manifest_digest)?;
 
         self.materialise(&manifest_digest, &config, layer_dirs, report)
     }
@@ -676,6 +725,37 @@ mod tests {
         assert!(root.join("tags").is_dir());
         assert_eq!(s.list().unwrap().len(), 0);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn removing_one_of_two_tags_for_an_image_leaves_the_other_usable() {
+        let root = std::env::temp_dir().join(format!("rustainer-twins-{}", std::process::id()));
+        let s = Store::new(&root);
+        s.prepare().unwrap();
+        std::fs::create_dir_all(s.image_dir("sha256:aa")).unwrap();
+        std::fs::write(s.image_dir("sha256:aa").join("config.json"), "{}").unwrap();
+        let origin = Reference::parse("alpine:3.21").unwrap();
+        let mirror = Reference::parse("mirror.gcr.io/library/alpine:3.21").unwrap();
+        s.record_tag(&origin, "sha256:aa").unwrap();
+        s.record_tag(&mirror, "sha256:aa").unwrap();
+        assert_eq!(
+            s.name_of(&mirror.store_key()).as_deref(),
+            Some("mirror.gcr.io/library/alpine:3.21"),
+            "a key is lossy, so the spelling is kept beside it"
+        );
+
+        s.remove("mirror.gcr.io/library/alpine:3.21").unwrap();
+        assert!(
+            s.inspect(&origin.store_key()).is_some(),
+            "the twin lost its record"
+        );
+        assert_eq!(s.name_of(&mirror.store_key()), None);
+        s.remove("alpine:3.21").unwrap();
+        assert!(
+            !s.image_dir("sha256:aa").exists(),
+            "the last tag takes the record with it"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
