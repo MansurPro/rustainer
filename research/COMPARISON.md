@@ -577,8 +577,9 @@ versions carry an exec terminal and a file browser. Those may well be
 better than anything here. This document does not say otherwise, because
 it did not look.
 
-That comparison is still not made, and is tracked as issue #23 rather
-than left as a sentence. What changed is this side of it: the page now
+That comparison against the running application is still not made, and
+is tracked as issue #23 rather than left as a sentence; the one against
+Docker's documentation is below. What changed is this side of it: the page now
 has the three things those screens are for, built without sight of the
 other one. Images show size, layer count, age, what the image declares
 and **which containers are using it**; volumes show size and who mounts
@@ -605,6 +606,61 @@ cost thirty lines, because bringing a container up from its stored
 config more than once is what a restart policy already had to do. One
 limit: a stack's healthcheck watcher is not restarted with it, so a
 started container reports no health rather than a stale one.
+
+### The three screens, against Docker's own documentation
+
+The running application could not be driven, so this compares against
+what Docker **documents** those screens as doing - the Images, Volumes
+and Containers pages under `docs.docker.com/desktop/use-desktop/`, read
+in November 2026. It is a comparison of features that exist, not of how
+well either one works, and a documented feature was not checked to be
+present in the installed version.
+
+**Images**
+
+| | Docker Desktop | this page |
+| --- | --- | --- |
+| In use / unused shown | yes, plus "dangling" | yes; no dangling state |
+| Remove unused | bulk select, shows space reclaimed | two-click "remove unused", no space figure |
+| Run from an image, with options | yes | yes, the same dialog as Run |
+| Pull | yes | yes |
+| Size | on disk | compressed layers, labelled |
+| Layers and history | yes, per layer | count only |
+| Packages and CVEs (Scout) | yes | **no** |
+| Registry tab ("My Hub"), push from the UI | yes | **no**; `push` is CLI only |
+
+**Volumes**
+
+| | Docker Desktop | this page |
+| --- | --- | --- |
+| Which containers use it | yes | yes |
+| Browse stored files | yes | yes |
+| Size | yes | yes, a floor past 20,000 entries |
+| Delete, and remove unused | yes | yes |
+| Create an empty volume | yes | **no**; one appears on first use |
+| Empty without deleting | yes | **no** |
+| Clone | yes | **no** |
+| Export / import (file, image, registry) | yes | **no** |
+
+**A container's detail**
+
+| | Docker Desktop | this page |
+| --- | --- | --- |
+| Logs | live, with search and timestamps | tail, polled; no search |
+| Inspect | yes | yes |
+| Run a command | Exec, or Docker Debug | one-shot exec, and a pty terminal |
+| Files: browse | running containers | running, and a stopped one's own writes |
+| Files: edit, upload, download | yes | **no**, read-only |
+| Stats | CPU, memory, network, disk over time | CPU sparkline and memory; no network or disk |
+| Bind mounts tab | yes | listed under inspect |
+| Start / stop / restart / delete | yes | yes |
+
+So the honest reading is not parity. The page has the working core of
+all three screens and one thing those pages do not describe - a stopped
+container's files, where Docker documents the Files tab for running
+containers - and it is missing the registry and vulnerability side of Images, every volume
+operation beyond delete, file editing, log search, and network and disk
+statistics. Those are a list of what to build, not a rounding error.
 
 ### What the page does that is worth something
 
