@@ -123,6 +123,16 @@ impl Server {
             ("POST", "/api/containers") => return self.create(stream, req),
             ("GET", "/api/images") => return http::json(stream, 200, &self.images()),
             ("POST", "/api/images/pull") => return self.pull(stream, req),
+            ("GET", "/api/registry/tags") => {
+                let Some(repo) = req.param("repository").filter(|s| !s.is_empty()) else {
+                    return http::error(stream, 400, "a repository is required");
+                };
+                // A leading `-` would be read by the CLI as a flag.
+                if repo.starts_with('-') {
+                    return http::error(stream, 400, "not a repository");
+                }
+                return self.run_cli(stream, &["tags", &repo]);
+            }
             ("GET", "/api/volumes") => return http::json(stream, 200, &self.volumes()),
             ("POST", "/api/volumes") => {
                 let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
@@ -442,12 +452,18 @@ impl Server {
             .and_then(|v| v.parse().ok())
             .unwrap_or(400)
             .min(5000);
-        let mut out = tail_file(&self.paths.stdout_log(id), tail);
-        let err = tail_file(&self.paths.stderr_log(id), tail);
+        let (out, out_times) = tail_file(&self.paths.stdout_log(id), tail);
+        let (err, err_times) = tail_file(&self.paths.stderr_log(id), tail);
         http::json(
             stream,
             200,
-            &json!({ "stdout": std::mem::take(&mut out), "stderr": err }),
+            // One time per line, in microseconds, or null where the log
+            // predates the index. Separate from the text so a reader
+            // that does not want them never has to parse them out.
+            &json!({
+                "stdout": out, "stderr": err,
+                "stdout_times": out_times, "stderr_times": err_times,
+            }),
         )
     }
 
@@ -989,10 +1005,10 @@ fn cgroup_dir_of(pid: i32) -> Option<PathBuf> {
 /// A container that has been running for a week has a log measured in
 /// gigabytes, and a dashboard that reads all of it to show the last
 /// screenful is a dashboard that takes the machine down.
-fn tail_file(path: &Path, n: usize) -> String {
+fn tail_file(path: &Path, n: usize) -> (String, Vec<Option<u64>>) {
     const WINDOW: u64 = 256 * 1024;
     let Ok(mut f) = std::fs::File::open(path) else {
-        return String::new();
+        return (String::new(), Vec::new());
     };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let start = len.saturating_sub(WINDOW);
@@ -1002,16 +1018,57 @@ fn tail_file(path: &Path, n: usize) -> String {
     }
     let mut buf = Vec::new();
     let _ = f.take(WINDOW).read_to_end(&mut buf);
-    let text = String::from_utf8_lossy(&buf);
     // A window boundary usually lands mid-line; drop that fragment rather
     // than show half a line as if it were whole.
-    let text = if start > 0 {
-        text.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
+    let skip = if start > 0 {
+        buf.iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |i| i + 1)
     } else {
-        &text
+        0
     };
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
+    // Each line with the byte offset it starts at in the file, which is
+    // what the time index is keyed by.
+    let mut lines: Vec<(u64, &[u8])> = Vec::new();
+    let mut at = skip;
+    for line in buf[skip..].split_inclusive(|&b| b == b'\n') {
+        lines.push((start + at as u64, line.strip_suffix(b"\n").unwrap_or(line)));
+        at += line.len();
+    }
+    let lines = &lines[lines.len().saturating_sub(n)..];
+
+    // `offset usec` pairs, ascending. The time of a line is the last
+    // entry at or before where it starts.
+    let mut idx_path = path.as_os_str().to_owned();
+    idx_path.push(".idx");
+    // Only its tail: the index grows for as long as the container
+    // talks, and the lines being shown are at the end of the log.
+    let mut raw = Vec::new();
+    if let Ok(mut f) = std::fs::File::open(idx_path) {
+        use std::io::Seek;
+        let _ = f.seek(std::io::SeekFrom::End(-(WINDOW as i64)));
+        let _ = f.read_to_end(&mut raw);
+    }
+    let index: Vec<(u64, u64)> = String::from_utf8_lossy(&raw)
+        .lines()
+        .filter_map(|l| {
+            let (o, t) = l.split_once(' ')?;
+            Some((o.parse().ok()?, t.parse().ok()?))
+        })
+        .collect();
+    let times = lines
+        .iter()
+        .map(|(off, _)| {
+            let i = index.partition_point(|(o, _)| o <= off);
+            (i > 0).then(|| index[i - 1].1)
+        })
+        .collect();
+    let text = lines
+        .iter()
+        .map(|(_, l)| String::from_utf8_lossy(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (text, times)
 }
 
 fn now_usec() -> u64 {
@@ -1301,12 +1358,20 @@ mod tests {
         let p = std::env::temp_dir().join("rustainer-api-tail-test.log");
         let body: String = (0..5000).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&p, &body).unwrap();
-        let out = tail_file(&p, 3);
+        let (out, times) = tail_file(&p, 3);
         assert_eq!(out.lines().count(), 3);
+        assert_eq!(times, vec![None; 3], "no index, so no times - and no error");
         assert!(out.ends_with("line 4999"), "{out}");
         // And a short file comes back whole.
         std::fs::write(&p, "one\ntwo\n").unwrap();
-        assert_eq!(tail_file(&p, 10), "one\ntwo");
+        assert_eq!(tail_file(&p, 10).0, "one\ntwo");
+        // With an index: a line takes the time of the last entry at or
+        // before where it starts.
+        let mut idx = p.clone().into_os_string();
+        idx.push(".idx");
+        std::fs::write(&idx, "0 111\n4 222\n").unwrap();
+        assert_eq!(tail_file(&p, 10).1, vec![Some(111), Some(222)]);
+        std::fs::remove_file(&idx).unwrap();
         std::fs::remove_file(&p).ok();
     }
 }

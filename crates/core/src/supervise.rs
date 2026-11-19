@@ -766,8 +766,8 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
         }
 
         // --- the steady state ------------------------------------------------
-        let mut out_log = log_file(&paths.stdout_log(id))?;
-        let mut err_log = log_file(&paths.stderr_log(id))?;
+        let mut out_log = StampedLog::open(&paths.stdout_log(id))?;
+        let mut err_log = StampedLog::open(&paths.stderr_log(id))?;
         match &pty_master {
             Some(master) => {
                 // Our own copy of the slave goes first, and deliberately:
@@ -896,6 +896,64 @@ fn cpath(p: &Path) -> Result<std::ffi::CString, Error> {
         .map_err(|_| Error::Io(std::io::Error::other("path contains an interior NUL")))
 }
 
+/// A log file, and beside it a record of when its bytes arrived.
+///
+/// The log stays exactly what the container wrote: `logs` prints it
+/// byte for byte and nothing that reads it has to know about
+/// timestamps. The times go in `<log>.idx` as `offset usec` lines, and
+/// a reader that wants them looks up the offset of the line it is
+/// showing.
+///
+/// At most one entry per [`STAMP_EVERY`], so a container printing a
+/// million lines a second costs ten index lines a second and not a
+/// million; the price is that timestamps are accurate to a tenth of a
+/// second, which is finer than anybody reads a log at.
+pub(crate) struct StampedLog {
+    file: std::fs::File,
+    idx: Option<std::fs::File>,
+    offset: u64,
+    stamped_at: Option<std::time::Instant>,
+}
+
+const STAMP_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+impl StampedLog {
+    fn open(p: &Path) -> std::io::Result<Self> {
+        let file = log_file(p)?;
+        let offset = file.metadata()?.len();
+        let mut name = p.as_os_str().to_owned();
+        name.push(".idx");
+        Ok(Self {
+            file,
+            // Best effort: a log without times is still a log.
+            idx: log_file(Path::new(&name)).ok(),
+            offset,
+            stamped_at: None,
+        })
+    }
+}
+
+impl Write for StampedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.stamped_at.is_none_or(|t| t.elapsed() >= STAMP_EVERY)
+            && let Some(idx) = &mut self.idx
+        {
+            let usec = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros())
+                .unwrap_or(0);
+            let _ = writeln!(idx, "{} {usec}", self.offset);
+            self.stamped_at = Some(std::time::Instant::now());
+        }
+        let n = self.file.write(buf)?;
+        self.offset += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 fn log_file(p: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
@@ -949,8 +1007,8 @@ fn pump(
     out_r: &OwnedFd,
     err_r: &OwnedFd,
     pidfd: &OwnedFd,
-    out_log: &mut std::fs::File,
-    err_log: &mut std::fs::File,
+    out_log: &mut StampedLog,
+    err_log: &mut StampedLog,
 ) -> Result<(), Error> {
     let mut out_open = true;
     let mut err_open = true;
@@ -1000,7 +1058,7 @@ fn pump(
 }
 
 /// One read; `false` once the pipe is at EOF.
-fn copy_once(src: &OwnedFd, log: &mut std::fs::File, passthrough: i32) -> Result<bool, Error> {
+fn copy_once(src: &OwnedFd, log: &mut StampedLog, passthrough: i32) -> Result<bool, Error> {
     let mut buf = [0u8; 8192];
     match sys::read(src, &mut buf) {
         Ok(0) => Ok(false),

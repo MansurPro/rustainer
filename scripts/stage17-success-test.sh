@@ -345,5 +345,34 @@ check "saving with no path is refused" "$(put "/api/volumes/putvol/files" 'x')" 
 "$B" rm --force "$PID_" >/dev/null 2>&1
 
 echo
+echo "14. Log lines have times, and the log itself is untouched"
+TID=$(timeout 60 "$B" run -d --network none --layer "$BASE" /bin/sh -c \
+    'echo first; sleep 1; echo second; exec sleep 60' 2>/dev/null | tail -1)
+for _ in $(seq 50); do
+    [ "$("$B" logs "$TID" 2>/dev/null | wc -l)" -ge 2 ] && break
+    sleep 0.1
+done
+# The times live beside the log, so `logs` is still byte for byte what
+# the container wrote - nothing that reads it had to change.
+check "logs prints exactly what was written" "$("$B" logs "$TID" 2>/dev/null | tr '\n' ,)" "first,second,"
+TIMES=$(curl -sS "$URL/api/containers/$TID/logs" | tr -d ' \n' | sed -n 's/.*"stdout_times":\[\([0-9,]*\)\].*/\1/p')
+T1=${TIMES%%,*}; T2=${TIMES##*,}
+if [ -n "$T1" ] && [ -n "$T2" ] && [ "$T1" != "$T2" ] && [ $((T2 - T1)) -ge 800000 ] && [ $((T2 - T1)) -le 5000000 ]; then
+    ok "two lines a second apart are stamped about a second apart"
+else
+    bad "two lines a second apart are stamped about a second apart (got '$TIMES')"
+fi
+# `date +%s` has whole seconds, so the stamp may be up to one ahead of it.
+NOW=$((($(date +%s) + 1) * 1000000))
+if [ -n "$T2" ] && [ $((NOW - T2)) -ge 0 ] && [ $((NOW - T2)) -le 60000000 ]; then
+    ok "and the stamp is the wall clock"
+else
+    bad "and the stamp is the wall clock (got '$T2' against '$NOW')"
+fi
+"$B" rm --force "$TID" >/dev/null 2>&1
+check "asking for tags of nothing is refused" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/registry/tags")" "400"
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
