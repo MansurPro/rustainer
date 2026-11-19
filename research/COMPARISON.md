@@ -660,8 +660,9 @@ The tables below are corrected against that.
 | | Docker Desktop | this page |
 | --- | --- | --- |
 | In use / unused shown | yes, plus "dangling" | yes; no dangling state |
-| Search, filter, column picker, bulk select | yes | **no**; "remove unused" is the only bulk action |
-| Disk used by images, as a total | yes | **no** |
+| Search and bulk select | yes | yes |
+| Filter by state, column picker | yes | **no** |
+| Disk used by images, as a total | yes, on disk | the sum of what the images would cost to pull, labelled as that |
 | Remove unused | bulk select, shows space reclaimed | two-click "remove unused", no space figure |
 | Run from an image, with options | yes | yes, the same dialog as Run |
 | Pull | yes | yes |
@@ -676,7 +677,8 @@ The tables below are corrected against that.
 | | Docker Desktop | this page |
 | --- | --- | --- |
 | Which containers use it | yes | yes |
-| Search, filter, column picker, bulk select, creation date | yes | **no** |
+| Search, bulk select, creation date, total size | yes | yes |
+| Filter by state, column picker | yes | **no** |
 | Browse stored files | yes | yes |
 | Size | yes | yes, a floor past 20,000 entries |
 | Delete, and remove unused | yes | yes |
@@ -693,10 +695,10 @@ The tables below are corrected against that.
 | Inspect | yes | yes |
 | Run a command | Exec, or Docker Debug | one-shot exec, and a pty terminal |
 | Files: browse | yes | running, and a stopped one's own writes |
-| Files: what differs from the image | each entry marked ADDED or MODIFIED | **no** for a running container; a stopped one shows only its own writes |
+| Files: what differs from the image | each entry marked ADDED or MODIFIED | the same two marks, from the writable layer; deletions are not shown |
 | Files: download | yes | yes |
 | Files: edit, upload | yes | yes, up to 64M per upload; mode and owner kept on edit |
-| Stats | four charts with axes, limits and zoom | the same four series as sparklines over the last minute, no axes; disk only with the io controller |
+| Stats | four charts with axes, limits and zoom | the same four series over the last minute, each with its peak and time span; no zoom, no limit line; disk only with the io controller |
 | Bind mounts tab | yes | listed under inspect |
 | Start / stop / restart / delete | yes | yes |
 
@@ -724,10 +726,11 @@ image with no package database is reported as having nothing to look up
 rather than nothing wrong. Scout sees more, and attributes each finding
 to the layer that introduced it.
 
-What is still missing: an account's own repositories; search, filters
-and bulk selection on the lists; a disk-used total; marking what a
-running container changed against its image; and axes on the charts. It
-is nearer parity than it was, and it is not parity.
+What is still missing: an account's own repositories, which needs a
+sign-in this has no notion of; filtering the lists by state and choosing
+their columns; zoom on the charts; and Scout's attribution of a finding
+to a layer. Search, bulk selection, totals, the added/modified marks and
+chart axes were added after seeing the application have them.
 
 ### What the page does that is worth something
 
