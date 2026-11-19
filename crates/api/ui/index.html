@@ -296,12 +296,14 @@
   <section id="view-images" hidden>
     <div class="card">
       <h2>
-        Images
+        Images <span id="images-total" class="dim" style="text-transform:none;letter-spacing:0"></span>
         <span class="spacer"></span>
+        <input id="image-q" placeholder="search" style="width: 130px; padding: 3px 8px; font-size: 12px;">
         <input id="pullref" placeholder="alpine:3.21" style="width: 200px; padding: 3px 8px; font-size: 12px;">
         <button class="act" id="pull">Pull</button>
         <button class="act" id="tags" title="List this repository's tags in its registry.">Tags</button>
         <button class="act" id="build">Build…</button>
+        <button class="act danger" id="picked-images" hidden></button>
         <button class="act danger" id="prune-images" hidden></button>
       </h2>
       <div id="taglist" hidden style="padding:10px 14px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:5px"></div>
@@ -311,7 +313,10 @@
 
   <section id="view-volumes" hidden>
     <div class="card">
-      <h2>Volumes <span class="spacer"></span>
+      <h2>Volumes <span id="volumes-total" class="dim" style="text-transform:none;letter-spacing:0"></span>
+        <span class="spacer"></span>
+        <input id="volume-q" placeholder="search" style="width: 130px; padding: 3px 8px; font-size: 12px;">
+        <button class="act danger" id="picked-volumes" hidden></button>
         <button class="act" id="new-volume">Create…</button>
         <button class="act danger" id="prune-volumes" hidden></button></h2>
       <div id="volumes"></div>
@@ -776,6 +781,23 @@ function buildDetail() {
   box.replaceChildren(head, body);
 }
 
+// A sparkline with the two things that make it readable as a chart:
+// what the top of it is worth, and how far back it goes.
+function chart(values, fmt) {
+  const peak = Math.max(...values);
+  const axis = (text, style) => el("div", { className: "mono dim", style: "font-size:10px;" + style }, text);
+  return el("div", { style: "display:flex;gap:8px;align-items:stretch" }, [
+    el("div", { style: "display:flex;flex-direction:column;justify-content:space-between;text-align:right;min-width:64px" },
+      [axis(fmt(peak), ""), axis(fmt(0), "")]),
+    el("div", {}, [
+      el("div", { style: "border-left:1px solid var(--line);border-bottom:1px solid var(--line);padding:2px 0 0 2px" },
+        spark(values, 420, 40) || el("div", { style: "width:420px;height:40px" })),
+      el("div", { style: "display:flex;justify-content:space-between;width:422px" },
+        [axis(values.length * 2 + "s ago", ""), axis("now", "")]),
+    ]),
+  ]);
+}
+
 function statsPane(c) {
   const ser = series.get(c.id) || {};
   const last = (a) => (a && a.length ? a[a.length - 1] : null);
@@ -796,10 +818,10 @@ function statsPane(c) {
   box.append(el("table", {}, el("tbody", {}, rows.map(([k, a, fmt]) => el("tr", {}, [
     el("td", { className: "dim nowrap", style: "width:150px" }, k),
     el("td", { className: "mono nowrap", style: "width:110px" }, fmt(last(a))),
-    el("td", {}, spark(a, 420, 34)),
+    el("td", {}, chart(a, fmt)),
   ])))));
   box.append(el("div", { className: "hint", style: "padding:8px 14px" },
-    "The last minute, each line scaled to its own peak. Disk needs the io controller and is absent without it."));
+    "Each chart is scaled to its own peak, which is the number at its top. Disk needs the io controller and is absent without it."));
   return box;
 }
 
@@ -1218,11 +1240,11 @@ function sure(key, label, redraw, run) {
 
 // "Remove unused", in two clicks instead of a confirm() box: the first
 // says how many, the second does it, and looking away disarms it.
-function pruneButton(button, unused, noun, call) {
+function pruneButton(button, unused, noun, call, word = "unused") {
   button.hidden = !unused.length;
   if (button.dataset.armed === "1") return;   // do not relabel under the cursor
   button.disabled = false;
-  button.textContent = "remove " + unused.length + " unused";
+  button.textContent = "remove " + unused.length + " " + word;
   button.onclick = () => {
     button.dataset.armed = "1";
     button.textContent = "really remove " + unused.length + " " + noun + "?";
@@ -1264,7 +1286,9 @@ function fileBrowser(base, variant = "") {
           textContent: e.name + (e.kind === "dir" ? "/" : ""), onclick: () => go(child),
         });
         tb.append(el("tr", {}, [
-          el("td", { className: "mono" }, [name, e.target ? el("span", { className: "dim" }, " → " + e.target) : ""]),
+          el("td", { className: "mono" }, [name, e.target ? el("span", { className: "dim" }, " → " + e.target) : "",
+            e.note ? el("span", { className: "pill", title: "Against the image this container was started from.",
+              style: "margin-left:8px;font-size:10px;color:" + (e.note === "added" ? "var(--ok)" : "#e0af68") }, e.note) : ""]),
           el("td", { className: "mono dim" }, e.kind === "file" ? bytes(e.size) : e.kind),
           el("td", { className: "mono dim hide-s" }, e.mode + "  " + e.uid + ":" + e.gid),
           el("td", { className: "mono dim hide-s" }, ago(e.mtime)),
@@ -1374,17 +1398,40 @@ function usedPill(ids) {
     : el("span", { className: "pill" }, "unused");
 }
 
-function renderImages(list) {
+// A checkbox per row, remembered across redraws by key. Something in
+// use cannot be picked, because it cannot be removed.
+function picker(set, key, inUse, redraw) {
+  return el("input", { type: "checkbox", style: "width:auto", checked: set.has(key), disabled: !!inUse,
+    ariaLabel: "select " + key,
+    onchange: (e) => { e.target.checked ? set.add(key) : set.delete(key); redraw(); } });
+}
+const pickedImages = new Set(), pickedVolumes = new Set();
+let imageQuery = "", volumeQuery = "";
+$("#image-q").oninput = (e) => { imageQuery = e.target.value.toLowerCase(); refresh(); };
+$("#volume-q").oninput = (e) => { volumeQuery = e.target.value.toLowerCase(); refresh(); };
+
+function renderImages(all) {
   const box = $("#images");
-  pruneButton($("#prune-images"), list.filter((i) => i.used_by && !i.used_by.length), "images",
-    (i) => [["rmi", i.reference], "/api/images/" + encodeURIComponent(i.reference), "DELETE"]);
+  const rmi = (i) => [["rmi", i.reference], "/api/images/" + encodeURIComponent(i.reference), "DELETE"];
+  pruneButton($("#prune-images"), all.filter((i) => i.used_by && !i.used_by.length), "images", rmi);
+  for (const k of [...pickedImages]) if (!all.some((i) => i.reference === k)) pickedImages.delete(k);
+  pruneButton($("#picked-images"), all.filter((i) => pickedImages.has(i.reference)), "images", rmi, "selected");
+  // Compressed, and summed per image: two images sharing a base count
+  // it twice, so this is what they would cost to pull, not disk used.
+  $("#images-total").textContent = all.length
+    ? "· " + all.length + " · " + bytes(all.reduce((n, i) => n + (i.compressed_size || 0), 0)) + " to pull" : "";
+  const list = all.filter((i) => !imageQuery || (i.name || i.reference).toLowerCase().includes(imageQuery));
+  if (all.length && !list.length) {
+    box.replaceChildren(el("div", { className: "empty" }, "No image matches the search."));
+    return;
+  }
   if (!list.length) {
     box.replaceChildren(el("div", { className: "empty" }, "No images in the store. Pull one."));
     return;
   }
   const t = el("table");
   t.append(el("thead", {}, el("tr", {}, [
-    el("th", {}, "Reference"), el("th", {}, ""),
+    el("th", { style: "width:28px" }, ""), el("th", {}, "Reference"), el("th", {}, ""),
     el("th", { title: "The compressed layers: what a pull transfers." }, "Size"),
     el("th", { className: "hide-s" }, "Layers"), el("th", { className: "hide-s" }, "Created"),
     el("th", { className: "hide-s" }, "Config digest"), el("th", {}, ""),
@@ -1394,6 +1441,7 @@ function renderImages(list) {
     const inUse = i.used_by && i.used_by.length;
     const created = i.created ? Date.parse(i.created) / 1000 : 0;
     body.append(el("tr", {}, [
+      el("td", {}, picker(pickedImages, i.reference, inUse, () => renderImages(all))),
       el("td", { className: "mono truncate", title: i.reference }, i.name || i.reference),
       el("td", {}, usedPill(i.used_by)),
       el("td", { className: "mono dim" }, bytes(i.compressed_size)),
@@ -1404,12 +1452,12 @@ function renderImages(list) {
         el("button", { className: "act", textContent: "run",
           onclick: () => { $("#new-container").click(); $("#dlg-body input").value = i.name || i.reference; } }),
         el("button", { className: "act", textContent: "inspect",
-          onclick: () => { openImage = openImage === i.reference ? null : i.reference; renderImages(list); } }),
+          onclick: () => { openImage = openImage === i.reference ? null : i.reference; renderImages(all); } }),
         el("button", { className: "act", textContent: scanning === i.reference ? "scanning…" : "scan",
           disabled: scanning === i.reference,
           title: "Looks up this image's packages at api.osv.dev. Sends package names and versions, nothing else.",
           onclick: async () => {
-            scanning = i.reference; openImage = i.reference; renderImages(list);
+            scanning = i.reference; openImage = i.reference; renderImages(all);
             const r = await post("/api/images/scan", { reference: i.name || i.reference });
             logCommand(["scan", i.name || i.reference], r);
             let report = null;
@@ -1443,7 +1491,7 @@ function renderImages(list) {
         el("td", { className: "dim nowrap", style: "width:150px" }, k),
         el("td", { className: "mono", style: "white-space:pre-wrap" }, v),
       ]))));
-      body.append(el("tr", {}, el("td", { colSpan: 7, style: "padding:0" },
+      body.append(el("tr", {}, el("td", { colSpan: 8, style: "padding:0" },
         [scanPanel(scans.get(i.reference)),
          facts.length ? inner : el("div", { className: "empty" }, "The image declares nothing.")])));
     }
@@ -1452,10 +1500,20 @@ function renderImages(list) {
   box.replaceChildren(t);
 }
 
-function renderVolumes(list) {
+function renderVolumes(all) {
   const box = $("#volumes");
-  pruneButton($("#prune-volumes"), list.filter((v) => !v.used_by.length), "volumes",
-    (v) => [["volume", "rm", v.name], "/api/volumes/" + encodeURIComponent(v.name), "DELETE"]);
+  const rm = (v) => [["volume", "rm", v.name], "/api/volumes/" + encodeURIComponent(v.name), "DELETE"];
+  pruneButton($("#prune-volumes"), all.filter((v) => !v.used_by.length), "volumes", rm);
+  for (const k of [...pickedVolumes]) if (!all.some((v) => v.name === k)) pickedVolumes.delete(k);
+  pruneButton($("#picked-volumes"), all.filter((v) => pickedVolumes.has(v.name)), "volumes", rm, "selected");
+  $("#volumes-total").textContent = all.length
+    ? "· " + all.length + " · " + (all.some((v) => v.size_partial) ? "≥ " : "") +
+      bytes(all.reduce((n, v) => n + v.size, 0)) : "";
+  const list = all.filter((v) => !volumeQuery || v.name.toLowerCase().includes(volumeQuery));
+  if (all.length && !list.length) {
+    box.replaceChildren(el("div", { className: "empty" }, "No volume matches the search."));
+    return;
+  }
   if (!list.length) {
     box.replaceChildren(el("div", { className: "empty" },
       "No named volumes. One appears the first time you use -v name:/path."));
@@ -1463,27 +1521,30 @@ function renderVolumes(list) {
   }
   const t = el("table");
   t.append(el("thead", {}, el("tr", {}, [
-    el("th", {}, "Name"), el("th", {}, ""), el("th", {}, "Size"),
-    el("th", { className: "hide-s" }, "Entries"), el("th", { className: "hide-s" }, "Path"), el("th", {}, ""),
+    el("th", { style: "width:28px" }, ""), el("th", {}, "Name"), el("th", {}, ""), el("th", {}, "Size"),
+    el("th", { className: "hide-s" }, "Entries"), el("th", { className: "hide-s" }, "Created"),
+    el("th", { className: "hide-s" }, "Path"), el("th", {}, ""),
   ])));
   const body = el("tbody");
   for (const v of list) {
     const inUse = v.used_by.length;
     body.append(el("tr", {}, [
+      el("td", {}, picker(pickedVolumes, v.name, inUse, () => renderVolumes(all))),
       el("td", { className: "mono nowrap" }, v.name),
       el("td", {}, usedPill(v.used_by)),
       el("td", { className: "mono dim",
                  title: v.size_partial ? "Too many files to count on every refresh; at least this much." : "" },
         (v.size_partial ? "≥ " : "") + bytes(v.size)),
       el("td", { className: "mono dim hide-s" }, String(v.entries)),
+      el("td", { className: "mono dim hide-s" }, ago(v.created)),
       el("td", { className: "mono dim truncate hide-s" }, v.path),
       el("td", {}, el("div", { className: "actions" }, [
         el("button", { className: "act", textContent: "files",
-          onclick: () => { openVolume = openVolume === v.name ? null : v.name; renderVolumes(list); } }),
+          onclick: () => { openVolume = openVolume === v.name ? null : v.name; renderVolumes(all); } }),
         el("a", { className: "act", textContent: "export", download: v.name + ".tar",
           href: "/api/volumes/" + encodeURIComponent(v.name) + "/export",
           style: "text-decoration:none", title: "A tar archive of everything in it." }),
-        el("label", { className: "act", style: "margin:0;cursor:pointer",
+        el("label", { className: "act", style: "margin:0;cursor:pointer;text-transform:none;letter-spacing:0;color:var(--text)",
                       title: "Unpack a tar archive into this volume. Adds and overwrites; removes nothing." }, [
           "import",
           el("input", { type: "file", accept: ".tar", hidden: true, onchange: async (e) => {
@@ -1501,7 +1562,7 @@ function renderVolumes(list) {
             const r = await post("/api/volumes/" + encodeURIComponent(v.name) + "/clone", { to });
             logCommand(["volume", "clone", v.name, to], r); return r;
           }) }),
-        sure("empty:" + v.name, "empty", () => renderVolumes(list), async () => {
+        sure("empty:" + v.name, "empty", () => renderVolumes(all), async () => {
           logCommand(["volume", "empty", v.name],
             await post("/api/volumes/" + encodeURIComponent(v.name) + "/empty"));
         }),
@@ -1514,7 +1575,7 @@ function renderVolumes(list) {
       ])),
     ]));
     if (openVolume === v.name) {
-      body.append(el("tr", {}, el("td", { colSpan: 6, style: "padding:0" },
+      body.append(el("tr", {}, el("td", { colSpan: 8, style: "padding:0" },
         fileBrowser("/api/volumes/" + encodeURIComponent(v.name) + "/files"))));
     }
   }

@@ -584,6 +584,11 @@ impl Server {
                     "name": e.file_name().to_string_lossy(),
                     "path": e.path().display().to_string(),
                     "entries": std::fs::read_dir(e.path()).map(|d| d.count()).unwrap_or(0),
+                    // Birth time where the filesystem records one; the
+                    // directory's own mtime where it does not.
+                    "created": e.metadata().ok().and_then(|m| m.created().or(m.modified()).ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs()),
                     "size": size,
                     // Out of budget means the number is a floor, and the
                     // page writes it as one.
@@ -634,7 +639,36 @@ impl Server {
                 ),
             };
         };
-        browse_reply(stream, Path::new(&format!("/proc/{pid}/root")), req)
+        let root = PathBuf::from(format!("/proc/{pid}/root"));
+        let rel = req.param("path").unwrap_or_default();
+        let layered = Config::load(&self.paths, id)
+            .ok()
+            .and_then(|c| Some((Path::new(&c.overlay_dir?).join("upper"), c.layers)));
+        let (Some((upper, layers)), None) = (layered, req.param("raw")) else {
+            return browse_reply(stream, &root, req);
+        };
+        // What this container changed, against its image: an entry that
+        // is in the writable layer is `added` if no image layer has it
+        // and `modified` if one does. A directory is modified when
+        // anything beneath it is, which is how overlayfs records it and
+        // also what somebody looking for a change wants to follow.
+        match browse(&root, &rel) {
+            Ok(mut v) => {
+                for e in v["entries"].as_array_mut().into_iter().flatten() {
+                    let child = format!(
+                        "{}/{}",
+                        rel.trim_matches('/'),
+                        e["name"].as_str().unwrap_or("")
+                    );
+                    if exists_in(&upper, &child) {
+                        let below = layers.iter().any(|l| exists_in(Path::new(l), &child));
+                        e["note"] = json!(if below { "modified" } else { "added" });
+                    }
+                }
+                http::json(stream, 200, &v)
+            }
+            Err(e) => http::error(stream, 404, &e),
+        }
     }
 
     /// A volume as a tar archive, streamed from the CLI's stdout so a
@@ -882,6 +916,31 @@ fn browse_reply(stream: &mut TcpStream, root: &Path, req: &http::Request) -> std
         Ok(v) => http::json(stream, 200, &v),
         Err(e) => http::error(stream, 404, &e),
     }
+}
+
+/// Is there anything at `rel` under `root`? Confined like every other
+/// lookup here, and it does not follow a link at the final name: the
+/// question is whether the LAYER has an entry there, not where a link
+/// in it points.
+fn exists_in(root: &Path, rel: &str) -> bool {
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+    let Ok(rootfd) = rustix::fs::open(
+        root,
+        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    let rel = rel.trim_start_matches('/');
+    !rel.is_empty()
+        && rustix::fs::openat2(
+            &rootfd,
+            rel,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
+        )
+        .is_ok()
 }
 
 /// Find `rel` under `root` without leaving it, and say what it is.

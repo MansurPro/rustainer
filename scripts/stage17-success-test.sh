@@ -239,6 +239,12 @@ done
 check "no link or .. reads a host file" "$LEAK" ""
 check "a traversing volume name is refused" \
     "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/volumes/..%2F..%2Fstate/files")" "400"
+# What the container changed, against its image: /wrote is new, and
+# /bin came with the image and was not touched.
+NOTED=$(curl -sS "$URL/api/containers/$FID/files?path=/")
+contains "a file the container made is marked added" "$(echo "$NOTED" | tr '{' '\n' | grep '"name":"wrote"')" '"note":"added"'
+check "and one from the image is not marked" "$(echo "$NOTED" | tr '{' '\n' | grep '"name":"bin"' | grep -c '"note"')" "0"
+contains "volumes say when they were made" "$(curl -sS "$URL/api/volumes")" '"created":1'
 "$B" stop -t 0 "$FID" >/dev/null 2>&1
 # Stopped, there is no mount namespace to look into: what is left is the
 # writable layer, which is the container's own files and not the image's.
