@@ -244,6 +244,7 @@
     <button data-view="images">Images</button>
     <button data-view="builds">Builds</button>
     <button data-view="volumes">Volumes</button>
+    <button data-view="mcp">MCP</button>
   </nav>
   <div class="spacer"></div>
   <div class="sys" id="sys"></div>
@@ -285,6 +286,21 @@
     <div class="card">
       <h2>Networks</h2>
       <div id="networks"></div>
+    </div>
+  </section>
+
+  <section id="view-mcp" hidden>
+    <div class="card">
+      <h2>MCP servers <span id="mcp-total" class="dim" style="text-transform:none;letter-spacing:0"></span>
+        <span class="spacer"></span>
+        <input id="mcp-q" placeholder="search the catalogue" style="width: 190px; padding: 3px 8px; font-size: 12px;">
+      </h2>
+      <div class="hint" style="padding:10px 14px;border-bottom:1px solid var(--line);margin:0">
+        Docker Hub's <span class="mono">mcp</span> catalogue. A server is an image that speaks MCP on stdin and stdout, so a client starts it
+        with <span class="mono">rustainer run -i --rm</span>; "config" gives the exact entry to paste into the client. There is no gateway here:
+        each client runs its own servers.</div>
+      <div id="mcp-config" hidden style="padding:12px 14px;border-bottom:1px solid var(--line)"></div>
+      <div id="mcp"></div>
     </div>
   </section>
 
@@ -420,7 +436,7 @@ const ago = (secs) => {
 };
 
 // --- state --------------------------------------------------------------
-const VIEWS = ["containers", "stacks", "networks", "events", "images", "builds", "volumes"];
+const VIEWS = ["containers", "stacks", "networks", "events", "images", "builds", "volumes", "mcp"];
 let view = "containers";
 let filter = "";
 let openRow = null;           // container id whose detail panel is open
@@ -1822,6 +1838,64 @@ function renderNetworks(list) {
   box.replaceChildren(t);
 }
 
+// The catalogue is fetched once per visit, not every two seconds: it is
+// a few hundred rows from somebody else's service and does not change
+// while you are looking at it.
+let mcpCatalogue = null, mcpQuery = "";
+$("#mcp-q").oninput = (e) => { mcpQuery = e.target.value.toLowerCase(); renderMcp(); };
+async function loadMcp() {
+  if (mcpCatalogue) return renderMcp();
+  $("#mcp").replaceChildren(el("div", { className: "empty" }, "Loading the catalogue…"));
+  const r = await api("/api/mcp");
+  if (r.ok === false || r.error) {
+    $("#mcp").replaceChildren(el("div", { className: "empty" }, (r.stderr || r.error || "could not reach Docker Hub").split("\n")[0]));
+    return;
+  }
+  mcpCatalogue = (r.stdout || "").split("\n").filter(Boolean).map((l) => l.split("\t"))
+    .map(([name, pulls]) => ({ name, pulls: Number(pulls) || 0 })).sort((a, b) => b.pulls - a.pulls);
+  renderMcp();
+}
+function renderMcp() {
+  const all = mcpCatalogue || [];
+  const list = all.filter((s) => !mcpQuery || s.name.toLowerCase().includes(mcpQuery));
+  $("#mcp-total").textContent = all.length ? "· " + list.length + " of " + all.length + ", most pulled first" : "";
+  const show = async (name, network) => {
+    const r = await api("/api/mcp/config?server=" + encodeURIComponent(name) + "&network=" + network);
+    const box = $("#mcp-config");
+    box.hidden = false;
+    const text = r.stdout || r.stderr || r.error || "";
+    box.replaceChildren(
+      el("div", { style: "display:flex;gap:8px;align-items:center;margin-bottom:8px" }, [
+        el("b", { className: "mono" }, "mcp/" + name), el("span", { className: "spacer", style: "flex:1" }),
+        el("button", { className: "act", textContent: network === "none" ? "allow network" : "no network",
+          title: "Whether the server may reach the network. Choose `none` for one that does not need it.",
+          onclick: () => show(name, network === "none" ? "bridge" : "none") }),
+        el("button", { className: "act", textContent: "copy",
+          onclick: (e) => navigator.clipboard.writeText(text).then(() => { e.target.textContent = "copied"; }) }),
+        el("button", { className: "act", textContent: "pull the image", onclick: async (e) => {
+          e.target.disabled = true; e.target.textContent = "pulling…";
+          const p = await post("/api/images/pull", { reference: "mcp/" + name });
+          logCommand(["pull", "mcp/" + name], p);
+          e.target.textContent = p.ok === false ? "pull failed" : "pulled";
+        } }),
+        el("button", { className: "act", textContent: "close", onclick: () => { box.hidden = true; } }),
+      ]),
+      el("pre", { className: "log", style: "max-height:36vh", textContent: text }));
+  };
+  if (!list.length) {
+    $("#mcp").replaceChildren(el("div", { className: "empty" }, all.length ? "No server matches." : "The catalogue is empty."));
+    return;
+  }
+  $("#mcp").replaceChildren(el("table", {}, [
+    el("thead", {}, el("tr", {}, [el("th", {}, "Server"), el("th", {}, "Pulls"), el("th", {}, "")])),
+    el("tbody", {}, list.slice(0, 300).map((s) => el("tr", {}, [
+      el("td", { className: "mono" }, s.name),
+      el("td", { className: "mono dim" }, s.pulls.toLocaleString()),
+      el("td", {}, el("div", { className: "actions" },
+        el("button", { className: "act", textContent: "config", onclick: () => show(s.name, "bridge") }))),
+    ])))]));
+}
+
 // Every build this engine has done, worked or not, read back out of the
 // event log - there is no separate build database to drift from it.
 function renderBuilds(events) {
@@ -2056,6 +2130,8 @@ async function refresh() {
   } else if (view === "events") {
     const evs = await api("/api/events?limit=300");
     renderEvents(Array.isArray(evs) ? evs : []);
+  } else if (view === "mcp") {
+    await loadMcp();
   } else if (view === "builds") {
     const evs = await api("/api/events?limit=2000");
     renderBuilds(Array.isArray(evs) ? evs : []);

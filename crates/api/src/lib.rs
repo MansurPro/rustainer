@@ -123,6 +123,22 @@ impl Server {
             ("POST", "/api/containers") => return self.create(stream, req),
             ("GET", "/api/images") => return http::json(stream, 200, &self.images()),
             ("POST", "/api/images/pull") => return self.pull(stream, req),
+            ("GET", "/api/mcp") => return self.run_cli(stream, &["mcp", "ls"]),
+            ("GET", "/api/mcp/config") => {
+                let server = req.param("server").unwrap_or_default();
+                let network = req.param("network").unwrap_or_else(|| "bridge".into());
+                // Names, not flags: both are placed on a command line.
+                let plain = |s: &str| {
+                    !s.is_empty()
+                        && !s.starts_with('-')
+                        && s.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "._-/:".contains(c))
+                };
+                if !plain(&server) || !plain(&network) {
+                    return http::error(stream, 400, "not a server name");
+                }
+                return self.run_cli(stream, &["mcp", "config", &server, "--network", &network]);
+            }
             ("GET", "/api/registry/repos") => {
                 let ns = req.param("namespace").unwrap_or_default();
                 if !is_safe_id(&ns) {

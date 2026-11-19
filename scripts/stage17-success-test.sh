@@ -389,5 +389,26 @@ check "asking for tags of nothing is refused" \
     "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/registry/tags")" "400"
 
 echo
+echo "15. A container can be driven over a pipe"
+# `run -i` without a terminal: how one program speaks to another through
+# a container, and what every stdio-based server depends on.
+check "piped stdin reaches the command" \
+    "$(echo through-a-pipe | timeout 60 "$B" run -i --rm --network none --layer "$BASE" /bin/cat 2>/dev/null)" "through-a-pipe"
+check "and without -i it does not" \
+    "$(echo through-a-pipe | timeout 60 "$B" run --rm --network none --layer "$BASE" /bin/cat 2>/dev/null)" ""
+check "a bare -e KEY takes the value we have" \
+    "$(FROM_OUTSIDE=yes timeout 60 "$B" run --rm --network none -e FROM_OUTSIDE --layer "$BASE" /bin/sh -c 'echo $FROM_OUTSIDE' 2>/dev/null | tail -1)" "yes"
+BEFORE=$("$B" ps -a | wc -l)
+timeout 60 "$B" run --rm --network none --layer "$BASE" /bin/true >/dev/null 2>&1
+check "--rm leaves no container behind" "$("$B" ps -a | wc -l)" "$BEFORE"
+CFG=$("$B" mcp config time --network none -e API_KEY 2>&1)
+contains "an MCP entry names the image" "$CFG" '"mcp/time"'
+contains "starts it on a pipe and removes it after" "$(echo "$CFG" | tr -d ' \n')" '"run","-i","--rm","--network","none","-e","API_KEY"'
+contains "and leaves a secret to be filled in, not written down" "$CFG" '"API_KEY": "<fill in>"'
+contains "the same entry comes from the API" "$(curl -sS "$URL/api/mcp/config?server=time&network=none")" 'mcp/time'
+check "a server name that is a flag is refused" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/mcp/config?server=--help")" "400"
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
