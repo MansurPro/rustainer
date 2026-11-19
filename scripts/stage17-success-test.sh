@@ -244,5 +244,35 @@ check "a stopped container has no files to show" \
     "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/containers/$FID/files")" "409"
 
 echo
+echo "11. An exited container starts again as itself"
+# The same container resumed, not a new one like it: what it wrote to its
+# own filesystem before it stopped has to still be there. /kept gains a
+# line per start, so its length is the number of times THIS container ran.
+status_of() { "$B" ps -a | awk -v id="$1" '$1 == id {print $2}'; }
+pid_of() { "$B" ps -a | awk -v id="$1" '$1 == id {print $3}'; }
+SID=$(timeout 60 "$B" run -d --network none --layer "$BASE" /bin/sh -c \
+    'echo ran >> /kept; exec sleep 60' 2>/dev/null | tail -1)
+"$B" stop -t 0 "$SID" >/dev/null 2>&1
+check "it is stopped first" "$(status_of "$SID")" "exited"
+check "start through the API is accepted" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL/api/containers/$SID/start")" "200"
+check "and it is running again" "$(status_of "$SID")" "running"
+for _ in $(seq 50); do
+    [ "$("$B" exec "$SID" /bin/cat /kept 2>/dev/null | wc -l)" -ge 2 ] && break
+    sleep 0.1
+done
+check "with the files it had before" "$("$B" exec "$SID" /bin/cat /kept 2>/dev/null | wc -l | tr -d ' ')" "2"
+"$B" start "$SID" >/dev/null 2>&1
+check "starting what is running is refused" "$?" "1"
+BEFORE=$(pid_of "$SID")
+check "restart through the API is accepted" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL/api/containers/$SID/restart")" "200"
+check "and it is running" "$(status_of "$SID")" "running"
+AFTER=$(pid_of "$SID")
+if [ -n "$AFTER" ] && [ "$AFTER" != "$BEFORE" ]; then ok "as a new process"; else bad "as a new process ($BEFORE -> $AFTER)"; fi
+"$B" start no-such-container >/dev/null 2>&1
+check "starting nothing is an error" "$?" "1"
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

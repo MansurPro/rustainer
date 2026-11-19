@@ -590,8 +590,17 @@ the same image deleted the record the other still needed.
 
 Stated as limits: an image's size is its **compressed** layers, not disk
 use; a volume's size stops counting at 20,000 entries and is then shown
-as a floor; a stopped container cannot be browsed; and there is still no
-`start` or `restart` for a container that has exited.
+as a floor; and a stopped container cannot be browsed.
+
+`start` and `restart` followed, because a Containers screen without them
+is a list of things you can only delete. An exited container comes back
+as itself - same id, address, published ports, volumes and writable
+layer - which stage 17 asserts by having the container append a line to
+a file in its own filesystem on every run and counting the lines. It
+cost thirty lines, because bringing a container up from its stored
+config more than once is what a restart policy already had to do. One
+limit: a stack's healthcheck watcher is not restarted with it, so a
+started container reports no health rather than a stale one.
 
 ### What the page does that is worth something
 

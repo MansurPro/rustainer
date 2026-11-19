@@ -664,8 +664,16 @@ function renderContainers(list) {
     }));
     if (running) {
       acts.append(el("button", {
+        className: "act", textContent: "restart",
+        onclick: (e) => act(e.target, ["restart", "-t", "5", c.id], "/api/containers/" + c.id + "/restart"),
+      }), el("button", {
         className: "act", textContent: "stop",
         onclick: (e) => act(e.target, ["stop", "-t", "5", c.id], "/api/containers/" + c.id + "/stop"),
+      }));
+    } else {
+      acts.append(el("button", {
+        className: "act", textContent: "start",
+        onclick: (e) => act(e.target, ["start", c.id], "/api/containers/" + c.id + "/start"),
       }));
     }
     acts.append(el("button", {
@@ -1040,6 +1048,9 @@ function renderStacks(list) {
       el("b", { className: "mono" }, name),
       el("span", { className: "pill" }, running + " / " + members.length + " running"),
       el("span", { className: "spacer", style: "flex:1" }),
+      el("button", { className: "act", textContent: "start all", disabled: running === members.length,
+        onclick: (e) => each(e.target, members.filter((m) => m.status !== "running"),
+          (m) => [["start", m.id], "/api/containers/" + m.id + "/start", "POST"]) }),
       el("button", { className: "act", textContent: "stop all", disabled: !running,
         onclick: (e) => each(e.target, members.filter((m) => m.status === "running"),
           (m) => [["stop", "-t", "5", m.id], "/api/containers/" + m.id + "/stop", "POST"]) }),

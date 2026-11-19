@@ -66,6 +66,14 @@ enum Command {
     Ps(PsArgs),
     /// Stop a running container: SIGTERM, a grace period, then SIGKILL.
     Stop(StopArgs),
+    /// Start an exited container again, exactly as it was configured.
+    ///
+    /// Same id, address, volumes and limits, and the same writable
+    /// layer: files the container wrote before it exited are still
+    /// there. It is the container resumed, not a new one like it.
+    Start { id: String },
+    /// Stop a container if it is running, then start it.
+    Restart(StopArgs),
     /// Remove a container's state directory.
     Rm(RmArgs),
     /// Print a container's captured output.
@@ -570,6 +578,12 @@ fn real_main() -> Result<ExitCode> {
         Command::Run(a) => cmd_run(&paths, *a),
         Command::Ps(a) => cmd_ps(&paths, a),
         Command::Stop(a) => cmd_stop(&paths, a),
+        Command::Start { id } => cmd_start(&paths, &id),
+        Command::Restart(a) => {
+            supervise::stop(&paths, &a.id, Duration::from_secs(a.time))
+                .with_context(|| format!("stopping {}", a.id))?;
+            cmd_start(&paths, &a.id)
+        }
         Command::Rm(a) => cmd_rm(&paths, a),
         Command::Logs(a) => cmd_logs(&paths, a),
         Command::Exec(a) => cmd_exec(&paths, a),
@@ -1332,6 +1346,34 @@ fn cmd_stop(paths: &Paths, args: StopArgs) -> Result<ExitCode> {
     supervise::stop(paths, &args.id, Duration::from_secs(args.time))
         .with_context(|| format!("stopping {}", args.id))?;
     println!("{}", args.id);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_start(paths: &Paths, id: &str) -> Result<ExitCode> {
+    use rustainer_core::state::Status;
+    let st = State::load(paths, id).with_context(|| format!("no such container: {id}"))?;
+    if matches!(st.observed_status(), Status::Running | Status::Created) {
+        bail!("{id} is already running");
+    }
+    // Everything a start needs is in the stored config, and the
+    // supervisor already knows how to bring a container up from it more
+    // than once - that is what a restart policy is. So this is `run`
+    // from the point where the config has been written: a fresh state
+    // record, a new supervisor, the same handshake.
+    let config = supervise::Config::load(paths, id)
+        .with_context(|| format!("{id} has no stored configuration to start from"))?;
+    let lock = rustainer_core::state::Lock::acquire(&paths.lock_file(id))
+        .context("locking the container directory")?;
+    State::new(id.to_owned(), config.argv.clone()).store(paths)?;
+    // The health watcher left with the old process and nothing is
+    // probing this one, so its last verdict is about something that no
+    // longer exists. No answer is better than a stale "healthy".
+    let _ = std::fs::remove_file(paths.dir(id).join("health"));
+    let (handshake_rx, handshake_tx) = sys::pipe()?;
+    let mut child = spawn_supervisor(paths, id, handshake_tx, true, false)?;
+    read_handshake(paths, &handshake_rx, &mut child, id)?;
+    drop(lock);
+    println!("{id}");
     Ok(ExitCode::SUCCESS)
 }
 
