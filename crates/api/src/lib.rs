@@ -165,6 +165,8 @@ impl Server {
                 ("GET", "files") => self.container_files(stream, &id, req),
                 ("POST", "stop") => self.run_cli(stream, &["stop", "-t", "5", &id]),
                 ("POST", "kill") => self.run_cli(stream, &["stop", "-t", "0", &id]),
+                ("POST", "start") => self.run_cli(stream, &["start", &id]),
+                ("POST", "restart") => self.run_cli(stream, &["restart", "-t", "5", &id]),
                 ("POST", "exec") => self.exec(stream, &id, req),
                 ("POST", "term") => self.term_open(stream, &id, req),
                 ("DELETE", "") => self.run_cli(stream, &["rm", "--force", &id]),
