@@ -243,6 +243,9 @@ impl Server {
                     ("PUT", "files") => self.put_file(stream, &["--volume", &name], req),
                     ("GET", "export") if root.is_dir() => self.export_volume(stream, &name),
                     ("POST", "empty") => self.run_cli(stream, &["volume", "empty", &name]),
+                    ("POST", "import") => {
+                        self.run_cli_with(stream, &["volume", "import", &name], &req.body)
+                    }
                     ("POST", "clone") => {
                         let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
                         let to = spec["to"].as_str().unwrap_or("");
