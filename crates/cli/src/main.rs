@@ -88,6 +88,11 @@ enum Command {
     Push(PushArgs),
     /// List images in the local store.
     Images,
+    /// List the tags a repository has in its registry.
+    Tags {
+        /// A repository, e.g. `alpine` or `ghcr.io/owner/name`.
+        repository: String,
+    },
     /// Remove an image from the local store.
     Rmi(RmiArgs),
     /// List or remove named volumes.
@@ -623,6 +628,17 @@ fn real_main() -> Result<ExitCode> {
         Command::Push(a) => cmd_push(&paths, a),
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
+        Command::Tags { repository } => {
+            let r = rustainer_image::Reference::parse(&repository)
+                .map_err(|e| anyhow::anyhow!("{repository}: {e}"))?;
+            let tags = rustainer_image::registry::Client::new()
+                .tags(&r)
+                .with_context(|| format!("listing the tags of {repository}"))?;
+            for t in tags {
+                println!("{t}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Volume(a) => cmd_volume(&paths, a),
         Command::Network(a) => cmd_network(&paths, a),
         Command::Events(a) => cmd_events(&paths, a),

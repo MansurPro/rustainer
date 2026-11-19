@@ -224,6 +224,25 @@ impl Client {
         self
     }
 
+    /// The tags a repository has, as the registry lists them.
+    ///
+    /// One page of them: registries paginate with a `Link` header and
+    /// some repositories have tens of thousands of tags, so this asks
+    /// for a bounded number and says nothing about the rest.
+    pub fn tags(&mut self, r: &Reference) -> Result<Vec<String>, Error> {
+        let url = format!("{}/v2/{}/tags/list?n=1000", r.base_url(), r.name);
+        let (body, _) = self.get(r, &url, "application/json", "the tag list")?;
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        Ok(doc["tags"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Fetch a manifest or index, verified.
     pub fn manifest(&mut self, r: &Reference) -> Result<(Fetched, String, Vec<u8>), Error> {
         let url = format!(

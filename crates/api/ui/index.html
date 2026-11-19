@@ -300,9 +300,11 @@
         <span class="spacer"></span>
         <input id="pullref" placeholder="alpine:3.21" style="width: 200px; padding: 3px 8px; font-size: 12px;">
         <button class="act" id="pull">Pull</button>
+        <button class="act" id="tags" title="List this repository's tags in its registry.">Tags</button>
         <button class="act" id="build">Build…</button>
         <button class="act danger" id="prune-images" hidden></button>
       </h2>
+      <div id="taglist" hidden style="padding:10px 14px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:5px"></div>
       <div id="images"></div>
     </div>
   </section>
@@ -719,9 +721,14 @@ function buildDetail() {
   const body = el("div");
   if (detailTab === "logs") {
     body.append(
-      el("div", { style: "padding:8px 14px;border-bottom:1px solid var(--line)" },
+      el("div", { style: "padding:8px 14px;border-bottom:1px solid var(--line);display:flex;gap:14px;align-items:center" }, [
         el("input", { placeholder: "search these lines", value: logFilter, style: "width:260px",
-          oninput: (e) => { logFilter = e.target.value; refreshLogs(true); } })),
+          oninput: (e) => { logFilter = e.target.value; refreshLogs(true); } }),
+        el("label", { style: "display:flex;gap:6px;align-items:center;margin:0" }, [
+          el("input", { type: "checkbox", checked: logTimes, style: "width:auto",
+            onchange: (e) => { logTimes = e.target.checked; refreshLogs(true); } }),
+          "timestamps"]),
+      ]),
       el("pre", { className: "log", id: "logtext", textContent: "loading…" }));
     refreshLogs(true);
   } else if (detailTab === "terminal") {
@@ -1030,7 +1037,15 @@ async function refreshLogs(force) {
   const out = $("#logtext");
   if (!out) return;
   const d = await api("/api/containers/" + openRow + "/logs?tail=400");
-  let text = [d.stdout, d.stderr].filter(Boolean).join("\n") || "(no output)";
+  // Times are per line and to a tenth of a second; a line from before
+  // the engine kept them gets a blank of the same width.
+  const stamp = (text, times) => !text ? "" : !logTimes ? text : text.split("\n").map((l, i) => {
+    const t = times && times[i];
+    return (t ? new Date(t / 1000).toLocaleTimeString([], { hour12: false }) +
+                "." + String(Math.floor(t / 100000) % 10) : "          ") + "  " + l;
+  }).join("\n");
+  let text = [stamp(d.stdout, d.stdout_times), stamp(d.stderr, d.stderr_times)]
+    .filter(Boolean).join("\n") || "(no output)";
   if (logFilter) {
     // A filter, not a highlight: on a busy log the lines you wanted are
     // otherwise still a scroll apart.
@@ -1050,6 +1065,7 @@ async function refreshLogs(force) {
 // status changed - not on every tick.
 let detailStatus = null;
 let logFilter = "";
+let logTimes = false;
 function buildDetailIfStale() {
   if (!openRow) return;
   const c = lastContainers.find((x) => x.id === openRow);
@@ -1466,6 +1482,32 @@ $("#pull").onclick = async (e) => {
   refresh();
 };
 $("#pullref").onkeydown = (e) => { if (e.key === "Enter") $("#pull").click(); };
+
+// The registry's own list of tags for whatever is in the box. A tag is
+// a button that fills the box, so finding a version and pulling it is
+// two clicks and no guessing.
+$("#tags").onclick = async (e) => {
+  const box = $("#taglist");
+  const repo = $("#pullref").value.trim().replace(/[:@][^/]*$/, "");
+  if (!repo) { box.hidden = true; return; }
+  e.target.disabled = true;
+  const r = await api("/api/registry/tags?repository=" + encodeURIComponent(repo));
+  e.target.disabled = false;
+  logCommand(["tags", repo], r);
+  box.hidden = false;
+  const tags = (r.stdout || "").split("\n").filter(Boolean);
+  if (!tags.length) {
+    box.replaceChildren(el("span", { className: "hint", style: "margin:0" },
+      (r.stderr || r.error || "No tags.").split("\n")[0]));
+    return;
+  }
+  // Newest-looking first: registries return them in no useful order.
+  tags.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+  box.replaceChildren(...tags.slice(0, 200).map((t) => el("button", {
+    className: "act mono", textContent: t,
+    onclick: () => { $("#pullref").value = repo + ":" + t; $("#pullref").focus(); },
+  })), tags.length > 200 ? el("span", { className: "hint", style: "margin:0" }, "and " + (tags.length - 200) + " more") : "");
+};
 
 // --- run a container ----------------------------------------------------
 $("#new-container").onclick = () => {

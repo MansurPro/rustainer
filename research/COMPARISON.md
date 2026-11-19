@@ -628,7 +628,7 @@ present in the installed version.
 | Layers and history | yes, per layer | per-layer sizes and the build history |
 | Packages and CVEs (Scout) | yes | **no** |
 | Push from the UI | yes | yes, with the credentials the server was started with |
-| Registry tab ("My Hub") | yes | **no** |
+| Registry | "My Hub": your repositories | the tags of any repository you name; no account view |
 
 **Volumes**
 
@@ -647,7 +647,7 @@ present in the installed version.
 
 | | Docker Desktop | this page |
 | --- | --- | --- |
-| Logs | live, with search and timestamps | tail, polled, with a line filter; no timestamps |
+| Logs | live, with search and timestamps | tail, polled, with a line filter and timestamps to 0.1 s |
 | Inspect | yes | yes |
 | Run a command | Exec, or Docker Debug | one-shot exec, and a pty terminal |
 | Files: browse | running containers | running, and a stopped one's own writes |
@@ -666,10 +666,12 @@ one whose entry is named `../../outside-volume` and asserts nothing
 appears there.
 
 What is still missing, and is not close: **package and CVE data**, which
-needs a vulnerability database this project does not have; a registry
-browser; log timestamps; importing a volume from the page; and files
-over 1M in the editor. Editing a file and the memory, network and disk
-charts followed in a second pass. It is nearer parity than it was, and
+needs a vulnerability database this project does not have; an account's
+own repositories; importing a volume from the page; and files over 1M
+in the editor. Editing a file, the memory, network and disk charts, log
+timestamps and a registry tag list followed in later passes. The
+timestamps are kept in an index beside each log rather than in it, so
+`logs` still prints byte for byte what the container wrote. It is nearer parity than it was, and
 it is not parity.
 
 ### What the page does that is worth something
