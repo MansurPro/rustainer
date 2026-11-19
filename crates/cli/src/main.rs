@@ -1739,7 +1739,14 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         "create",
         &id,
         serde_json::json!({
-            "image": config.rootfs.clone().unwrap_or_default(),
+            // The reference when there was one: the rootfs of an image
+            // is a path under the state directory, which names nothing.
+            "image": if args.rootfs.is_none() && args.layer.is_empty() {
+                args.command.first().map(|c| c.to_string_lossy().into_owned())
+            } else {
+                config.rootfs.clone()
+            }
+            .unwrap_or_default(),
             "command": config.argv.join(" "),
             "detached": args.detach,
         }),
