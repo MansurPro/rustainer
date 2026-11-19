@@ -4,6 +4,43 @@ What this engine actually costs, next to the one it is modelled on, measured
 rather than asserted. Everything here is reproducible with one command, which
 is at the bottom.
 
+## Is it 2× or 3× better, and does it still run Docker's images?
+
+**Yes to both, with one exception that is stated rather than averaged
+away.** Twelve speed ratios were measured against Docker, on two hosts:
+
+| | ratio (midpoint of the range measured) |
+|---|---:|
+| network throughput, container to container | 1.15× |
+| start detached, stop, remove - arm64 host | 2.4× |
+| rebuild an image from cache | 2.8× |
+| pull a cold image - arm64 host | 2.85× |
+| build an image, no cache | 3.0× |
+| pull a cold image - x86_64 host | 3.6× |
+| exec in a live container - arm64 host | 3.8× |
+| start detached, stop, remove - x86_64 host | 4.0× |
+| run a container to exit - x86_64 host | 6.5× |
+| run a container to exit - arm64 host | 7.2× |
+| bring up a stack with replicas | 9.7× |
+| exec in a live container - x86_64 host | 14.5× |
+
+- **The median is 3.7×.**
+- **11 of the 12 are at least 2×, and 8 are at least 3×.**
+- The one that is not is network throughput, which is the same as
+  Docker's and will stay the same: both hand packets to the same kernel
+  bridge, and there is nothing in between to make faster.
+- Memory is a separate axis and a larger one: 7× to 18× less per running
+  container, and nothing resident when nothing runs (Docker: 120-170 MiB).
+- Compatibility: **28 of 28** Docker Hub images tried run unchanged
+  (section 6), private repositories included, and it reads Docker's
+  model artifacts too.
+
+So "2× to 3× better with compatibility" is true as a statement about
+the typical operation and false as a statement about every operation.
+The sections below are where each number comes from.
+
+---
+
 The short answer: **2.4× to 7.5× faster** on the container operations both
 tools perform, **18× less memory per running container**, **40× less binary**,
 and **no resident daemon at all**. The longer answer is that most of that gap
