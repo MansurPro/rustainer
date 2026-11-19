@@ -124,6 +124,27 @@ impl Server {
             ("GET", "/api/images") => return http::json(stream, 200, &self.images()),
             ("POST", "/api/images/pull") => return self.pull(stream, req),
             ("GET", "/api/volumes") => return http::json(stream, 200, &self.volumes()),
+            ("POST", "/api/volumes") => {
+                let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let name = spec["name"].as_str().unwrap_or("");
+                if !is_safe_id(name) {
+                    return http::error(stream, 400, "not a usable volume name");
+                }
+                return self.run_cli(stream, &["volume", "create", name]);
+            }
+            ("POST", "/api/images/push") => {
+                let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let Some(reference) = spec["reference"].as_str().filter(|s| !s.is_empty()) else {
+                    return http::error(stream, 400, "a reference is required");
+                };
+                // Credentials are whatever RUSTAINER_REGISTRY_AUTH this
+                // server was started with. None ever arrive in a request:
+                // a password in a JSON body is a password in a browser.
+                return match spec["to"].as_str().filter(|s| !s.is_empty()) {
+                    Some(to) => self.run_cli(stream, &["push", reference, "--to", to]),
+                    None => self.run_cli(stream, &["push", reference]),
+                };
+            }
             ("GET", "/api/networks") => return http::json(stream, 200, &self.networks()),
             ("POST", "/api/build") => return self.build(stream, req),
             ("GET", "/api/events") => {
@@ -200,13 +221,26 @@ impl Server {
         }
 
         if let Some(name) = path.strip_prefix("/api/volumes/") {
-            if let Some(name) = name.strip_suffix("/files") {
+            if let Some((name, action)) = name.split_once('/') {
                 let name = http::percent_decode(name);
-                if method != "GET" || !is_safe_id(&name) {
+                if !is_safe_id(&name) {
                     return http::error(stream, 400, "not a usable volume name");
                 }
                 let root = Store::default_root().join("volumes").join(&name);
-                return browse_reply(stream, &root, req);
+                return match (method, action) {
+                    ("GET", "files") => browse_reply(stream, &root, req),
+                    ("GET", "export") if root.is_dir() => self.export_volume(stream, &name),
+                    ("POST", "empty") => self.run_cli(stream, &["volume", "empty", &name]),
+                    ("POST", "clone") => {
+                        let spec: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                        let to = spec["to"].as_str().unwrap_or("");
+                        if !is_safe_id(to) {
+                            return http::error(stream, 400, "not a usable volume name");
+                        }
+                        self.run_cli(stream, &["volume", "clone", &name, to])
+                    }
+                    _ => http::error(stream, 404, "no such volume action"),
+                };
             }
             let name = http::percent_decode(name);
             if method != "DELETE" {
@@ -352,6 +386,31 @@ impl Server {
                 .sum::<u64>()
                 * 1024
         });
+        let net = read_trimmed(format!("/proc/{pid}/net/dev")).map(|s| {
+            s.lines()
+                .filter_map(|l| l.split_once(':'))
+                .filter(|(name, _)| name.trim() != "lo")
+                .fold((0u64, 0u64), |acc, (_, rest)| {
+                    let f: Vec<u64> = rest
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    (
+                        acc.0 + f.first().copied().unwrap_or(0),
+                        acc.1 + f.get(8).copied().unwrap_or(0),
+                    )
+                })
+        });
+        // Needs the io controller, which is not always enabled; absent
+        // then, and the page shows nothing rather than a zero.
+        let io = read("io.stat").map(|s| {
+            s.split_whitespace()
+                .fold((0u64, 0u64), |acc, kv| match kv.split_once('=') {
+                    Some(("rbytes", v)) => (acc.0 + v.parse::<u64>().unwrap_or(0), acc.1),
+                    Some(("wbytes", v)) => (acc.0, acc.1 + v.parse::<u64>().unwrap_or(0)),
+                    _ => acc,
+                })
+        });
         json!({
             "running": true,
             "cgroup": true,
@@ -362,6 +421,15 @@ impl Server {
             "pids_current": read("pids.current").and_then(|s| s.parse::<u64>().ok()),
             "pids_max": read("pids.max"),
             "cpu_usec": cpu_usec,
+            // Cumulative since the container started, like the CPU
+            // counter. `/proc/<pid>/net/dev` is that process's network
+            // namespace, so this is the container's traffic and not the
+            // host's - except with `--network host`, where they are the
+            // same thing and the number says so by being large.
+            "net_rx": net.map(|n| n.0),
+            "net_tx": net.map(|n| n.1),
+            "io_read": io.map(|n| n.0),
+            "io_write": io.map(|n| n.1),
             "sampled_at_usec": now_usec(),
         })
     }
@@ -432,6 +500,20 @@ impl Server {
                     let section = config.config.unwrap_or_default();
                     row["created"] = json!(config.created);
                     row["layers"] = json!(ids.len());
+                    row["history"] = json!(
+                        config
+                            .history
+                            .iter()
+                            .filter_map(|h| h.created_by.clone())
+                            .collect::<Vec<_>>()
+                    );
+                    row["layer_sizes"] = json!(
+                        manifest.as_ref().map(|m| m
+                            .layers
+                            .iter()
+                            .map(|l| l.size)
+                            .collect::<Vec<_>>())
+                    );
                     // What the registry stores and what a pull transfers:
                     // the COMPRESSED layers. Not the size on disk, which
                     // would take a walk of every layer on every refresh,
@@ -522,6 +604,24 @@ impl Server {
             };
         };
         browse_reply(stream, Path::new(&format!("/proc/{pid}/root")), req)
+    }
+
+    /// A volume as a tar archive, streamed from the CLI's stdout so a
+    /// large volume is never held in this process's memory.
+    fn export_volume(&self, stream: &mut TcpStream, name: &str) -> std::io::Result<()> {
+        let mut cmd = std::process::Command::new(&self.exe);
+        if let Some(root) = &self.root_arg {
+            cmd.arg("--root").arg(root);
+        }
+        let mut child = cmd
+            .args(["volume", "export", name])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let out = child.stdout.take().expect("piped above");
+        let r = download(stream, &format!("{name}.tar"), out);
+        let _ = child.wait();
+        r
     }
 
     // --- writes, all of which execute the CLI ---------------------------
@@ -640,9 +740,6 @@ impl Server {
     }
 }
 
-/// Ids come back to us in a URL and become a path. Anything that is not
-/// plainly a name is refused rather than sanitised, because sanitising is
-/// where traversal bugs live.
 /// How many directory entries a volume's size may cost to compute. The
 /// list is polled, and a volume holding a million files must not turn
 /// every poll into a million `lstat`s.
@@ -673,32 +770,55 @@ fn du(dir: &Path, budget: &mut usize) -> u64 {
     total
 }
 
+/// Send a body of unknown length as a file to save. No Content-Length:
+/// the connection closing is the end, which HTTP/1.1 allows and which
+/// is what lets the body be streamed instead of buffered.
+fn download(stream: &mut TcpStream, name: &str, mut body: impl Read) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = if is_safe_id(name) { name } else { "download" };
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+         Content-Disposition: attachment; filename=\"{name}\"\r\n\
+         Connection: close\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\n\r\n"
+    )?;
+    std::io::copy(&mut body, stream)?;
+    stream.flush()
+}
+
 fn browse_reply(stream: &mut TcpStream, root: &Path, req: &http::Request) -> std::io::Result<()> {
-    match browse(root, &req.param("path").unwrap_or_default()) {
+    let rel = req.param("path").unwrap_or_default();
+    // `raw=1`: the whole file, as a download, through the same confined
+    // lookup as everything else here.
+    if req.param("raw").is_some() {
+        return match resolve(root, &rel) {
+            Ok((via, meta, _fd)) if meta.is_file() => match std::fs::File::open(&via) {
+                Ok(f) => {
+                    let name = rel.rsplit('/').next().unwrap_or("");
+                    download(stream, name, f)
+                }
+                Err(e) => http::error(stream, 404, &e.to_string()),
+            },
+            Ok(_) => http::error(stream, 400, "only a regular file can be downloaded"),
+            Err(e) => http::error(stream, 404, &e),
+        };
+    }
+    match browse(root, &rel) {
         Ok(v) => http::json(stream, 200, &v),
         Err(e) => http::error(stream, 404, &e),
     }
 }
 
-/// List a directory, or show the head of a file, somewhere under `root`.
-///
-/// The path comes from a URL and the tree it names belongs to a
-/// container, so neither is trusted. `openat2(RESOLVE_IN_ROOT)` makes
-/// the kernel treat `root` as `/` for the whole walk: `..` stops there,
-/// and an absolute symlink - `/etc -> /`, or a link a container planted
-/// at `/var/log/x -> /etc/shadow` hoping the host would read its own -
-/// resolves inside the tree instead of on the host. Checking the string
-/// for `..` would not have covered the symlink.
-///
-/// Opened `O_PATH` first and reopened only once it is known to be a
-/// directory or a regular file: opening a FIFO blocks and opening a
-/// device node can have effects, and a container gets to choose what is
-/// at the path.
-fn browse(root: &Path, rel: &str) -> Result<Value, String> {
+/// Find `rel` under `root` without leaving it, and say what it is.
+/// Returns the descriptor's `/proc/self/fd` name - the one path that
+/// cannot be re-resolved to something else between the check and the
+/// use - and the descriptor, which has to outlive that name.
+fn resolve(
+    root: &Path,
+    rel: &str,
+) -> Result<(String, std::fs::Metadata, rustix::fd::OwnedFd), String> {
     use rustix::fs::{Mode, OFlags, ResolveFlags};
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     let rootfd = rustix::fs::open(
         root,
         OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
@@ -718,6 +838,26 @@ fn browse(root: &Path, rel: &str) -> Result<Value, String> {
     // re-resolved to something else between the check and the use.
     let via = format!("/proc/self/fd/{}", fd.as_raw_fd());
     let meta = std::fs::metadata(&via).map_err(|e| e.to_string())?;
+    Ok((via, meta, fd))
+}
+
+/// List a directory, or show the head of a file, somewhere under `root`.
+///
+/// The path comes from a URL and the tree it names belongs to a
+/// container, so neither is trusted. `openat2(RESOLVE_IN_ROOT)` makes
+/// the kernel treat `root` as `/` for the whole walk: `..` stops there,
+/// and an absolute symlink - `/etc -> /`, or a link a container planted
+/// at `/var/log/x -> /etc/shadow` hoping the host would read its own -
+/// resolves inside the tree instead of on the host. Checking the string
+/// for `..` would not have covered the symlink.
+///
+/// Opened `O_PATH` first and reopened only once it is known to be a
+/// directory or a regular file: opening a FIFO blocks and opening a
+/// device node can have effects, and a container gets to choose what is
+/// at the path.
+fn browse(root: &Path, rel: &str) -> Result<Value, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (via, meta, _fd) = resolve(root, rel)?;
 
     if meta.is_dir() {
         let mut entries = Vec::new();
@@ -770,6 +910,9 @@ fn browse(root: &Path, rel: &str) -> Result<Value, String> {
     Ok(json!({ "kind": "other" }))
 }
 
+/// Ids come back to us in a URL and become a path. Anything that is not
+/// plainly a name is refused rather than sanitised, because sanitising is
+/// where traversal bugs live.
 fn is_safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128

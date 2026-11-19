@@ -514,6 +514,25 @@ enum VolumeCmd {
     Ls,
     /// Remove a named volume and everything in it.
     Rm { name: String },
+    /// Create an empty named volume.
+    Create { name: String },
+    /// Delete everything in a volume and keep the volume.
+    Empty { name: String },
+    /// Copy a volume, contents and ownership, under a new name.
+    Clone { from: String, to: String },
+    /// Write a volume's contents as a tar archive, to a file or stdout.
+    Export {
+        name: String,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Replace nothing, add everything: unpack a tar archive into a
+    /// volume, from a file or stdin. The volume is created if missing.
+    Import {
+        name: String,
+        #[arg(short, long)]
+        input: Option<PathBuf>,
+    },
 }
 
 #[derive(Args)]
@@ -592,7 +611,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Push(a) => cmd_push(&paths, a),
         Command::Images => cmd_images(),
         Command::Rmi(a) => cmd_rmi(a),
-        Command::Volume(a) => cmd_volume(a),
+        Command::Volume(a) => cmd_volume(&paths, a),
         Command::Network(a) => cmd_network(&paths, a),
         Command::Events(a) => cmd_events(&paths, a),
         Command::Serve(a) => cmd_serve(cli_root.clone(), a),
@@ -2773,9 +2792,125 @@ fn cmd_serve(root: Option<PathBuf>, args: ServeArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_volume(cmd: VolumeCmd) -> Result<ExitCode> {
+/// A volume's directory, from a name that is checked to be only a name:
+/// `volume rm ../../etc` must not delete anything.
+fn volume_dir(name: &str, must_exist: bool) -> Result<PathBuf> {
+    if name.contains('/') || name.contains("..") || name.is_empty() || name.starts_with('.') {
+        bail!("{name:?} is not a volume name");
+    }
+    let p = volumes_root().join(name);
+    if must_exist && !p.is_dir() {
+        bail!("no such volume: {name}");
+    }
+    Ok(p)
+}
+
+fn cmd_volume(paths: &Paths, cmd: VolumeCmd) -> Result<ExitCode> {
     let root = volumes_root();
     match cmd {
+        VolumeCmd::Create { name } => {
+            let p = volume_dir(&name, false)?;
+            if p.exists() {
+                bail!("volume {name} already exists");
+            }
+            std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
+            println!("{name}");
+        }
+        VolumeCmd::Empty { name } => {
+            let p = volume_dir(&name, true)?;
+            // Refused rather than done under a running process: a
+            // database whose files vanish while it holds them open does
+            // not fail cleanly, it corrupts whatever it writes next.
+            let users: Vec<String> = paths
+                .list()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|id| {
+                    State::load(paths, id).is_ok_and(|s| s.observed_status() == Status::Running)
+                        && Config::load(paths, id)
+                            .is_ok_and(|c| c.volumes.iter().any(|v| v.source == p))
+                })
+                .collect();
+            if !users.is_empty() {
+                bail!(
+                    "volume {name} is mounted by running container(s): {}. Stop them first.",
+                    users.join(", ")
+                );
+            }
+            for e in std::fs::read_dir(&p)?.flatten() {
+                let path = e.path();
+                let r = if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                r.with_context(|| format!("removing {}", path.display()))?;
+            }
+            println!("{name}");
+        }
+        VolumeCmd::Clone { from, to } => {
+            let src = volume_dir(&from, true)?;
+            let dst = volume_dir(&to, false)?;
+            if dst.exists() {
+                bail!("volume {to} already exists");
+            }
+            std::fs::create_dir_all(&dst)?;
+            // ponytail: `cp -a` is the copy that already preserves owners,
+            // modes, links and sparse files; reimplementing it is a bug farm.
+            let ok = std::process::Command::new("cp")
+                .arg("-a")
+                .arg(src.join("."))
+                .arg(&dst)
+                .status()
+                .context("running cp")?
+                .success();
+            if !ok {
+                let _ = std::fs::remove_dir_all(&dst);
+                bail!("copying {from} to {to} failed");
+            }
+            println!("{to}");
+        }
+        VolumeCmd::Export { name, output } => {
+            let p = volume_dir(&name, true)?;
+            let out: Box<dyn std::io::Write> = match &output {
+                Some(f) => Box::new(
+                    std::fs::File::create(f)
+                        .with_context(|| format!("creating {}", f.display()))?,
+                ),
+                None => Box::new(std::io::stdout().lock()),
+            };
+            let mut tar = tar::Builder::new(out);
+            // A link is archived as a link. Following it would export
+            // whatever it points at on the HOST.
+            tar.follow_symlinks(false);
+            tar.append_dir_all(".", &p)
+                .context("archiving the volume")?;
+            tar.finish()?;
+        }
+        VolumeCmd::Import { name, input } => {
+            let p = volume_dir(&name, false)?;
+            std::fs::create_dir_all(&p)?;
+            let reader: Box<dyn Read> = match &input {
+                Some(f) => Box::new(
+                    std::fs::File::open(f).with_context(|| format!("opening {}", f.display()))?,
+                ),
+                None => Box::new(std::io::stdin().lock()),
+            };
+            // The image extractor, because an archive is hostile input
+            // whoever made it: it resolves every path inside the volume
+            // and refuses entries that would land outside.
+            let safe = rustainer_image::extract::SafeRoot::open(&p)?;
+            let mut report = rustainer_image::extract::Report::default();
+            rustainer_image::extract::apply_layer(
+                &safe,
+                reader,
+                rustainer_image::extract::Limits::default(),
+                false,
+                &mut report,
+            )
+            .context("unpacking the archive")?;
+            println!("{name}");
+        }
         VolumeCmd::Ls => {
             println!("{:<32} {:>10}  PATH", "VOLUME", "ENTRIES");
             let Ok(rd) = std::fs::read_dir(&root) else {
@@ -2799,15 +2934,7 @@ fn cmd_volume(cmd: VolumeCmd) -> Result<ExitCode> {
             }
         }
         VolumeCmd::Rm { name } => {
-            // Resolved through the volumes root rather than joined blindly:
-            // `volume rm ../../etc` must not delete anything.
-            if name.contains('/') || name.contains("..") || name.is_empty() {
-                bail!("{name:?} is not a volume name");
-            }
-            let p = root.join(&name);
-            if !p.is_dir() {
-                bail!("no such volume: {name}");
-            }
+            let p = volume_dir(&name, true)?;
             std::fs::remove_dir_all(&p).with_context(|| format!("removing the volume {name}"))?;
             println!("{name}");
         }

@@ -625,9 +625,10 @@ present in the installed version.
 | Run from an image, with options | yes | yes, the same dialog as Run |
 | Pull | yes | yes |
 | Size | on disk | compressed layers, labelled |
-| Layers and history | yes, per layer | count only |
+| Layers and history | yes, per layer | per-layer sizes and the build history |
 | Packages and CVEs (Scout) | yes | **no** |
-| Registry tab ("My Hub"), push from the UI | yes | **no**; `push` is CLI only |
+| Push from the UI | yes | yes, with the credentials the server was started with |
+| Registry tab ("My Hub") | yes | **no** |
 
 **Volumes**
 
@@ -637,30 +638,37 @@ present in the installed version.
 | Browse stored files | yes | yes |
 | Size | yes | yes, a floor past 20,000 entries |
 | Delete, and remove unused | yes | yes |
-| Create an empty volume | yes | **no**; one appears on first use |
-| Empty without deleting | yes | **no** |
-| Clone | yes | **no** |
-| Export / import (file, image, registry) | yes | **no** |
+| Create an empty volume | yes | yes |
+| Empty without deleting | yes, stopping and restarting its containers | yes, refused while a running container mounts it |
+| Clone | yes | yes |
+| Export / import | file, image, registry, cloud | a tar file: export from the page, import from the CLI |
 
 **A container's detail**
 
 | | Docker Desktop | this page |
 | --- | --- | --- |
-| Logs | live, with search and timestamps | tail, polled; no search |
+| Logs | live, with search and timestamps | tail, polled, with a line filter; no timestamps |
 | Inspect | yes | yes |
 | Run a command | Exec, or Docker Debug | one-shot exec, and a pty terminal |
 | Files: browse | running containers | running, and a stopped one's own writes |
-| Files: edit, upload, download | yes | **no**, read-only |
-| Stats | CPU, memory, network, disk over time | CPU sparkline and memory; no network or disk |
+| Files: download | yes | yes |
+| Files: edit, upload | yes | **no** |
+| Stats | CPU, memory, network, disk over time | CPU over time; memory, network and disk as totals |
 | Bind mounts tab | yes | listed under inspect |
 | Start / stop / restart / delete | yes | yes |
 
-So the honest reading is not parity. The page has the working core of
-all three screens and one thing those pages do not describe - a stopped
-container's files, where Docker documents the Files tab for running
-containers - and it is missing the registry and vulnerability side of Images, every volume
-operation beyond delete, file editing, log search, and network and disk
-statistics. Those are a list of what to build, not a rounding error.
+The first version of this table was a list of what to build, and most
+of it then was: volume create, empty, clone, export and import; file
+download; a log filter; network and disk counters; per-layer sizes,
+build history and push. Volume import reuses the image layer extractor,
+because an archive is hostile input whoever made it - stage 17 imports
+one whose entry is named `../../outside-volume` and asserts nothing
+appears there.
+
+What is still missing, and is not close: **package and CVE data**, which
+needs a vulnerability database this project does not have; a registry
+browser; editing and uploading files; log timestamps; and charts for
+anything but CPU. It is nearer parity than it was, and it is not parity.
 
 ### What the page does that is worth something
 

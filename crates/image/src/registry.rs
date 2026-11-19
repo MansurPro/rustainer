@@ -139,6 +139,19 @@ pub struct ImageConfig {
     pub rootfs: RootFs,
     #[serde(default)]
     pub config: Option<ConfigSection>,
+    /// How the image was built, one entry per instruction. Optional,
+    /// and informational only: nothing here is trusted to be true.
+    #[serde(default)]
+    pub history: Vec<History>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct History {
+    #[serde(default)]
+    pub created_by: Option<String>,
+    /// Set for instructions that changed only metadata (`ENV`, `CMD`).
+    #[serde(default)]
+    pub empty_layer: bool,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]

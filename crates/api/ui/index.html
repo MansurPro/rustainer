@@ -123,13 +123,14 @@
   .s-created .dot { background: var(--warn); }
   .s-unknown .dot { background: var(--bad); }
 
-  button.act {
+  .act {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
     border-radius: 7px; padding: 4px 9px; font: inherit; font-size: 12px; cursor: pointer;
+    white-space: nowrap; text-decoration: none;
   }
-  button.act:hover { border-color: var(--accent); color: var(--accent); }
-  button.act.danger:hover { border-color: var(--bad); color: var(--bad); }
-  button.act:disabled { opacity: 0.45; cursor: default; }
+  .act:hover { border-color: var(--accent); color: var(--accent); }
+  .act.danger:hover { border-color: var(--bad); color: var(--bad); }
+  .act:disabled { opacity: 0.45; cursor: default; }
   .actions { display: flex; gap: 5px; justify-content: flex-end; }
 
   input, select, textarea {
@@ -309,6 +310,7 @@
   <section id="view-volumes" hidden>
     <div class="card">
       <h2>Volumes <span class="spacer"></span>
+        <button class="act" id="new-volume">Create…</button>
         <button class="act danger" id="prune-volumes" hidden></button></h2>
       <div id="volumes"></div>
     </div>
@@ -715,7 +717,11 @@ function buildDetail() {
 
   const body = el("div");
   if (detailTab === "logs") {
-    body.append(el("pre", { className: "log", id: "logtext", textContent: "loading…" }));
+    body.append(
+      el("div", { style: "padding:8px 14px;border-bottom:1px solid var(--line)" },
+        el("input", { placeholder: "search these lines", value: logFilter, style: "width:260px",
+          oninput: (e) => { logFilter = e.target.value; refreshLogs(true); } })),
+      el("pre", { className: "log", id: "logtext", textContent: "loading…" }));
     refreshLogs(true);
   } else if (detailTab === "terminal") {
     body.append(terminalPane(c));
@@ -771,7 +777,10 @@ function inspectTable(c) {
     ["memory now", st.memory_current != null ? bytes(st.memory_current)
        : st.memory_rss != null ? bytes(st.memory_rss) + " (summed rss)" : null],
     ["memory peak", st.memory_peak != null ? bytes(st.memory_peak) : null],
-    ["pids", st.pids_current], ["exit code", c.exit_code], ["signal", c.signal],
+    ["pids", st.pids_current],
+    ["network", st.net_rx != null ? bytes(st.net_rx) + " received, " + bytes(st.net_tx) + " sent" : null],
+    ["disk", st.io_read != null ? bytes(st.io_read) + " read, " + bytes(st.io_write) + " written" : null],
+    ["exit code", c.exit_code], ["signal", c.signal],
     ["oom killed", c.oom_killed ? "yes" : null], ["error", c.error],
   ].filter(([, v]) => v != null && v !== "");
   const tb = el("table");
@@ -991,7 +1000,13 @@ async function refreshLogs(force) {
   const out = $("#logtext");
   if (!out) return;
   const d = await api("/api/containers/" + openRow + "/logs?tail=400");
-  const text = [d.stdout, d.stderr].filter(Boolean).join("\n") || "(no output)";
+  let text = [d.stdout, d.stderr].filter(Boolean).join("\n") || "(no output)";
+  if (logFilter) {
+    // A filter, not a highlight: on a busy log the lines you wanted are
+    // otherwise still a scroll apart.
+    const q = logFilter.toLowerCase();
+    text = text.split("\n").filter((l) => l.toLowerCase().includes(q)).join("\n") || "(no line matches)";
+  }
   if (text === out.textContent) return;
   // Only follow the tail if you were already at it. Scrolling back to read
   // something and being yanked to the bottom two seconds later is the
@@ -1004,6 +1019,7 @@ async function refreshLogs(force) {
 // Rebuild the panel only when the container it shows has gone, or its
 // status changed - not on every tick.
 let detailStatus = null;
+let logFilter = "";
 function buildDetailIfStale() {
   if (!openRow) return;
   const c = lastContainers.find((x) => x.id === openRow);
@@ -1109,6 +1125,45 @@ async function each(button, items, call) {
   await refresh();
 }
 
+// One question, in the page's own dialog rather than a prompt() box.
+function ask(title, label, value, okText, run) {
+  const dlg = $("#dlg");
+  $("#dlg-title").textContent = title;
+  const inp = el("input", { value });
+  const err = el("div", { className: "hint" });
+  $("#dlg-body").replaceChildren(el("div", { className: "field" }, [el("label", {}, label), inp]), err);
+  const go = el("button", { className: "act", textContent: okText });
+  go.onclick = async () => {
+    if (!inp.value.trim()) return;
+    go.disabled = true;
+    const r = await run(inp.value.trim());
+    go.disabled = false;
+    if (r && r.ok === false) err.textContent = (r.stderr || r.error || "failed").split("\n")[0];
+    else { dlg.close(); refresh(); }
+  };
+  inp.onkeydown = (e) => { if (e.key === "Enter") go.click(); };
+  $("#dlg-foot").replaceChildren(
+    el("button", { className: "act", textContent: "Cancel", onclick: () => dlg.close() }), go);
+  dlg.showModal();
+  inp.focus(); inp.select();
+}
+const post = (url, body) => api(url, {
+  method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}),
+});
+
+// A destructive row button that asks once. The rows are redrawn every
+// two seconds, so which one is armed has to live out here.
+let armed = null;
+function sure(key, label, redraw, run) {
+  return el("button", {
+    className: "act danger", textContent: armed === key ? "really " + label + "?" : label,
+    onclick: async (e) => {
+      if (armed !== key) { armed = key; redraw(); return; }
+      armed = null; e.target.disabled = true; await run(); refresh();
+    },
+  });
+}
+
 // "Remove unused", in two clicks instead of a confirm() box: the first
 // says how many, the second does it, and looking away disarms it.
 function pruneButton(button, unused, noun, call) {
@@ -1168,8 +1223,11 @@ function fileBrowser(base, variant = "") {
         ? el("div", { className: "hint", style: "padding:8px 14px" }, "Only the first " + r.entries.length + " entries are shown.") : "");
     } else if (r.kind === "file") {
       pane.replaceChildren(
-        el("div", { className: "hint", style: "padding:8px 14px" },
-          bytes(r.size) + (r.binary ? ", binary — not shown" : r.truncated ? ", showing the first 64K" : "")),
+        el("div", { className: "hint", style: "padding:8px 14px" }, [
+          bytes(r.size) + (r.binary ? ", binary — not shown" : r.truncated ? ", showing the first 64K" : "") + " · ",
+          el("a", { href: base + "?raw=1&path=" + encodeURIComponent(path), download: parts[parts.length - 1],
+                    textContent: "download", style: "color:var(--accent)" }),
+        ]),
         r.binary ? "" : el("pre", { className: "log", textContent: r.text }));
     } else {
       pane.replaceChildren(el("div", { className: "empty" },
@@ -1221,6 +1279,12 @@ function renderImages(list) {
           onclick: () => { $("#new-container").click(); $("#dlg-body input").value = i.name || i.reference; } }),
         el("button", { className: "act", textContent: "inspect",
           onclick: () => { openImage = openImage === i.reference ? null : i.reference; renderImages(list); } }),
+        el("button", { className: "act", textContent: "push",
+          title: "Uses the credentials this server was started with (RUSTAINER_REGISTRY_AUTH).",
+          onclick: () => ask("Push " + (i.name || i.reference), "push to", i.name || "", "Push", async (to) => {
+            const r = await post("/api/images/push", { reference: i.name || i.reference, to });
+            logCommand(["push", i.name || i.reference, "--to", to], r); return r;
+          }) }),
         el("button", {
           className: "act danger", textContent: "remove", disabled: !!inUse,
           title: inUse ? "In use by " + i.used_by.join(", ") + ". Remove those first." : "",
@@ -1234,6 +1298,8 @@ function renderImages(list) {
         ["entrypoint", (i.entrypoint || []).join(" ")], ["cmd", (i.cmd || []).join(" ")],
         ["working dir", i.working_dir], ["user", i.user], ["created", i.created],
         ["used by", (i.used_by || []).join(", ")], ["env", (i.env || []).join("\n")],
+        ["layers", (i.layer_sizes || []).map((n, k) => (k + 1) + ".  " + bytes(n)).join("\n")],
+        ["history", (i.history || []).map((h) => h.replace(/\s+/g, " ")).join("\n")],
       ].filter(([, v]) => v);
       const inner = el("table", {}, el("tbody", {}, facts.map(([k, v]) => el("tr", {}, [
         el("td", { className: "dim nowrap", style: "width:150px" }, k),
@@ -1265,7 +1331,7 @@ function renderVolumes(list) {
   for (const v of list) {
     const inUse = v.used_by.length;
     body.append(el("tr", {}, [
-      el("td", { className: "mono" }, v.name),
+      el("td", { className: "mono nowrap" }, v.name),
       el("td", {}, usedPill(v.used_by)),
       el("td", { className: "mono dim",
                  title: v.size_partial ? "Too many files to count on every refresh; at least this much." : "" },
@@ -1275,6 +1341,18 @@ function renderVolumes(list) {
       el("td", {}, el("div", { className: "actions" }, [
         el("button", { className: "act", textContent: "files",
           onclick: () => { openVolume = openVolume === v.name ? null : v.name; renderVolumes(list); } }),
+        el("a", { className: "act", textContent: "export", download: v.name + ".tar",
+          href: "/api/volumes/" + encodeURIComponent(v.name) + "/export",
+          style: "text-decoration:none", title: "A tar archive of everything in it." }),
+        el("button", { className: "act", textContent: "clone",
+          onclick: () => ask("Clone " + v.name, "new volume name", v.name + "-copy", "Clone", async (to) => {
+            const r = await post("/api/volumes/" + encodeURIComponent(v.name) + "/clone", { to });
+            logCommand(["volume", "clone", v.name, to], r); return r;
+          }) }),
+        sure("empty:" + v.name, "empty", () => renderVolumes(list), async () => {
+          logCommand(["volume", "empty", v.name],
+            await post("/api/volumes/" + encodeURIComponent(v.name) + "/empty"));
+        }),
         el("button", {
           className: "act danger", textContent: "remove", disabled: !!inUse,
           title: inUse ? "Mounted by " + v.used_by.join(", ") + ". Remove those first." : "",
@@ -1291,6 +1369,11 @@ function renderVolumes(list) {
   t.append(body);
   box.replaceChildren(t);
 }
+
+$("#new-volume").onclick = () => ask("Create a volume", "name", "", "Create", async (name) => {
+  const r = await post("/api/volumes", { name });
+  logCommand(["volume", "create", name], r); return r;
+});
 
 $("#pull").onclick = async (e) => {
   const ref = $("#pullref").value.trim();

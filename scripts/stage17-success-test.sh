@@ -278,5 +278,40 @@ if [ -n "$AFTER" ] && [ "$AFTER" != "$BEFORE" ]; then ok "as a new process"; els
 check "starting nothing is an error" "$?" "1"
 
 echo
+echo "12. Volumes can be made, copied, emptied, taken out and put back"
+jpost() { curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d "$2" "$URL$1"; }
+VOLS="$RUSTAINER_IMAGE_ROOT/volumes"
+check "create through the API" "$(jpost /api/volumes '{"name":"made"}')" "200"
+check "and it exists" "$([ -d "$VOLS/made" ] && echo yes)" "yes"
+check "a name that is a path is refused" "$(jpost /api/volumes '{"name":"../escape"}')" "400"
+check "creating it twice is refused" "$(jpost /api/volumes '{"name":"made"}')" "400"
+mkdir -p "$VOLS/made/dir"; echo payload > "$VOLS/made/dir/f"; ln -s f "$VOLS/made/dir/link"
+check "clone through the API" "$(jpost /api/volumes/made/clone '{"to":"twin"}')" "200"
+check "the copy has the file" "$(cat "$VOLS/twin/dir/f" 2>/dev/null)" "payload"
+check "and the link, as a link" "$(readlink "$VOLS/twin/dir/link" 2>/dev/null)" "f"
+curl -sS -o "$SCRATCH/made.tar" "$URL/api/volumes/made/export"
+contains "export is a tar of the contents" "$(tar -tf "$SCRATCH/made.tar" 2>&1)" "dir/f"
+check "a file downloads whole" "$(curl -sS "$URL/api/volumes/made/files?raw=1&path=dir/f")" "payload"
+check "a directory does not" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' "$URL/api/volumes/made/files?raw=1&path=dir")" "400"
+# Emptying under a running process is refused: files vanishing beneath a
+# database do not fail cleanly.
+EID=$(timeout 60 "$B" run -d --network none --layer "$BASE" -v made:/m /bin/sleep 60 2>/dev/null | tail -1)
+check "emptying a volume in use is refused" "$(jpost /api/volumes/made/empty '')" "400"
+check "and nothing was removed" "$(cat "$VOLS/made/dir/f" 2>/dev/null)" "payload"
+contains "the container reports its network and disk counters" \
+    "$(curl -sS "$URL/api/containers/$EID/stats")" '"net_rx"'
+"$B" rm --force "$EID" >/dev/null 2>&1
+check "emptying it afterwards works" "$(jpost /api/volumes/made/empty '')" "200"
+check "the volume is still there" "$([ -d "$VOLS/made" ] && ls -A "$VOLS/made" | wc -l | tr -d ' ')" "0"
+"$B" volume import made -i "$SCRATCH/made.tar" >/dev/null 2>&1
+check "import puts the contents back" "$(cat "$VOLS/made/dir/f" 2>/dev/null)" "payload"
+# An archive is hostile input whoever made it.
+mkdir -p "$SCRATCH/evil"; echo pwned > "$SCRATCH/evil/x"
+tar -C "$SCRATCH/evil" -cf "$SCRATCH/evil.tar" --transform 's|^x$|../../outside-volume|' x 2>/dev/null
+"$B" volume import made -i "$SCRATCH/evil.tar" >/dev/null 2>&1
+check "an archive cannot write outside the volume" "$([ -e "$RUSTAINER_IMAGE_ROOT/outside-volume" ] && echo escaped)" ""
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
