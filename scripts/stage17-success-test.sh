@@ -315,19 +315,24 @@ check "an archive cannot write outside the volume" "$([ -e "$RUSTAINER_IMAGE_ROO
 echo
 echo "13. A file can be saved into a container or a volume, and only there"
 PID_=$(timeout 60 "$B" run -d --network none --layer "$BASE" -v putvol:/pv /bin/sh -c \
-    "mkdir /site && echo old > /site/conf && chown 123:456 /site/conf && chmod 640 /site/conf && \
+    "mkdir /site && echo old > /site/conf && chmod 640 /site/conf && \
+     (chown 123:456 /site/conf 2>/dev/null || true) && \
      ln -s $SCRATCH/hostsecret /site/trap && exec sleep 60" 2>/dev/null | tail -1)
 for _ in $(seq 50); do
     [ "$("$B" exec "$PID_" /bin/sh -c 'test -L /site/trap && echo y' 2>/dev/null | tail -1)" = y ] && break
     sleep 0.1
 done
 put() { curl -sS -o /dev/null -w '%{http_code}' -X PUT --data-binary "$2" "$URL$1"; }
+# Whatever it is here: 123:456 as root, and the one mapped id where a
+# rootless container has only one and the chown above was refused.
+OWNED=$("$B" exec "$PID_" /bin/stat -c '%a %u:%g' /site/conf 2>/dev/null | tail -1)
+contains "the file starts 0640" "$OWNED" "640 "
 check "saving over a file is accepted" "$(put "/api/containers/$PID_/files?path=/site/conf" 'new')" "200"
 check "the container sees the new contents" "$("$B" exec "$PID_" /bin/cat /site/conf 2>/dev/null | tail -1)" "new"
 # An edit is a change of contents. Turning nginx's 0640 config into a
 # root-owned 0644 one would be a second change nobody asked for.
 check "with the mode and owner it had" \
-    "$("$B" exec "$PID_" /bin/stat -c '%a %u:%g' /site/conf 2>/dev/null | tail -1)" "640 123:456"
+    "$("$B" exec "$PID_" /bin/stat -c '%a %u:%g' /site/conf 2>/dev/null | tail -1)" "$OWNED"
 check "a new file in a new directory is made" "$(put "/api/containers/$PID_/files?path=/site/a/b/c.txt" 'deep')" "200"
 check "and is there" "$("$B" exec "$PID_" /bin/cat /site/a/b/c.txt 2>/dev/null | tail -1)" "deep"
 put "/api/containers/$PID_/files?path=/site/trap" 'overwritten' >/dev/null
