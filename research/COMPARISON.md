@@ -641,7 +641,7 @@ present in the installed version.
 | Create an empty volume | yes | yes |
 | Empty without deleting | yes, stopping and restarting its containers | yes, refused while a running container mounts it |
 | Clone | yes | yes |
-| Export / import | file, image, registry, cloud | a tar file: export from the page, import from the CLI |
+| Export / import | file, image, registry, cloud | a tar file, both from the page; 64M through the page, any size from the CLI |
 
 **A container's detail**
 
@@ -652,7 +652,7 @@ present in the installed version.
 | Run a command | Exec, or Docker Debug | one-shot exec, and a pty terminal |
 | Files: browse | running containers | running, and a stopped one's own writes |
 | Files: download | yes | yes |
-| Files: edit, upload | yes | yes, up to 1M per file; mode and owner kept on edit |
+| Files: edit, upload | yes | yes, up to 64M per upload; mode and owner kept on edit |
 | Stats | CPU, memory, network, disk over time | the same four over the last minute; disk only with the io controller |
 | Bind mounts tab | yes | listed under inspect |
 | Start / stop / restart / delete | yes | yes |
@@ -667,8 +667,7 @@ appears there.
 
 What is still missing, and is not close: **package and CVE data**, which
 needs a vulnerability database this project does not have; an account's
-own repositories; importing a volume from the page; and files over 1M
-in the editor. Editing a file, the memory, network and disk charts, log
+own repositories. Editing a file, the memory, network and disk charts, log
 timestamps and a registry tag list followed in later passes. The
 timestamps are kept in an index beside each log rather than in it, so
 `logs` still prints byte for byte what the container wrote. It is nearer parity than it was, and

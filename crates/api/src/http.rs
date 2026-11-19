@@ -27,6 +27,12 @@ pub const MAX_HEADERS: usize = 16 * 1024;
 pub const MAX_LINE: usize = 8 * 1024;
 /// A request body. Ours carry a container spec, never a file.
 pub const MAX_BODY: usize = 1024 * 1024;
+/// The limit for the two requests whose body IS a file: saving one, and
+/// importing a volume. Everything else is a small JSON document and
+/// keeps the small limit.
+// ponytail: buffered in memory, so this is also the most one upload can
+// cost; stream to the CLI's stdin if anyone needs archives beyond it.
+pub const MAX_UPLOAD: usize = 64 * 1024 * 1024;
 /// How long a connection may stay silent before we give up on it.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -138,7 +144,9 @@ pub fn read_request(stream: &TcpStream) -> Result<Option<Request>, Error> {
             content_length = v.trim().parse().unwrap_or(0);
         }
     }
-    if content_length > MAX_BODY {
+    let path_only = target.split('?').next().unwrap_or("");
+    let is_upload = method == "PUT" || (method == "POST" && path_only.ends_with("/import"));
+    if content_length > if is_upload { MAX_UPLOAD } else { MAX_BODY } {
         return Err(Error::BodyTooLarge);
     }
     let mut body = vec![0u8; content_length];

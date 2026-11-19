@@ -1319,7 +1319,7 @@ function fileBrowser(base, variant = "") {
     const pick = el("input", { type: "file", style: "font-size:12px;width:auto;border:0;padding:0", onchange: async () => {
       const f = pick.files[0];
       if (!f) return;
-      if (f.size > 1024 * 1024) { msg.textContent = "Over the 1M upload limit; use a volume import for more."; return; }
+      if (f.size > 64 * 1024 * 1024) { msg.textContent = "Over the 64M upload limit."; return; }
       if (await save(dir.replace(/\/$/, "") + "/" + f.name, await f.arrayBuffer(), msg)) go(dir);
     } });
     return el("div", { style: "padding:8px 14px;display:flex;gap:8px;align-items:center" },
@@ -1435,6 +1435,19 @@ function renderVolumes(list) {
         el("a", { className: "act", textContent: "export", download: v.name + ".tar",
           href: "/api/volumes/" + encodeURIComponent(v.name) + "/export",
           style: "text-decoration:none", title: "A tar archive of everything in it." }),
+        el("label", { className: "act", style: "margin:0;cursor:pointer",
+                      title: "Unpack a tar archive into this volume. Adds and overwrites; removes nothing." }, [
+          "import",
+          el("input", { type: "file", accept: ".tar", hidden: true, onchange: async (e) => {
+            const f = e.target.files[0];
+            if (!f) return;
+            const r = f.size > 64 * 1024 * 1024
+              ? { ok: false, error: "over the 64M upload limit; use `rustainer volume import`" }
+              : await api("/api/volumes/" + encodeURIComponent(v.name) + "/import", { method: "POST", body: f });
+            logCommand(["volume", "import", v.name, "-i", f.name], r);
+            refresh();
+          } }),
+        ]),
         el("button", { className: "act", textContent: "clone",
           onclick: () => ask("Clone " + v.name, "new volume name", v.name + "-copy", "Clone", async (to) => {
             const r = await post("/api/volumes/" + encodeURIComponent(v.name) + "/clone", { to });

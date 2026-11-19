@@ -342,6 +342,15 @@ check "and .. does not leave a volume" "$([ -e "$RUSTAINER_IMAGE_ROOT/escaped" ]
 check "saving into a volume works" "$(put "/api/volumes/putvol/files?path=note" 'kept')" "200"
 check "and the container sees it" "$("$B" exec "$PID_" /bin/cat /pv/note 2>/dev/null | tail -1)" "kept"
 check "saving with no path is refused" "$(put "/api/volumes/putvol/files" 'x')" "400"
+# A file is bigger than a JSON document, so these two requests - and only
+# these two - get a bigger limit. Section 8 still refuses 2M of JSON.
+head -c 3000000 /dev/urandom > "$SCRATCH/big.bin"
+check "a 3M file can be saved" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' -X PUT --data-binary "@$SCRATCH/big.bin" "$URL/api/volumes/putvol/files?path=big.bin")" "200"
+check "and arrives intact" "$(cmp -s "$SCRATCH/big.bin" "$RUSTAINER_IMAGE_ROOT/volumes/putvol/big.bin" && echo same)" "same"
+check "a volume is imported through the API" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' -X POST --data-binary "@$SCRATCH/made.tar" "$URL/api/volumes/putvol/import")" "200"
+check "with the archive's contents" "$(cat "$RUSTAINER_IMAGE_ROOT/volumes/putvol/dir/f" 2>/dev/null)" "payload"
 "$B" rm --force "$PID_" >/dev/null 2>&1
 
 echo
