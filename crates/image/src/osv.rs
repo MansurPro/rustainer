@@ -7,12 +7,14 @@
 //! image name, no file contents - and nothing leaves at all unless
 //! somebody runs a scan.
 //!
-//! What this is not: a scanner of application dependencies. It reads the
-//! distribution's package database (`apk`, `dpkg`), so a vulnerable
-//! `node_modules` or a statically linked binary is invisible to it, and
-//! an image with neither database - `scratch`, distroless static, or
-//! anything RPM-based, whose database is SQLite - reports no packages
-//! rather than no vulnerabilities.
+//! What it reads: the distribution's package database (`apk`, `dpkg`),
+//! and the two kinds of application dependency that leave an
+//! unambiguous record on disk - Python distributions (`*.dist-info`)
+//! and Node packages (`node_modules/*/package.json`). What it cannot
+//! see: a statically linked binary, a Go or Rust program's compiled-in
+//! modules, a vendored copy with no metadata, or anything RPM-based,
+//! whose database is SQLite. An image where it finds nothing reports no
+//! packages rather than no vulnerabilities.
 
 use std::io::Read;
 
@@ -105,6 +107,115 @@ pub fn ecosystem(os_release: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `*.dist-info/METADATA`: RFC 822 headers, then a blank line.
+pub fn parse_python_metadata(text: &str) -> Option<Package> {
+    let head = text.split("\n\n").next()?;
+    let field = |k: &str| {
+        head.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .map(|v| v.trim().to_owned())
+    };
+    Some(Package {
+        // PyPI names compare case-insensitively with `-`, `_` and `.`
+        // all equal; OSV files them in the normalised form.
+        name: field("Name:")?.to_lowercase().replace(['_', '.'], "-"),
+        version: field("Version:")?,
+    })
+}
+
+/// A `package.json` that describes an installed package: it has both a
+/// name and a version. An application's own often has neither.
+pub fn parse_package_json(text: &str) -> Option<Package> {
+    let doc: Value = serde_json::from_str(text).ok()?;
+    Some(Package {
+        name: doc["name"].as_str()?.to_owned(),
+        version: doc["version"].as_str()?.to_owned(),
+    })
+}
+
+/// How many directory entries the search for application dependencies
+/// may visit across all layers. A large image has a few hundred thousand
+/// files; past this the scan stops looking rather than run for minutes,
+/// and what it found so far is still reported.
+const WALK_BUDGET: usize = 400_000;
+
+/// Application dependencies in an image's layers: `(ecosystem, package,
+/// layer)`, the layer being the LOWEST one that has it, counted from 1.
+///
+/// Links are not followed, and whiteouts are not interpreted - a package
+/// an upper layer deleted is still reported, attributed to the layer
+/// that shipped it. That errs toward saying too much, which is the right
+/// way for this to be wrong.
+pub fn app_packages(layers: &[std::path::PathBuf]) -> Vec<(&'static str, Package, usize)> {
+    fn read(p: &std::path::Path) -> String {
+        // Metadata files are small; anything large is not one.
+        match std::fs::metadata(p) {
+            Ok(m) if m.is_file() && m.len() < 1024 * 1024 => {
+                std::fs::read_to_string(p).unwrap_or_default()
+            }
+            _ => String::new(),
+        }
+    }
+    fn walk(
+        dir: &std::path::Path,
+        layer: usize,
+        budget: &mut usize,
+        out: &mut Vec<(&'static str, Package, usize)>,
+    ) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let in_node_modules = dir.file_name().is_some_and(|n| n == "node_modules");
+        for e in rd.flatten() {
+            if *budget == 0 {
+                return;
+            }
+            *budget -= 1;
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let path = e.path();
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".dist-info") {
+                if let Some(p) = parse_python_metadata(&read(&path.join("METADATA"))) {
+                    out.push(("PyPI", p, layer));
+                }
+                continue;
+            }
+            if in_node_modules
+                && !name.starts_with('@')
+                && let Some(p) = parse_package_json(&read(&path.join("package.json")))
+            {
+                out.push(("npm", p, layer));
+            }
+            // `@scope/name` is one level further down, and a package's
+            // own node_modules is where its dependencies are.
+            if dir
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('@'))
+                && dir
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .is_some_and(|n| n == "node_modules")
+                && let Some(p) = parse_package_json(&read(&path.join("package.json")))
+            {
+                out.push(("npm", p, layer));
+            }
+            walk(&path, layer, budget, out);
+        }
+    }
+    let mut out = Vec::new();
+    let mut budget = WALK_BUDGET;
+    for (i, layer) in layers.iter().enumerate() {
+        walk(layer, i + 1, &mut budget, &mut out);
+    }
+    // Lowest layer wins, one row per (ecosystem, name, version).
+    out.sort_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
+    out.dedup_by(|b, a| a.0 == b.0 && a.1 == b.1);
+    out
 }
 
 /// A CVSS 3.x base score from its vector, or `None` for any other
@@ -407,6 +518,58 @@ mod tests {
         assert_eq!(ecosystem("ID=fedora\nVERSION_ID=41\n"), None);
         // Debian testing has no VERSION_ID, and so no release to ask about.
         assert_eq!(ecosystem("ID=debian\n"), None);
+    }
+
+    #[test]
+    fn application_packages_are_found_and_placed_in_their_lowest_layer() {
+        let base = std::env::temp_dir().join(format!("rustainer-appdeps-{}", std::process::id()));
+        let (l1, l2) = (base.join("l1"), base.join("l2"));
+        let py = "usr/lib/python3/site-packages/Flask_Login-0.6.dist-info";
+        let node = "app/node_modules";
+        for (dir, text) in [
+            (
+                l1.join(py),
+                "Name: Flask_Login\nVersion: 0.6.0\n\nA description\nVersion: 9\n",
+            ),
+            // The same distribution again, higher up: one row, layer 1.
+            (l2.join(py), "Name: Flask_Login\nVersion: 0.6.0\n"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("METADATA"), text).unwrap();
+        }
+        for (dir, text) in [
+            (
+                l2.join(node).join("left-pad"),
+                r#"{"name":"left-pad","version":"1.3.0"}"#,
+            ),
+            (
+                l2.join(node).join("@scope/tool"),
+                r#"{"name":"@scope/tool","version":"2.0.0"}"#,
+            ),
+            (
+                l2.join(node).join("left-pad/node_modules/inner"),
+                r#"{"name":"inner","version":"0.1.0"}"#,
+            ),
+            // The application's own manifest is not an installed package.
+            (l2.join("app"), r#"{"name":"my-app","version":"1.0.0"}"#),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("package.json"), text).unwrap();
+        }
+        let got: Vec<(String, String, usize)> = app_packages(&[l1, l2])
+            .into_iter()
+            .map(|(eco, p, layer)| (format!("{eco}:{}", p.name), p.version, layer))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("PyPI:flask-login".to_owned(), "0.6.0".to_owned(), 1),
+                ("npm:@scope/tool".to_owned(), "2.0.0".to_owned(), 2),
+                ("npm:inner".to_owned(), "0.1.0".to_owned(), 2),
+                ("npm:left-pad".to_owned(), "1.3.0".to_owned(), 2),
+            ]
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
