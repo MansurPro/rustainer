@@ -241,6 +241,11 @@ struct RunArgs {
     #[arg(long)]
     pull: bool,
 
+    /// Run another platform's build of the image, e.g. `linux/amd64` on
+    /// an arm64 machine. Needs an emulator registered with the kernel.
+    #[arg(long)]
+    platform: Option<String>,
+
     /// Stack this directory as a layer, lowest first. Repeatable, and an
     /// alternative to naming an image.
     #[arg(long, value_name = "DIR")]
@@ -393,6 +398,9 @@ struct PullArgs {
     /// Fetch and re-extract even if it is already in the store.
     #[arg(long)]
     force: bool,
+    /// Another platform's build, e.g. `linux/amd64`.
+    #[arg(long)]
+    platform: Option<String>,
 }
 
 #[derive(Args)]
@@ -1371,7 +1379,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         }
         (None, true) => {
             let reference = args.command[0].to_string_lossy().into_owned();
-            let store = Store::new(Store::default_root());
+            let store = Store::new(Store::default_root()).platform(args.platform.as_deref());
             // The store first, the registry only if it has to be. `pull`
             // begins by fetching the manifest, so going through it for an
             // image already on disk cost four TLS round-trips before
@@ -1381,7 +1389,9 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             // `--pull=missing`, which is Docker's default; `--pull` still
             // means "go and check".
             let image = match store.local(&reference) {
-                Some(i) if !args.pull => i,
+                // A named platform always asks: the tag on disk may be
+                // this machine's build, and the config does not say.
+                Some(i) if !args.pull && args.platform.is_none() => i,
                 _ => store
                     .pull(&reference, args.pull)
                     .with_context(|| format!("pulling {reference}"))?,
@@ -2138,7 +2148,7 @@ fn dump(path: &Path, out: &mut impl std::io::Write) -> Result<()> {
 }
 
 fn cmd_pull(args: PullArgs) -> Result<ExitCode> {
-    let store = Store::new(Store::default_root());
+    let store = Store::new(Store::default_root()).platform(args.platform.as_deref());
     let image = store
         .pull(&args.image, args.force)
         .with_context(|| format!("pulling {}", args.image))?;

@@ -1009,11 +1009,20 @@ which meant teaching the filter compiler to carry two error codes.
 Private repositories work with a personal access token in
 `RUSTAINER_REGISTRY_AUTH`: checked against a real account, the private
 repository was listed, its 102 tags were listed, and its manifest was
-served signed in and refused (401) anonymously. There is no sign-in
+served signed in and refused (401) anonymously. The image itself - 2.6 GB
+extracted, Debian 12 - then pulled in 35 s and ran. There is no sign-in
 *screen* - the token comes from the environment the server was started
 in, never from the browser - and nothing else of an account (teams,
 subscriptions, Scout). Search, bulk selection, totals, the added/modified marks and
 chart axes were added after seeing the application have them.
+
+`pull` and `run` take Docker's `--platform`. On an arm64 machine
+`run --platform linux/amd64 alpine uname -m` prints `x86_64`, through the
+same kernel-registered emulator Docker uses (Rosetta or QEMU via
+binfmt_misc - the engine supplies none of its own). A platform the image
+has no build for is refused, including when the image is a single
+manifest with no index to choose from. As with Docker, the tag then
+points at whichever platform was pulled last.
 
 ### What the page does that is worth something
 

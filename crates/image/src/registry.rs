@@ -57,7 +57,7 @@ pub enum Error {
          Pull a schema 2 or OCI image instead."
     )]
     Schema1 { media_type: String },
-    #[error("no manifest in the index matches {os}/{arch}")]
+    #[error("the image has no build for {os}/{arch}")]
     NoPlatform { os: String, arch: String },
     #[error("parsing {what}: {source}")]
     Parse {
