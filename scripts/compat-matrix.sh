@@ -89,8 +89,14 @@ mirror() { case "$1" in */*) echo "mirror.gcr.io/$1" ;; *) echo "mirror.gcr.io/l
 median() { tr ' ' '\n' | sort -n | awk '{a[NR]=$1} END {print (NR%2) ? a[(NR+1)/2] : int((a[NR/2]+a[NR/2+1])/2)}'; }
 
 PROBE='id -u; id -g; pwd; printf "%s" "$PATH"'
+# `getfattr` is nowhere; the raw xattr is read where busybox or coreutils
+# can, and is simply absent from both sides where they cannot.
+FILES='find / -xdev \( -path /proc -o -path /sys -o -path /dev \) -prune -o -exec stat -c "%u:%g %a %Y %n" {} + 2>/dev/null | sort -k4; find / -xdev -type f -perm /111 2>/dev/null | while read -r f; do c=$(getcap "$f" 2>/dev/null); [ -n "$c" ] && echo "cap $c"; done; true'
+# What each engine writes for the container itself rather than taking
+# from the image.
+RUNTIME=' (/|/etc|/etc/hosts|/etc/resolv.conf|/etc/hostname|/etc/mtab|/\.dockerenv|/run|/run/secrets|/tmp)$'
 
-TOTAL=0; SKIPPED=0; CFG_OK=0; CFG_N=0; EXIT_OK=0; EXIT_N=0
+TOTAL=0; SKIPPED=0; CFG_OK=0; CFG_N=0; EXIT_OK=0; EXIT_N=0; FILE_OK=0; FILE_N=0
 FAILED=""
 printf '%-22s %-10s %-10s %10s %10s %7s\n' IMAGE "probe 1" "probe 2" docker rustainer ratio
 printf '%s\n' "----------------------------------------------------------------------------"
@@ -134,6 +140,22 @@ for img in $IMAGES; do
     if [ "$D2" = "$R2" ]; then P2=same; EXIT_OK=$((EXIT_OK + 1))
     else P2="$D2/$R2"; FAILED="$FAILED $img(exit)"; fi
 
+    # --- probe 3: every file, not just the process --------------------
+    # Owner, group, mode, time and file capabilities of every entry.
+    # Added after the first two probes scored 28/28 over an extractor
+    # that made everything root's and dated it today: neither probe
+    # looks at a file. Skipped where the image has no find or stat.
+    if [ "$P1" != no-shell ] && D3=$(timeout 120 docker run --rm --network none "$ref" /bin/sh -c "$FILES" 2>/dev/null) && [ -n "$D3" ]; then
+        R3=$(timeout 120 "$B" run --network none "$ref" /bin/sh -c "$FILES" 2>/dev/null)
+        FILE_N=$((FILE_N + 1))
+        NDIFF=$(diff <(echo "$D3" | grep -Ev "$RUNTIME") <(echo "$R3" | grep -Ev "$RUNTIME") | grep -c '^[<>]')
+        if [ "$NDIFF" = 0 ]; then P3="$(echo "$D3" | wc -l | tr -d ' ') same"; FILE_OK=$((FILE_OK + 1))
+        else
+            P3="$NDIFF DIFFER"; FAILED="$FAILED $img(files)"
+            diff <(echo "$D3" | grep -Ev "$RUNTIME") <(echo "$R3" | grep -Ev "$RUNTIME") | grep '^[<>]' | head -4 | sed 's/^/    /'
+        fi
+    else P3="-"; fi
+
     # --- and how long each takes to run one, on this kernel -------------
     dt=""; rt=""
     for _ in 1 2 3; do
@@ -146,8 +168,8 @@ for img in $IMAGES; do
     if [ "${RM:-0}" -gt 0 ] && [ "${DM:-0}" -gt 0 ]; then
         RATIO=$(awk -v d="$DM" -v r="$RM" 'BEGIN {printf "%.1fx", d / r}')
     else RATIO="-"; fi
-    printf '%-22s %-10s %-10s %9sms %9sms %7s\n' \
-        "$img" "$P1" "$P2" "$((DM / 1000))" "$((RM / 1000))" "$RATIO"
+    printf '%-22s %-10s %-10s %9sms %9sms %7s  %s\n' \
+        "$img" "$P1" "$P2" "$((DM / 1000))" "$((RM / 1000))" "$RATIO" "$P3"
 
     docker rmi -f "$ref" >/dev/null 2>&1
     "$B" rmi "$ref" >/dev/null 2>&1
@@ -158,8 +180,9 @@ echo "images offered:           $TOTAL"
 echo "excluded (docker failed): $SKIPPED"
 echo "config identical:         $CFG_OK/$CFG_N  (uid, gid, workdir, PATH)"
 echo "exit status identical:    $EXIT_OK/$EXIT_N  (the image's own entrypoint and command)"
+echo "files identical:          $FILE_OK/$FILE_N  (owner, group, mode, mtime of every entry; capabilities where the image can read them)"
 [ -n "$FAILED" ] && echo "not identical:           $FAILED"
 echo
 echo "Compatibility is parity. The number to read is how close both rates"
 echo "are to their denominators, not how large they are."
-[ "$CFG_OK" = "$CFG_N" ] && [ "$EXIT_OK" = "$EXIT_N" ]
+[ "$CFG_OK" = "$CFG_N" ] && [ "$EXIT_OK" = "$EXIT_N" ] && [ "$FILE_OK" = "$FILE_N" ]
