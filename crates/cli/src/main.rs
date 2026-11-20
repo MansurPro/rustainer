@@ -278,6 +278,11 @@ struct RunArgs {
     #[arg(short = 'v', long = "volume")]
     volumes: Vec<String>,
 
+    /// Give the container a host device: `--device /dev/fuse` or
+    /// `--device /dev/sdb:/dev/xvdc`. Repeatable.
+    #[arg(long = "device")]
+    devices: Vec<String>,
+
     /// What to do when the container exits: `no` (the default), `always`,
     /// `unless-stopped`, or `on-failure[:attempts]`.
     #[arg(long, default_value = "no")]
@@ -1589,6 +1594,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .volumes
         .iter()
         .map(|v| parse_volume(v))
+        .chain(args.devices.iter().map(|d| parse_device(d)))
         .collect::<Result<Vec<_>>>()?;
 
     let (restart_policy, restart_max) = supervise::RestartPolicy::parse(&args.restart)
@@ -2475,7 +2481,9 @@ fn parse_volume(spec: &str) -> Result<rustainer_core::mount::VolumeMount> {
     // Stat'd here because the child cannot: a bind over a file needs a
     // file as its mount point, and mkdir'ing one produces EISDIR from the
     // mount with nothing to say which `-v` caused it.
-    let is_file = source.is_file();
+    // Anything that is not a directory: a socket (`docker.sock`) or a
+    // device node needs a file as its mount point just as a file does.
+    let is_file = !source.is_dir();
 
     Ok(rustainer_core::mount::VolumeMount {
         source,
@@ -2483,6 +2491,25 @@ fn parse_volume(spec: &str) -> Result<rustainer_core::mount::VolumeMount> {
         read_only,
         is_file,
     })
+}
+
+/// `--device src[:dst[:rwm]]` is a bind of the host's node.
+///
+/// ponytail: there is no device cgroup filter here, so the node is as
+/// usable as its mode allows and the `rwm` field is accepted and ignored;
+/// add a BPF_CGROUP_DEVICE program if per-device permissions matter.
+fn parse_device(spec: &str) -> Result<rustainer_core::mount::VolumeMount> {
+    use std::os::unix::fs::FileTypeExt;
+    let mut parts = spec.split(':');
+    let src = parts.next().unwrap_or_default();
+    let dst = parts.next().filter(|d| !d.is_empty()).unwrap_or(src);
+    let kind = std::fs::metadata(src)
+        .with_context(|| format!("--device {spec:?}: {src}"))?
+        .file_type();
+    if !kind.is_char_device() && !kind.is_block_device() {
+        bail!("--device {spec:?}: {src} is not a device; use -v for files and directories");
+    }
+    parse_volume(&format!("{src}:{dst}"))
 }
 
 /// `~` and `~/...` only. Not a shell: `~user` is deliberately not resolved,

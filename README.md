@@ -937,6 +937,7 @@ Another architecture's build, where the kernel has an emulator
 registered (Docker Desktop's VM does):
 
     rustainer run --platform linux/amd64 alpine uname -m     # x86_64
+rustainer run --device /dev/fuse alpine ls -l /dev/fuse
 
 **The test is a round trip**: build, push, pull into a *clean* store, run.
 Anything less proves the request succeeded, not that the right bytes

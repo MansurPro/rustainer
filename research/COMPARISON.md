@@ -1052,8 +1052,9 @@ one engine wider than any gap between them, with the server answering
 `/health` 0.40-0.62 s after `run` here against 0.61-0.71 s under Docker.
 A model is a CPU-bound process and a container engine is not in its way.
 
-A GPU inside a container was not measured anywhere. There is no
-`--gpus` or `--device` flag yet, and the one Linux machine available
+A GPU inside a container was not measured anywhere. `run --device /dev/dri/renderD128`
+hands a container the host's node (a bind of it; there is no `--gpus`
+and no per-device permission filter), but the one Linux machine available
 with a graphics card has a 2014 FirePro W5100 bound to the `radeon`
 kernel driver, which has no Vulkan; moving it to `amdgpu` needs root
 and a reboot of a shared machine.

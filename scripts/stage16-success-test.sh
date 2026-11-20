@@ -194,6 +194,17 @@ check "a missing host directory is created" "$(cat "$NEW/f" 2>/dev/null)" "made"
 echo hostfile > "$SCRATCH/single.txt"
 check "a host FILE binds as a file" \
     "$(R -v "$SCRATCH/single.txt:/etc/single.txt" /bin/cat /etc/single.txt)" "hostfile"
+# A socket and a device node need a file as their mount point too;
+# is_file() is false for both, which once made `-v docker.sock` fail.
+python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$SCRATCH/s.sock"
+check "a host SOCKET binds as a socket" \
+    "$(R -v "$SCRATCH/s.sock:/run/s.sock" /bin/sh -c 'test -S /run/s.sock && echo socket' 2>&1)" "socket"
+check "--device gives the container the host's node, under the name asked for" \
+    "$(R --device /dev/zero:/dev/myzero /bin/sh -c 'test -c /dev/myzero && head -c 3 /dev/myzero | wc -c' 2>&1)" "3"
+case "$(R --device "$SCRATCH/single.txt" /bin/true 2>&1)" in
+*"is not a device"*) ok "--device refuses something that is not a device" ;;
+*) bad "--device refuses something that is not a device" ;;
+esac
 
 echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
