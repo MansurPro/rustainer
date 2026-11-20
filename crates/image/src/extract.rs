@@ -1298,7 +1298,10 @@ mod tests {
         );
         // The directory's time survives a file being created inside it.
         assert_eq!((dm.mtime(), fm.mtime()), (1_000_000, 2_000_000));
-        if rustix::process::geteuid().is_root() {
+        // Decided by what happened, not by who we are: uid 0 inside a
+        // user namespace is "root" and still cannot give a file to an
+        // id that is not mapped there.
+        if report.ownership_skipped == 0 {
             assert_eq!((dm.uid(), dm.gid(), fm.uid(), fm.gid()), (70, 70, 70, 42));
             // And the setgid bit survives the change of owner.
             assert_eq!(fm.mode() & 0o7777, 0o2755);
