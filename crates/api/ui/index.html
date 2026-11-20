@@ -1353,7 +1353,8 @@ function pruneButton(button, unused, noun, call, word = "unused") {
   button.hidden = !unused.length;
   if (button.dataset.armed === "1") return;   // do not relabel under the cursor
   button.disabled = false;
-  button.textContent = "remove " + unused.length + " " + word;
+  const space = unused.reduce((n, x) => n + (x.size || 0), 0);
+  button.textContent = "remove " + unused.length + " " + word + (space ? " · " + bytes(space) : "");
   button.onclick = () => {
     button.dataset.armed = "1";
     button.textContent = "really remove " + unused.length + " " + noun + "?";
@@ -1390,17 +1391,17 @@ function fileBrowser(base, variant = "") {
         const child = "/" + [...parts, e.name].join("/");
         // A link is followed by the server, inside the tree, so it is
         // as clickable as what it points at.
-        const name = e.kind === "other" ? e.name : el("button", {
+        const name = e.note === "deleted" ? el("s", { className: "dim" }, e.name) : e.kind === "other" ? e.name : el("button", {
           className: "act", style: "border-color:transparent;padding-left:0",
           textContent: e.name + (e.kind === "dir" ? "/" : ""), onclick: () => go(child),
         });
         tb.append(el("tr", {}, [
           el("td", { className: "mono" }, [name, e.target ? el("span", { className: "dim" }, " → " + e.target) : "",
             e.note ? el("span", { className: "pill", title: "Against the image this container was started from.",
-              style: "margin-left:8px;font-size:10px;color:" + (e.note === "added" ? "var(--ok)" : "#e0af68") }, e.note) : ""]),
-          el("td", { className: "mono dim" }, e.kind === "file" ? bytes(e.size) : e.kind),
-          el("td", { className: "mono dim hide-s" }, e.mode + "  " + e.uid + ":" + e.gid),
-          el("td", { className: "mono dim hide-s" }, ago(e.mtime)),
+              style: "margin-left:8px;font-size:10px;color:" + (e.note === "added" ? "var(--ok)" : e.note === "deleted" ? "var(--bad)" : "#e0af68") }, e.note) : ""]),
+          el("td", { className: "mono dim" }, e.note === "deleted" ? "" : e.kind === "file" ? bytes(e.size) : e.kind),
+          el("td", { className: "mono dim hide-s" }, e.note === "deleted" ? "" : e.mode + "  " + e.uid + ":" + e.gid),
+          el("td", { className: "mono dim hide-s" }, e.note === "deleted" ? "" : ago(e.mtime)),
         ]));
       }
       const t = el("table", {}, [el("thead", {}, el("tr", {}, [
