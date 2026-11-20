@@ -821,7 +821,7 @@ The tables below are corrected against that.
 | Filter by state, column picker | yes | yes |
 | Browse stored files | yes | yes |
 | Size | yes | yes, a floor past 20,000 entries |
-| Delete, and remove unused | yes | yes |
+| Delete, and remove unused | yes | yes, with the space it would free on the button |
 | Create an empty volume | yes | yes |
 | Empty without deleting | yes, stopping and restarting its containers | yes, refused while a running container mounts it |
 | Clone | yes | yes |
@@ -835,7 +835,7 @@ The tables below are corrected against that.
 | Inspect | yes | yes |
 | Run a command | Exec, or Docker Debug | one-shot exec, and a pty terminal |
 | Files: browse | yes | running, and a stopped one's own writes |
-| Files: what differs from the image | each entry marked ADDED or MODIFIED | the same two marks, from the writable layer; deletions are not shown |
+| Files: what differs from the image | each entry marked ADDED or MODIFIED | the same two marks, from the writable layer, and a third for what it deleted |
 | Files: download | yes | yes |
 | Files: edit, upload | yes | yes, up to 64M per upload; mode and owner kept on edit |
 | Stats | four charts with axes, limits and zoom | the same four series over the last minute, each with its peak and time span, a choice of the last 1, 5 or 15 minutes, a click to enlarge, and the memory limit drawn as the top of its chart; history starts when the page is opened; disk only with the io controller |

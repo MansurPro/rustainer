@@ -220,7 +220,7 @@ echo "10. Files: a container's and a volume's, and never the host's"
 # host has and the container must never be shown.
 echo "HOSTSECRET-$$" > "$SCRATCH/hostsecret"
 FID=$(timeout 60 "$B" run -d --network none --layer "$BASE" -v filevol:/v /bin/sh -c \
-    "echo mine > /wrote; echo inside > /v/note; ln -s $SCRATCH/hostsecret /v/abs; \
+    "echo mine > /wrote; rm /etc/motd; echo inside > /v/note; ln -s $SCRATCH/hostsecret /v/abs; \
      ln -s ../../../../../../../..$SCRATCH/hostsecret /v/climb; exec sleep 60" 2>/dev/null | tail -1)
 for _ in $(seq 50); do
     [ -L "$RUSTAINER_IMAGE_ROOT/volumes/filevol/climb" ] && break
@@ -244,6 +244,9 @@ check "a traversing volume name is refused" \
 NOTED=$(curl -sS "$URL/api/containers/$FID/files?path=/")
 contains "a file the container made is marked added" "$(echo "$NOTED" | tr '{' '\n' | grep '"name":"wrote"')" '"note":"added"'
 check "and one from the image is not marked" "$(echo "$NOTED" | tr '{' '\n' | grep '"name":"bin"' | grep -c '"note"')" "0"
+ETC=$(curl -sS "$URL/api/containers/$FID/files?path=/etc")
+contains "a file it deleted is still listed, marked deleted" "$(echo "$ETC" | tr '{' '\n' | grep '"name":"motd"')" '"note":"deleted"'
+check "and nothing else in that directory is" "$(echo "$ETC" | grep -o '"note":"deleted"' | wc -l | tr -d ' ')" "1"
 contains "volumes say when they were made" "$(curl -sS "$URL/api/volumes")" '"created":1'
 "$B" stop -t 0 "$FID" >/dev/null 2>&1
 # Stopped, there is no mount namespace to look into: what is left is the

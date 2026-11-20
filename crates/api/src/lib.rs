@@ -746,6 +746,17 @@ impl Server {
                         e["note"] = json!(if below { "modified" } else { "added" });
                     }
                 }
+                // What it deleted: gone from the merged view, so listed
+                // from the writable layer, where overlayfs leaves a
+                // marker in place of each removed name.
+                if let Some(entries) = v["entries"].as_array_mut() {
+                    for name in whiteouts_in(&upper, &rel) {
+                        entries.push(json!({
+                            "name": name, "kind": "other", "size": 0, "mode": "",
+                            "uid": "", "gid": "", "mtime": 0, "note": "deleted",
+                        }));
+                    }
+                }
                 http::json(stream, 200, &v)
             }
             Err(e) => http::error(stream, 404, &e),
@@ -1035,6 +1046,40 @@ fn exists_in(root: &Path, rel: &str) -> bool {
             ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
         )
         .is_ok()
+}
+
+/// The names a container deleted from the directory `rel`: overlayfs
+/// records each as a character device numbered 0,0 in the upper layer.
+// ponytail: a directory deleted and recreated ("opaque") hides what was
+// under it without one marker per name, and those are not listed.
+fn whiteouts_in(upper: &Path, rel: &str) -> Vec<String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let dir = if rel.trim_matches('/').is_empty() {
+        upper.to_path_buf()
+    } else {
+        match resolve(upper, rel) {
+            Ok((name, m, _fd)) if m.is_dir() => {
+                return whiteouts_at(Path::new(&name));
+            }
+            _ => return Vec::new(),
+        }
+    };
+    return whiteouts_at(&dir);
+
+    fn whiteouts_at(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.metadata()
+                    .is_ok_and(|m| m.file_type().is_char_device() && m.rdev() == 0)
+            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        out.sort();
+        out
+    }
 }
 
 /// Find `rel` under `root` without leaving it, and say what it is.
