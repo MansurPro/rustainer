@@ -481,7 +481,7 @@ pub fn apply_layer<R: Read>(
     // calls this --delay-directory-restore and needs it for the same
     // reason: a directory has to be traversable while its own contents
     // are being written, whatever mode it is supposed to end up with.
-    let mut deferred_modes: Vec<(PathBuf, u32)> = Vec::new();
+    let mut deferred_modes: Vec<(PathBuf, u32, Timestamps)> = Vec::new();
 
     let entries = archive.entries().map_err(Error::Archive)?;
     for entry in entries {
@@ -501,6 +501,16 @@ pub fn apply_layer<R: Read>(
         let rel = sanitise(&raw)?;
         let header = entry.header().clone();
         let mode = header.mode().unwrap_or(0o644) & 0o7777;
+        // Who the layer says owns it, and when it was last changed. Both
+        // were dropped once, and everything in every image belonged to
+        // root and dated from the pull: `/etc/shadow` lost its group, an
+        // image's unprivileged user did not own its own data directory,
+        // and anything that compares file times saw nonsense.
+        let owner = (
+            header.uid().unwrap_or(0) as u32,
+            header.gid().unwrap_or(0) as u32,
+        );
+        let mtime = stamp(header.mtime().unwrap_or(0));
 
         // --- whiteouts ---------------------------------------------------
         if let Some(name) = rel.file_name().and_then(OsStr::to_str) {
@@ -555,7 +565,7 @@ pub fn apply_layer<R: Read>(
                 // And a directory that already exists keeps whatever mode
                 // an earlier layer gave it, because mkdirat returns EEXIST
                 // without touching it.
-                deferred_modes.push((rel.clone(), mode));
+                deferred_modes.push((rel.clone(), mode, mtime.clone()));
                 match rustix::fs::mkdirat(
                     &dir,
                     name.as_c_str(),
@@ -607,7 +617,13 @@ pub fn apply_layer<R: Read>(
                 // the container's own no_new_privs and dropped bounding set
                 // are what make them harmless - not a matter of stripping
                 // the bit here and breaking the image.
+                // The owner BEFORE the mode: changing a file's owner
+                // clears its setuid and setgid bits, even for root.
+                if owner != (0, 0) && chown_fd(&file, owner).is_err() {
+                    report.ownership_skipped += 1;
+                }
                 let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
+                let _ = rustix::fs::futimens(&file, &mtime);
             }
 
             tar::EntryType::Symlink => {
@@ -713,6 +729,40 @@ pub fn apply_layer<R: Read>(
             _ => continue,
         }
 
+        // Owner and time for what is not a regular file (done above, on
+        // its descriptor) or a hard link (it shares the file's). By name
+        // under the pinned parent and never through a link.
+        let kind = header.entry_type();
+        if matches!(
+            kind,
+            tar::EntryType::Directory | tar::EntryType::Symlink | tar::EntryType::Fifo
+        ) {
+            let dir = root.parent_dir(&rel)?;
+            let name = file_name_c(&rel)?;
+            if owner != (0, 0)
+                && rustix::fs::chownat(
+                    &dir,
+                    name.as_c_str(),
+                    Some(rustix::fs::Uid::from_raw(owner.0)),
+                    Some(rustix::fs::Gid::from_raw(owner.1)),
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .is_err()
+            {
+                report.ownership_skipped += 1;
+            }
+            // A directory's time is set at the end: every entry created
+            // inside it from here on would move it again.
+            if kind != tar::EntryType::Directory {
+                let _ = rustix::fs::utimensat(
+                    &dir,
+                    name.as_c_str(),
+                    &mtime,
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                );
+            }
+        }
+
         // Extended attributes are dropped wholesale for now. The one that
         // matters is `security.capability`: a file carrying it gains
         // capabilities at execve, and written from inside a user namespace
@@ -733,8 +783,8 @@ pub fn apply_layer<R: Read>(
 
     // Deepest first, so a directory is never made unsearchable before the
     // ones inside it have been dealt with.
-    deferred_modes.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
-    for (rel, mode) in &deferred_modes {
+    deferred_modes.sort_by_key(|(p, _, _)| std::cmp::Reverse(p.components().count()));
+    for (rel, mode, mtime) in &deferred_modes {
         let dir = root.parent_dir(rel)?;
         let name = file_name_c(rel)?;
         // Opened through the pinned parent with O_NOFOLLOW, then fchmod
@@ -756,8 +806,30 @@ pub fn apply_layer<R: Read>(
             Err(_) => continue,
         };
         let _ = rustix::fs::fchmod(&fd, Mode::from_bits_truncate(*mode));
+        let _ = rustix::fs::futimens(&fd, mtime);
     }
     Ok(())
+}
+
+use rustix::fs::Timestamps;
+
+fn stamp(secs: u64) -> Timestamps {
+    let t = rustix::fs::Timespec {
+        tv_sec: secs as i64,
+        tv_nsec: 0,
+    };
+    Timestamps {
+        last_access: t,
+        last_modification: t,
+    }
+}
+
+fn chown_fd(file: &std::fs::File, owner: (u32, u32)) -> rustix::io::Result<()> {
+    rustix::fs::fchown(
+        file,
+        Some(rustix::fs::Uid::from_raw(owner.0)),
+        Some(rustix::fs::Gid::from_raw(owner.1)),
+    )
 }
 
 /// A whiteout we could not record. Counted and explained once, not fatal.
@@ -1202,6 +1274,41 @@ mod tests {
         // is not a root name either.
         assert!(!names_archive_root(Path::new("./..")));
         assert!(sanitise(Path::new("./..")).is_err());
+    }
+
+    #[test]
+    fn the_layers_times_are_kept_and_its_owners_too_where_allowed() {
+        use std::os::unix::fs::MetadataExt;
+        let d = staging("meta");
+        let mut dir = header("data/", tar::EntryType::Directory, 0);
+        dir.set_mtime(1_000_000);
+        dir.set_uid(70);
+        dir.set_gid(70);
+        dir.set_cksum();
+        let mut f = header("data/f", tar::EntryType::Regular, 1);
+        f.set_mtime(2_000_000);
+        f.set_uid(70);
+        f.set_gid(42);
+        f.set_mode(0o2755);
+        f.set_cksum();
+        let report = run(&d, tar_with(vec![(dir, Vec::new()), (f, b"x".to_vec())])).unwrap();
+        let (dm, fm) = (
+            std::fs::metadata(d.join("data")).unwrap(),
+            std::fs::metadata(d.join("data/f")).unwrap(),
+        );
+        // The directory's time survives a file being created inside it.
+        assert_eq!((dm.mtime(), fm.mtime()), (1_000_000, 2_000_000));
+        // Decided by what happened, not by who we are: uid 0 inside a
+        // user namespace is "root" and still cannot give a file to an
+        // id that is not mapped there.
+        if report.ownership_skipped == 0 {
+            assert_eq!((dm.uid(), dm.gid(), fm.uid(), fm.gid()), (70, 70, 70, 42));
+            // And the setgid bit survives the change of owner.
+            assert_eq!(fm.mode() & 0o7777, 0o2755);
+        } else {
+            assert_eq!(report.ownership_skipped, 2, "counted, not fatal");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
