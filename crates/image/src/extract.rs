@@ -482,6 +482,8 @@ pub fn apply_layer<R: Read>(
     // reason: a directory has to be traversable while its own contents
     // are being written, whatever mode it is supposed to end up with.
     let mut deferred_modes: Vec<(PathBuf, u32, Timestamps)> = Vec::new();
+    let initial_userns = std::fs::read_to_string("/proc/self/uid_map")
+        .is_ok_and(|m| m.split_whitespace().nth(2) == Some("4294967295"));
 
     let entries = archive.entries().map_err(Error::Archive)?;
     for entry in entries {
@@ -763,17 +765,25 @@ pub fn apply_layer<R: Read>(
             }
         }
 
-        // Extended attributes are dropped wholesale for now. The one that
-        // matters is `security.capability`: a file carrying it gains
-        // capabilities at execve, and written from inside a user namespace
-        // the kernel silently REWRITES the value to a namespaced form -
-        // so round-tripping an image through a rootless extraction changes
-        // what the image means.
+        // Extended attributes: one is kept, the rest are dropped and
+        // counted. `security.capability` is what makes `ping` work for a
+        // user who is not root, and Docker keeps it. It is written only
+        // from the initial user namespace: from inside any other the
+        // kernel silently REWRITES the value to a namespaced form, so a
+        // rootless extraction would change what the image means, and
+        // dropping it there is the honest thing to do.
         if let Ok(Some(pax)) = entry.pax_extensions() {
             for ext in pax.flatten() {
-                if let Ok(key) = ext.key()
-                    && (key.starts_with("SCHILY.xattr.security.")
-                        || key.starts_with("SCHILY.xattr.system."))
+                let Ok(key) = ext.key() else { continue };
+                if key == "SCHILY.xattr.security.capability"
+                    && kind == tar::EntryType::Regular
+                    && initial_userns
+                    && set_file_caps(root, &rel, ext.value_bytes()).is_ok()
+                {
+                    continue;
+                }
+                if key.starts_with("SCHILY.xattr.security.")
+                    || key.starts_with("SCHILY.xattr.system.")
                 {
                     report.xattrs_dropped += 1;
                 }
@@ -812,6 +822,33 @@ pub fn apply_layer<R: Read>(
 }
 
 use rustix::fs::Timestamps;
+
+/// Through the pinned parent and never through a link, like every other
+/// write here: a capability landing on the wrong file is the worst
+/// version of the bug this module exists to prevent.
+fn set_file_caps(root: &SafeRoot, rel: &Path, value: &[u8]) -> Result<(), Error> {
+    let dir = root.parent_dir(rel)?;
+    let name = file_name_c(rel)?;
+    let io = |e: rustix::io::Errno| Error::Io {
+        op: "setting file capabilities",
+        path: rel.display().to_string(),
+        source: e.into(),
+    };
+    let fd = rustix::fs::openat(
+        &dir,
+        name.as_c_str(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io)?;
+    rustix::fs::fsetxattr(
+        &fd,
+        "security.capability",
+        value,
+        rustix::fs::XattrFlags::empty(),
+    )
+    .map_err(io)
+}
 
 fn stamp(secs: u64) -> Timestamps {
     let t = rustix::fs::Timespec {
@@ -1307,6 +1344,31 @@ mod tests {
             assert_eq!(fm.mode() & 0o7777, 0o2755);
         } else {
             assert_eq!(report.ownership_skipped, 2, "counted, not fatal");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn file_capabilities_are_kept_where_they_would_mean_the_same() {
+        // cap_net_raw=ep, as `setcap` writes it (revision 2).
+        let caps: [u8; 20] = [
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x20, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let d = staging("caps");
+        let mut b = tar::Builder::new(Vec::new());
+        b.append_pax_extensions([("SCHILY.xattr.security.capability", &caps[..])])
+            .unwrap();
+        let mut h = header("ping", tar::EntryType::Regular, 1);
+        h.set_mode(0o755);
+        h.set_cksum();
+        b.append(&h, &b"x"[..]).unwrap();
+        let report = run(&d, b.into_inner().unwrap()).unwrap();
+        let got = rustix::fs::getxattr(d.join("ping"), "security.capability", &mut [0u8; 64]);
+        // Kept as root on a filesystem that takes it; otherwise dropped
+        // and counted - never silently neither.
+        match got {
+            Ok(n) => assert_eq!((n, report.xattrs_dropped), (20, 0)),
+            Err(_) => assert_eq!(report.xattrs_dropped, 1),
         }
         let _ = std::fs::remove_dir_all(&d);
     }

@@ -31,10 +31,12 @@ away.** Twelve speed ratios were measured against Docker, on two hosts:
   bridge, and there is nothing in between to make faster.
 - Memory is a separate axis and a larger one: 7× to 18× less per running
   container, and nothing resident when nothing runs (Docker: 120-170 MiB).
-- Compatibility: **28 of 28** Docker Hub images behave identically to
+- Compatibility: **29 of 29** Docker Hub images behave identically to
   the same image under Docker - same user, directory, `PATH` and exit
-  status (section 6; 30 were offered, 2 excluded because Docker itself
-  could not pull them). It also reads Docker's model artifacts.
+  status, and the same owner, group, mode, time and capabilities on
+  every one of their 123,217 files (section 6; 30 were offered, 1
+  excluded because Docker itself could not pull it). It also reads
+  Docker's model artifacts.
 
 So "2× to 3× better with compatibility" is true as a statement about
 the typical operation and false as a statement about every operation.
@@ -364,9 +366,14 @@ identically - so what follows is a rate, with the denominators.
 | | measured |
 |---|---|
 | images offered | 30 |
-| excluded (Docker could not pull it) | 2 |
-| `id -u`, `id -g`, `pwd`, `$PATH` byte-identical | **28/28** |
-| exit status of the image's own ENTRYPOINT/CMD identical | **28/28** |
+| excluded (Docker could not pull it) | 1 |
+| `id -u`, `id -g`, `pwd`, `$PATH` byte-identical | **29/29** |
+| exit status of the image's own ENTRYPOINT/CMD identical | **29/29** |
+| owner, group, mode, mtime of every file, and file capabilities | **29/29** - 123,217 entries, none differing |
+
+The last run excluded one image (haproxy:3-alpine, which the mirror
+refused to Docker that day); earlier runs excluded two and scored 28/28
+on the first two rows. The third row is new - see below for why.
 
 **What that table did not check, and what was wrong underneath it.** The
 four properties above are about the process. Nothing compared the
@@ -380,21 +387,26 @@ what they need at start - which is exactly why a rate over process
 properties could not see it. It was found by a screenshot of the file
 browser showing every file "modified 29 s ago".
 
-Fixed, and then measured the way it should have been from the start -
-`find / -xdev` in the same image under each engine, comparing owner,
-group, mode and mtime of every entry:
+Fixed, and then measured the way it should have been from the start:
+`compat-matrix.sh` has a third probe that runs `find / -xdev` in the
+same image under each engine and compares owner, group, mode and mtime
+of every entry, plus `getcap` on every executable where the image has
+it. The first version of the fix was checked by hand on five images;
+the probe then ran over all of them: **29 of 29 images, 123,217
+entries, no differences** - from 447 entries in busybox to 15,713 in
+golang.
 
-| image | entries compared | differing |
-|---|---:|---:|
-| alpine:3.21 | 513 | 0 |
-| nginx:1.27-alpine | 2,201 | 0 |
-| postgres:16-alpine | 3,856 | 0 |
-| redis:7 | 4,249 | 0 |
-| python:3.12-slim | 5,562 | 0 |
+File capabilities were the second half. `security.capability` was
+dropped with every other extended attribute, so `arping` and
+`newuidmap` in almalinux and fedora had lost theirs; it is kept now,
+when extracting as real root. Inside a user namespace it is still
+dropped, deliberately - the kernel would rewrite the value to a
+namespaced form - and so are all other extended attributes. An image
+pulled before this fix keeps its old layers until `pull --force`.
 
-Five images, not twenty-eight, and extended attributes are still
-dropped. An image pulled before this fix keeps its root-owned layers
-until `pull --force`.
+Running the probe also re-measured start-to-exit time on every image,
+on one kernel: Docker 75-107 ms, rustainer 12-42 ms, **5.6× at the
+median** (2.5× for traefik, the one outlier; 4.9× to 6.6× for the rest).
 
 alpine ×2, debian ×2, ubuntu, busybox, fedora, almalinux, python ×2,
 node ×2, ruby, php, golang, rust, eclipse-temurin, nginx ×2, httpd,
