@@ -779,10 +779,6 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
         // then stops after exactly one restart, reporting a failure that did
         // not happen.
         if first_attempt {
-            // Tell the CLI it may leave. Everything after this point happens
-            // with nobody waiting on us.
-            reply_ok(spawned.pid);
-
             // --- wait for the start byte, WITHOUT a blocking open ------------
             //
             // The naive version opens the FIFO read side blocking and reads a
@@ -794,6 +790,10 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
             let fifo_read = sys::open_read_nonblocking(&cpath(&fifo_path)?)?;
             let started = wait_for_start(&fifo_read, &spawned.pidfd)?;
             if !started {
+                // The CLI still gets its answer: a container that was
+                // created and then failed to start is reported through
+                // its state, as it always was.
+                reply_ok(spawned.pid);
                 let err = spawned.start_failure().map(Error::Core);
                 let status = reap_into(&mut st, spawned.pid);
                 st.status = Status::Exited;
@@ -807,6 +807,14 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
         st.status = Status::Running;
         st.started_at = Some(state::now());
         st.store(paths)?;
+        // Tell the CLI it may leave - only now, with `running` on disk.
+        // Replying at `created` let `run -d` return a moment before the
+        // state changed, and whatever ran next (`ps`, a stack counting
+        // its replicas, `model run`) could see a container that was up
+        // reported as not running.
+        if first_attempt {
+            reply_ok(spawned.pid);
+        }
         crate::events::record(
             paths,
             if first_attempt { "start" } else { "restarted" },

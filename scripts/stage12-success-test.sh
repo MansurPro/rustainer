@@ -265,5 +265,20 @@ echo "13. Nothing is left running afterwards"
 check "no container is still running" "$("$B" ps | tail -n +2 | grep -c .)" "0"
 
 echo
+echo "When run -d returns, the container is already running"
+# It used to return at `created`, a moment early, and whatever asked next
+# could be told a live container was not running. This is a guard, not a
+# reproduction: the window was narrow enough that the old binary passes
+# these twenty tries too on an idle machine. It was seen twice, both
+# times in stage 18 on a loaded one.
+EARLY=0
+for i in $(seq 20); do
+    timeout 60 "$B" run -d --name "now$i" --network none --layer "$BASE" /bin/sleep 30 >/dev/null 2>&1
+    "$B" ps | awk -v n="now$i" '$1 == n { print $2 }' | grep -qx running || EARLY=$((EARLY + 1))
+done
+check "ps straight afterwards says running, every time" "$EARLY" "0"
+for i in $(seq 20); do "$B" rm --force "now$i" >/dev/null 2>&1; done
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
