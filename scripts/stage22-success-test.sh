@@ -245,6 +245,16 @@ check "which still pulls as what it is" \
 export RUSTAINER_IMAGE_ROOT="$SCRATCH/images"
 
 echo
+echo "6c. A pulled image keeps its files' owners and times"
+# Both were once dropped: everything belonged to root and was dated from
+# the pull. /etc/shadow is root:shadow (gid 42) in alpine.
+META=$(timeout 60 "$B" run --network none alpine:3.21 /bin/stat -c '%u:%g %Y' /etc/shadow 2>/dev/null | tail -1)
+check "/etc/shadow has its group" "${META%% *}" "0:42"
+AGE=$(( $(date +%s) - ${META##* } ))
+[ "$AGE" -gt 86400 ] && ok "and the date the image gave it, not today's" \
+    || bad "/etc/shadow is dated $AGE seconds ago"
+
+echo
 echo "7. The push is in the event log"
 contains "a push is recorded" "$("$B" events --since 900 --limit 400)" "push"
 

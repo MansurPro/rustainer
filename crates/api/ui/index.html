@@ -805,7 +805,7 @@ function buildDetail() {
     el("span", { className: "mono", style: "text-transform:none;letter-spacing:0;color:var(--text)" }, c.id),
     el("span", { className: "spacer" }),
   ]);
-  for (const name of ["logs", "terminal", "exec", "files", "stats", "inspect"]) {
+  for (const name of ["logs", "terminal", "exec", "files", "mounts", "stats", "inspect"]) {
     head.append(el("button", {
       className: "act", textContent: name,
       style: detailTab === name ? "border-color:var(--accent);color:var(--accent)" : "",
@@ -856,6 +856,14 @@ function buildDetail() {
         "One shot, output collected. Not a terminal — a pty needs a second protocol, " +
         "and `rustainer exec -it` already is one."));
     body.append(pad);
+  } else if (detailTab === "mounts") {
+    const vols = c.volumes || [];
+    body.append(!vols.length ? el("div", { className: "empty" }, "Nothing is mounted into this container.")
+      : el("table", {}, [el("tbody", {}, vols.map((v) => el("tr", {}, [
+          el("td", { className: "mono" }, v.source),
+          el("td", { className: "mono dim" }, "→ " + v.target),
+          el("td", { className: "dim" }, v.read_only ? "read-only" : "read-write"),
+        ])))]));
   } else if (detailTab === "stats") {
     body.append(statsPane(c));
   } else if (detailTab === "files") {
@@ -2382,6 +2390,12 @@ async function refresh() {
 loadSystem();
 refresh();
 setInterval(refresh, 2000);
+// Logs on their own, faster clock: two seconds is fine for a list and
+// too slow to watch something start. It returns at once unless the logs
+// tab is the one open.
+// ponytail: polled, not streamed - a stream needs a second protocol in
+// a server that has one; switch if 400 lines twice a second ever costs.
+setInterval(() => refreshLogs(false), 500);
 </script>
 </body>
 </html>

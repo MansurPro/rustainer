@@ -368,6 +368,34 @@ identically - so what follows is a rate, with the denominators.
 | `id -u`, `id -g`, `pwd`, `$PATH` byte-identical | **28/28** |
 | exit status of the image's own ENTRYPOINT/CMD identical | **28/28** |
 
+**What that table did not check, and what was wrong underneath it.** The
+four properties above are about the process. Nothing compared the
+*files*, and until this was looked at every file in every pulled image
+belonged to root and was dated from the moment of the pull: the layer
+extractor wrote contents and modes and dropped owner, group and time.
+`/etc/shadow` in alpine was `root:root` instead of `root:shadow`; an
+image whose unprivileged user owns its data directory did not. All 28
+passed anyway, because their entrypoints either run as root or `chown`
+what they need at start - which is exactly why a rate over process
+properties could not see it. It was found by a screenshot of the file
+browser showing every file "modified 29 s ago".
+
+Fixed, and then measured the way it should have been from the start -
+`find / -xdev` in the same image under each engine, comparing owner,
+group, mode and mtime of every entry:
+
+| image | entries compared | differing |
+|---|---:|---:|
+| alpine:3.21 | 513 | 0 |
+| nginx:1.27-alpine | 2,201 | 0 |
+| postgres:16-alpine | 3,856 | 0 |
+| redis:7 | 4,249 | 0 |
+| python:3.12-slim | 5,562 | 0 |
+
+Five images, not twenty-eight, and extended attributes are still
+dropped. An image pulled before this fix keeps its root-owned layers
+until `pull --force`.
+
 alpine ×2, debian ×2, ubuntu, busybox, fedora, almalinux, python ×2,
 node ×2, ruby, php, golang, rust, eclipse-temurin, nginx ×2, httpd,
 caddy, traefik, redis ×2, postgres, mariadb, memcached, mongo. glibc and
@@ -831,7 +859,7 @@ The tables below are corrected against that.
 
 | | Docker Desktop | this page |
 | --- | --- | --- |
-| Logs | live, with search and timestamps | tail, polled, with a line filter and timestamps to 0.1 s |
+| Logs | live, with search and timestamps | tail, refreshed twice a second, with a line filter and timestamps to 0.1 s |
 | Inspect | yes | yes |
 | Run a command | Exec, or Docker Debug | one-shot exec, and a pty terminal |
 | Files: browse | yes | running, and a stopped one's own writes |
@@ -839,7 +867,7 @@ The tables below are corrected against that.
 | Files: download | yes | yes |
 | Files: edit, upload | yes | yes, up to 64M per upload; mode and owner kept on edit |
 | Stats | four charts with axes, limits and zoom | the same four series over the last minute, each with its peak and time span, a choice of the last 1, 5 or 15 minutes, a click to enlarge, and the memory limit drawn as the top of its chart; history starts when the page is opened; disk only with the io controller |
-| Bind mounts tab | yes | listed under inspect |
+| Bind mounts tab | yes | yes: each mount's source, target and whether it is read-only |
 | Start / stop / restart / delete | yes | yes |
 
 The first version of this table was a list of what to build, and most
