@@ -249,7 +249,13 @@ echo "6c. A pulled image keeps its files' owners and times"
 # Both were once dropped: everything belonged to root and was dated from
 # the pull. /etc/shadow is root:shadow (gid 42) in alpine.
 META=$(timeout 60 "$B" run --network none alpine:3.21 /bin/stat -c '%u:%g %Y' /etc/shadow 2>/dev/null | tail -1)
-check "/etc/shadow has its group" "${META%% *}" "0:42"
+# Only where the id exists: a user namespace with one id mapped has no
+# gid 42 to give it, and the extractor counts that instead of failing.
+if [ "$(awk '{print $3}' /proc/self/uid_map)" = 4294967295 ]; then
+    check "/etc/shadow has its group" "${META%% *}" "0:42"
+else
+    check "/etc/shadow is root's, there being no other id here" "${META%% *}" "0:0"
+fi
 AGE=$(( $(date +%s) - ${META##* } ))
 [ "$AGE" -gt 86400 ] && ok "and the date the image gave it, not today's" \
     || bad "/etc/shadow is dated $AGE seconds ago"
