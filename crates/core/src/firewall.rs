@@ -234,6 +234,12 @@ impl Firewall for Nft {
     }
 
     fn publish(&self, p: &Publish, bridge: &str) -> Result<(), Error> {
+        // The table too, not only the chain: on a fresh host the first
+        // container's ports are published before anything else has made
+        // it, and a chain cannot be added to a table that is not there.
+        // The forward chain for the same reason: the second rule goes in it.
+        run_ok("nft", &["add", "table", "ip", TABLE]);
+        self.ensure_forward(bridge)?;
         run_ok(
             "nft",
             &[

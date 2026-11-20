@@ -171,5 +171,24 @@ timeout 30 "$B" run --network host -p 8080:80 --layer "$BASE" /bin/true 2>&1 | g
     && ok "-p with host networking refuses" || bad "-p with host networking was accepted"
 
 echo
+echo "9. With only nft, the very first container can publish"
+# A fresh network namespace is a host nothing has run on, and an iptables
+# that fails is a host without one. Every other section runs after some
+# container already made the table, which is how this stayed hidden.
+if command -v nft >/dev/null 2>&1 && command -v unshare >/dev/null 2>&1; then
+    mkdir -p "$SCRATCH/noipt"
+    printf '#!/bin/sh\nexit 127\n' > "$SCRATCH/noipt/iptables"
+    chmod +x "$SCRATCH/noipt/iptables"
+    RULES=$(RUSTAINER_ROOT="$SCRATCH/fresh" PATH="$SCRATCH/noipt:$PATH" timeout 90 unshare -n sh -c '
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        "$0" run -d --name first -p 18098:80 --layer "$1" /bin/sleep 20 >/dev/null 2>&1
+        nft list table ip rustainer 2>/dev/null | grep -c "dport 80\|dport 18098"
+        "$0" rm --force first >/dev/null 2>&1' "$B" "$BASE")
+    check "both of its rules are written" "$RULES" "2"
+else
+    SKIP=$((SKIP + 1)); echo "  SKIP  no nft or no unshare here"
+fi
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

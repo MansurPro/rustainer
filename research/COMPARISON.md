@@ -995,7 +995,14 @@ CI job) pulls a real model and gets an answer out of it.
 What it is not: Docker's runner is a host process with Metal and CUDA
 behind it. This is a container on the CPU unless you name a GPU build
 of the server with `--image`, and nothing here was measured against
-Docker's for speed. It loads GGUF only; the `-mlx` and `-safetensors`
+Docker's *runner* for speed (it is off on the machine this was written
+on). What was measured is the same server image and the same
+`ai/smollm2:360M-Q4_K_M` file under each engine, on the CPU, in the same
+VM: 256 tokens generated at 3-12 per second under both, the spread within
+one engine wider than any gap between them, and the server answering
+`/health` 0.40-0.62 s after `run` here against 0.61-0.71 s under Docker.
+So: no faster and no slower. A model is a CPU-bound process and a
+container engine is not in its way. It loads GGUF only; the `-mlx` and `-safetensors`
 tags in the same catalogue are refused with a sentence saying why.
 
 Building it found a bug that had nothing to do with models. The server
