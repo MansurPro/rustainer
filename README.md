@@ -933,6 +933,11 @@ somewhere else does not break `pull alpine`.
     set -a; . ./.env; set +a      # RUSTAINER_REGISTRY_AUTH=user:dckr_pat_...
     rustainer repos               # yours, private marked
 
+Another architecture's build, where the kernel has an emulator
+registered (Docker Desktop's VM does):
+
+    rustainer run --platform linux/amd64 alpine uname -m     # x86_64
+
 **The test is a round trip**: build, push, pull into a *clean* store, run.
 Anything less proves the request succeeded, not that the right bytes
 arrived — and the first version of this code pushed an image whose

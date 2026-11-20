@@ -83,6 +83,8 @@ fn io(op: &'static str, path: impl AsRef<Path>) -> impl FnOnce(std::io::Error) -
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
+    /// The architecture to pull instead of this machine's.
+    arch: Option<String>,
 }
 
 /// What the runtime needs to run an image.
@@ -123,7 +125,20 @@ impl Materialised {
 
 impl Store {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            arch: None,
+        }
+    }
+
+    /// Pull for another platform: Docker's `--platform`, as `linux/amd64`
+    /// or just `amd64`. Running the result needs the kernel to have an
+    /// emulator registered (binfmt_misc), exactly as it does for Docker.
+    pub fn platform(mut self, platform: Option<&str>) -> Self {
+        // ponytail: the OS part is ignored - only Linux runs here - and so
+        // is the variant, which no index this was tried on needed.
+        self.arch = platform.map(|p| p.split('/').nth(1).unwrap_or(p).to_owned());
+        self
     }
 
     pub fn default_root() -> PathBuf {
@@ -591,7 +606,11 @@ impl Store {
         let (manifest, manifest_digest) = match fetched {
             Fetched::Manifest(m) => (m, digest),
             Fetched::Index(idx) => {
-                let d = registry::select_platform(&idx, "linux", std::env::consts::ARCH)?;
+                let d = registry::select_platform(
+                    &idx,
+                    "linux",
+                    self.arch.as_deref().unwrap_or(std::env::consts::ARCH),
+                )?;
                 let m = client.manifest_by_digest(&r, &d.digest)?;
                 (m, d.digest.clone())
             }
@@ -607,6 +626,23 @@ impl Store {
                 what: "the image config".into(),
                 source,
             })?;
+
+        // A single-manifest image has no index to choose from, so a named
+        // platform is checked against what the config says it is. Without
+        // this `--platform linux/amd64` quietly hands back an arm64 image.
+        if let Some(want) = &self.arch {
+            let got = serde_json::from_slice::<serde_json::Value>(&config_bytes)
+                .ok()
+                .and_then(|v| v["architecture"].as_str().map(registry::normalise_arch));
+            let want = registry::normalise_arch(want);
+            if got.as_ref().is_some_and(|g| *g != want) {
+                return Err(registry::Error::NoPlatform {
+                    os: "linux".into(),
+                    arch: want,
+                }
+                .into());
+            }
+        }
 
         let userxattr = Self::userxattr();
         let mut layer_dirs = Vec::new();

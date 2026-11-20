@@ -225,6 +225,26 @@ check "and it runs when pulled back" \
 export RUSTAINER_IMAGE_ROOT="$SCRATCH/images"
 
 echo
+echo "6b. --platform pulls the other architecture's build"
+# Checked by reading the ELF header rather than by running it, so this
+# holds on a host with no emulator registered.
+case "$(uname -m)" in x86_64) OTHER=arm64 WANT=b7 ;; *) OTHER=amd64 WANT=3e ;; esac
+export RUSTAINER_IMAGE_ROOT="$SCRATCH/images4"
+mkdir -p "$RUSTAINER_IMAGE_ROOT"
+timeout 600 "$B" pull --platform "linux/$OTHER" alpine:3.21 >/dev/null 2>&1 \
+    || bad "pulling linux/$OTHER failed"
+BB=$(find "$RUSTAINER_IMAGE_ROOT" -type f -path "*/bin/busybox" | head -1)
+check "the binary in it is $OTHER" "$(od -An -tx1 -j18 -N1 "$BB" | tr -d ' ')" "$WANT"
+refuses "a platform the image was never built for is refused" "no build for linux/sparc" \
+    "$B" pull --platform linux/sparc alpine:3.21
+# The image pushed in 6 is one manifest with no index to choose from.
+refuses "and so is one a single-manifest image is not" "no build for linux/$OTHER" \
+    "$B" pull --platform "linux/$OTHER" "$REG/mirror/alpine:3.21"
+check "which still pulls as what it is" \
+    "$("$B" pull --platform "linux/$(uname -m)" "$REG/mirror/alpine:3.21" >/dev/null 2>&1; echo $?)" "0"
+export RUSTAINER_IMAGE_ROOT="$SCRATCH/images"
+
+echo
 echo "7. The push is in the event log"
 contains "a push is recorded" "$("$B" events --since 900 --limit 400)" "push"
 
