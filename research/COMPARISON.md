@@ -1034,15 +1034,31 @@ CI job) pulls a real model and gets an answer out of it.
 
 What it is not: Docker's runner is a host process with Metal and CUDA
 behind it. This is a container on the CPU unless you name a GPU build
-of the server with `--image`, and nothing here was measured against
-Docker's *runner* for speed (it is off on the machine this was written
-on). What was measured is the same server image and the same
-`ai/smollm2:360M-Q4_K_M` file under each engine, on the CPU, in the same
-VM: 256 tokens generated at 3-12 per second under both, the spread within
-one engine wider than any gap between them, and the server answering
+of the server with `--image`. Measured on an Apple-silicon Mac with the
+same `ai/smollm2:360M-Q4_K_M` file, 256 tokens per request, five
+requests each: Docker's Model Runner (llama.cpp on Metal, on the host)
+generated 210-240 tokens per second; `rustainer model run` (llama.cpp on
+8 CPU threads, inside the Linux VM) generated 39-70. **Docker's runner
+is 3-6x faster here**, and the reason is the GPU, which a Linux
+container on a Mac cannot reach under any engine. Its first answer after
+an unload took 1.6 s, against roughly 15 s for a first `model run` here,
+which includes pulling the server image.
+
+Engine against engine it is a tie: the same server image and the same
+file under Docker and under this, on the CPU, in the same VM, ran at
+3-12 tokens per second under both in an earlier session (slower than
+the 39-70 above for a reason not found), the spread within
+one engine wider than any gap between them, with the server answering
 `/health` 0.40-0.62 s after `run` here against 0.61-0.71 s under Docker.
-So: no faster and no slower. A model is a CPU-bound process and a
-container engine is not in its way. It loads GGUF only; the `-mlx` and `-safetensors`
+A model is a CPU-bound process and a container engine is not in its way.
+
+A GPU inside a container was not measured anywhere. There is no
+`--gpus` or `--device` flag yet, and the one Linux machine available
+with a graphics card has a 2014 FirePro W5100 bound to the `radeon`
+kernel driver, which has no Vulkan; moving it to `amdgpu` needs root
+and a reboot of a shared machine.
+
+It loads GGUF only; the `-mlx` and `-safetensors`
 tags in the same catalogue are refused with a sentence saying why.
 
 Building it found a bug that had nothing to do with models. The server
