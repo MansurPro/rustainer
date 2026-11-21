@@ -233,7 +233,7 @@ fn service(svc: &J, dir: &Path, notes: &mut Vec<String>) -> Result<Table> {
             Ok(())
         };
         match k {
-            "image" | "restart" | "user" | "platform" => put_str(&mut t, k)?,
+            "image" | "restart" | "user" | "platform" | "pid" => put_str(&mut t, k)?,
             "working_dir" => put_str(&mut t, "workdir")?,
             "mem_limit" => put_str(&mut t, "memory")?,
             "network_mode" => put_str(&mut t, "network")?,
@@ -772,12 +772,12 @@ volumes:
     #[test]
     fn a_key_that_cannot_be_honoured_is_named() {
         let e = to_stack(
-            "services:\n  a:\n    image: x\n    pid: host\n",
+            "services:\n  a:\n    image: x\n    ipc: host\n",
             Path::new("/x"),
             &BTreeMap::new(),
         )
         .unwrap_err();
-        assert!(format!("{e:#}").contains("\"pid\""), "{e:#}");
+        assert!(format!("{e:#}").contains("\"ipc\""), "{e:#}");
     }
 
     #[test]

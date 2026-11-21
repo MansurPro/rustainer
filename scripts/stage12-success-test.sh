@@ -280,5 +280,30 @@ check "ps straight afterwards says running, every time" "$EARLY" "0"
 for i in $(seq 20); do "$B" rm --force "now$i" >/dev/null 2>&1; done
 
 echo
+echo "--pid host shares the process tree, and stop still stops all of it"
+if [ "$IN_USERNS" = yes ]; then
+    skip "a process tree can only be shared by something that owns it"
+else
+    sleep 54321 & MARK=$!
+    check "a container of its own cannot see a host process" \
+        "$(timeout 60 "$B" run --rm --network none --layer "$BASE" /bin/sh -c "test -d /proc/$MARK && echo seen || echo hidden" 2>&1 | tail -1)" "hidden"
+    check "with --pid host it can" \
+        "$(timeout 60 "$B" run --rm --network none --pid host --layer "$BASE" /bin/sh -c "test -d /proc/$MARK && echo seen || echo hidden" 2>&1 | tail -1)" "seen"
+    kill $MARK 2>/dev/null
+    # With no pid namespace nothing dies with init. What it started used
+    # to live on, holding the log pipes open, and `stop` waited five
+    # seconds for a supervisor that was waiting for them.
+    timeout 60 "$B" run -d --name hostpid --network none --pid host --layer "$BASE" \
+        /bin/sh -c 'sleep 65432 & sleep 65432 & wait' >/dev/null 2>&1
+    sleep 0.5
+    T0=$(date +%s)
+    timeout 60 "$B" stop -t 1 hostpid >/dev/null 2>&1
+    check "stop leaves none of its processes behind" "$(pgrep -fc 'sleep 65432' || true)" "0"
+    [ $(( $(date +%s) - T0 )) -le 3 ] && ok "and does not wait on them" || bad "stop took $(( $(date +%s) - T0 ))s"
+    "$B" rm --force hostpid >/dev/null 2>&1
+    pkill -f 'sleep 65432' 2>/dev/null
+fi
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
