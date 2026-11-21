@@ -103,6 +103,20 @@ echo "2. :ro is read-only, and read-only through submounts"
 check "a write is refused" \
     "$(R -v "$HOST:/data:ro" /bin/sh -c '( echo x > /data/nope ) 2>/dev/null && echo wrote || echo refused')" \
     "refused"
+# Read-only means read-only. It used to mean noexec as well, because the
+# attribute set written for /sys was reused here, and a script on a
+# read-only volume could be read and not run.
+printf '#!/bin/sh\necho ran\n' > "$HOST/tool.sh"; chmod +x "$HOST/tool.sh"
+check "a program on a read-only volume still runs" "$(R -v "$HOST:/data:ro" /data/tool.sh)" "ran"
+# --privileged takes the read-only attribute off /sys. It took it off
+# volumes too.
+if grep -q '^ *0 *0 *4294967295' /proc/self/uid_map; then
+    check "--privileged does not make a read-only volume writable" \
+        "$(R --privileged -v "$HOST:/data:ro" /bin/sh -c '( echo x > /data/nope ) 2>/dev/null && echo wrote || echo refused')" \
+        "refused"
+else
+    skip "--privileged needs real root"
+fi
 # A plain read-only remount leaves every submount of the source writable,
 # which is the trap /sys hit: the top looks right and the inside is not.
 mkdir -p "$HOST/sub"

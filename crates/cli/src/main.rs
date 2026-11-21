@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod build;
+mod compose;
 mod dockerfile;
 mod stack;
 
@@ -2561,9 +2562,21 @@ fn read_stack(files: &[PathBuf], profiles: &[String]) -> Result<stack::Stack> {
                 f.display()
             )
         })?;
-        texts.push(
-            stack::Stack::interpolate(&t, &vars).with_context(|| format!("in {}", f.display()))?,
-        );
+        let yaml = f.extension().is_some_and(|e| e == "yml" || e == "yaml");
+        let mut t = stack::Stack::interpolate_as(&t, &vars, yaml)
+            .with_context(|| format!("in {}", f.display()))?;
+        // A Compose file is translated into the stack it describes and
+        // then treated as one.
+        if yaml {
+            let dir = f.parent().filter(|d| !d.as_os_str().is_empty());
+            let (doc, notes) = compose::to_stack(&t, dir.unwrap_or(Path::new(".")), &vars)
+                .with_context(|| format!("in {}", f.display()))?;
+            for n in notes {
+                eprintln!("rustainer: {}: {n}", f.display());
+            }
+            t = toml::to_string(&doc).context("writing the Compose file as a stack")?;
+        }
+        texts.push(t);
     }
     let where_ = files
         .iter()
@@ -2937,6 +2950,12 @@ fn stack_run(paths: &Paths, st: &stack::Stack, args: &StackRunArgs) -> Result<Ex
         hostname: args.service.clone(),
         workdir: svc.workdir.clone(),
         platform: svc.platform.clone(),
+        entrypoint: svc.entrypoint.clone(),
+        privileged: svc.privileged,
+        read_only: svc.read_only,
+        cap_add: svc.cap_add.clone(),
+        cap_drop: svc.cap_drop.clone(),
+        security_opt: svc.security_opt.clone(),
         devices: svc.devices.clone(),
         volumes: {
             // A one-off gets the service's configs and secrets too: the
@@ -3009,8 +3028,8 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
             paths,
             BuildArgs {
                 tag: tag.clone(),
-                file: None,
-                build_args: Vec::new(),
+                file: svc.dockerfile.as_ref().map(|d| context.join(d)),
+                build_args: svc.build_args.clone(),
                 network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
                 no_cache: false,
                 context,
@@ -3159,6 +3178,12 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 hostname: name.clone(),
                 workdir: svc.workdir.clone(),
                 platform: svc.platform.clone(),
+                entrypoint: svc.entrypoint.clone(),
+                privileged: svc.privileged,
+                read_only: svc.read_only,
+                cap_add: svc.cap_add.clone(),
+                cap_drop: svc.cap_drop.clone(),
+                security_opt: svc.security_opt.clone(),
                 devices: svc.devices.clone(),
                 volumes: {
                     // Configs and secrets are read-only binds, which is

@@ -83,6 +83,13 @@ pub enum Op {
     SetAttrRecursiveReadonly {
         target: CString,
     },
+    /// A volume's `:ro`. Its own op rather than the one above for two
+    /// reasons that were both bugs: that one also sets noexec, and
+    /// `--privileged` removes every one of them - which is right for
+    /// `/sys` and silently made a read-only volume writable.
+    VolumeReadOnly {
+        target: CString,
+    },
     /// `mkdir`, tolerating EEXIST. Needed for directories that live inside
     /// a tmpfs this plan mounts, which therefore cannot exist beforehand.
     Mkdir {
@@ -934,7 +941,7 @@ pub fn plan(
                 // source writable, and a bind of a host directory can
                 // easily carry submounts.
                 push(
-                    Op::SetAttrRecursiveReadonly { target },
+                    Op::VolumeReadOnly { target },
                     false,
                     "making a volume read-only",
                 );
@@ -1128,6 +1135,9 @@ fn run_one(op: &Op, detail: &mut [u8; DETAIL_LEN], detail_len: &mut usize) -> Re
         }
         Op::SetAttrRecursiveReadonly { target } => {
             sys::mount_setattr_recursive_readonly(target.as_c_str())
+        }
+        Op::VolumeReadOnly { target } => {
+            sys::mount_setattr_recursive_rdonly_only(target.as_c_str())
         }
     }
 }
