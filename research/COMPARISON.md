@@ -666,7 +666,7 @@ and a bare `$VAR` without braces is not substituted.
 It was checked against a real project rather than a file written to
 pass: a development stack of Postgres 16, Redis, MinIO and a one-shot
 bucket-creation job, written for Docker Compose across three files with
-`extends`, `!override`, anchors and `env_file`, came up unmodified, with
+`extends`, `!override` and anchors, came up unmodified, with
 Postgres accepting connections, Redis answering and the job finding
 MinIO by name. Of that project's seven Compose files, the largest is
 still refused, for `pid: host` on a metrics exporter.
