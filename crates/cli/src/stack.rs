@@ -11,6 +11,9 @@
 //! afternoon. TOML has one way to write a string, one way to write a
 //! list, and comments.
 //!
+//! A Compose file is still read: `compose.rs` translates one into this
+//! model, so the YAML is an import format and never the model itself.
+//!
 //! # Why unknown keys are an error
 //!
 //! A misspelled key in a Compose file does nothing at all, silently, and
@@ -172,6 +175,28 @@ pub struct Service {
     /// `bridge` (the default), `none`, or `host`.
     #[serde(default)]
     pub network: Option<String>,
+    /// As the `run` flags of the same names.
+    #[serde(default)]
+    pub privileged: bool,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub cap_add: Vec<String>,
+    #[serde(default)]
+    pub cap_drop: Vec<String>,
+    #[serde(default)]
+    pub security_opt: Vec<String>,
+    /// The Dockerfile, relative to the `build` context, when it is not
+    /// the one named `Dockerfile` at its top.
+    #[serde(default)]
+    pub dockerfile: Option<String>,
+    /// `KEY=value` for the Dockerfile's `ARG`s, as `build --build-arg`.
+    #[serde(default)]
+    pub build_args: Vec<String>,
+    /// Replaces the image's entrypoint, as `run --entrypoint`: one
+    /// word, and empty for none.
+    #[serde(default)]
+    pub entrypoint: Option<String>,
     /// Another platform's build of the image, as `run --platform`.
     #[serde(default)]
     pub platform: Option<String>,
@@ -623,7 +648,18 @@ impl Stack {
     /// empty string. Compose substitutes empty and warns; the result is
     /// `ports = [":80"]` and a stack that fails somewhere else entirely.
     /// `${VAR:-}` is how you ask for empty on purpose.
+    #[cfg(test)]
     pub fn interpolate(text: &str, vars: &BTreeMap<String, String>) -> Result<String> {
+        Self::interpolate_as(text, vars, false)
+    }
+
+    /// `compose` reads an unset `${VAR}` as empty and says so, which is
+    /// what Compose does and what its files are written against.
+    pub fn interpolate_as(
+        text: &str,
+        vars: &BTreeMap<String, String>,
+        compose: bool,
+    ) -> Result<String> {
         let mut out = String::with_capacity(text.len());
         let b = text.as_bytes();
         let mut i = 0;
@@ -640,24 +676,37 @@ impl Stack {
                     bail!("`${{` at byte {i} is never closed with `}}`");
                 };
                 let body = &text[i + 2..end];
-                let (name, default) = match body.split_once(":-") {
-                    Some((n, d)) => (n, Some(d)),
-                    None => (body, None),
+                // The shell's forms, as Compose reads them: `:-` and `-`
+                // give a default, `:?` and `?` an error of your own
+                // wording, `:+` and `+` a value only when the variable
+                // is set. With the colon, set-but-empty counts as unset.
+                let op_at = body.find([':', '-', '?', '+']).unwrap_or(body.len());
+                let name = body[..op_at].trim();
+                let rest = &body[op_at..];
+                let (colon, rest) = match rest.strip_prefix(':') {
+                    Some(r) => (true, r),
+                    None => (false, rest),
                 };
-                let name = name.trim();
                 if name.is_empty() {
                     bail!("`${{}}` has no variable name in it");
                 }
-                match vars.get(name) {
-                    Some(v) => out.push_str(v),
-                    None => match default {
-                        Some(d) => out.push_str(d),
-                        None => bail!(
-                            "{name} is not set, and `${{{name}}}` has no default. \
-                             Set it in the environment or in a .env file beside the \
-                             stack file, or write `${{{name}:-something}}`."
-                        ),
-                    },
+                let value = vars.get(name).filter(|v| !(colon && v.is_empty()));
+                match (rest.chars().next(), value) {
+                    (None, Some(v)) if !colon => out.push_str(v),
+                    (Some('-') | Some('?'), Some(v)) => out.push_str(v),
+                    (Some('-'), None) => out.push_str(&rest[1..]),
+                    (Some('+'), Some(_)) => out.push_str(&rest[1..]),
+                    (Some('+'), None) => {}
+                    (Some('?'), None) => bail!("{name} is not set: {}", &rest[1..]),
+                    (None, None) if !colon && compose => {
+                        eprintln!("rustainer: {name} is not set; using an empty string");
+                    }
+                    (None, None) if !colon => bail!(
+                        "{name} is not set, and `${{{name}}}` has no default. \
+                         Set it in the environment or in a .env file beside the \
+                         stack file, or write `${{{name}:-something}}`."
+                    ),
+                    _ => bail!("`${{{body}}}` is not a substitution this understands"),
                 }
                 i = end + 1;
                 continue;

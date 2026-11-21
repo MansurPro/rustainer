@@ -32,7 +32,8 @@ serde_json = "1.0"
 # The stack file format. TOML and not YAML: a configuration language
 # should not be able to surprise you, and `ports: - 8080:80` is a
 # sexagesimal number in YAML 1.1.
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "display"] }
+serde_yaml_ng = "0.10"
 seccompiler = { version = "0.5", features = ["json"] }
 # The image subsystem. Synchronous on purpose: `ureq` rather than
 # `reqwest` + `tokio`, so nothing here can put an executor in the process

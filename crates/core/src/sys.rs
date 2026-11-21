@@ -302,8 +302,22 @@ struct MountAttr {
 ///
 /// Kernel 5.12 and later; the project floor is higher.
 pub fn mount_setattr_recursive_readonly(path: &CStr) -> Result<(), Errno> {
+    mount_setattr_recursive(
+        path,
+        MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+    )
+}
+
+/// Read-only and nothing else: what `-v src:dst:ro` asks for. The
+/// stricter set above is right for `/sys`, and on a volume it made every
+/// script and binary in it unrunnable.
+pub fn mount_setattr_recursive_rdonly_only(path: &CStr) -> Result<(), Errno> {
+    mount_setattr_recursive(path, MOUNT_ATTR_RDONLY)
+}
+
+fn mount_setattr_recursive(path: &CStr, attr_set: u64) -> Result<(), Errno> {
     let attr = MountAttr {
-        attr_set: MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+        attr_set,
         ..Default::default()
     };
     let rc = unsafe {
@@ -326,14 +340,19 @@ pub fn unmount_detach(target: &CStr) -> Result<(), Errno> {
 }
 
 pub fn mknod_char(target: &CStr, mode: u32, major: u32, minor: u32) -> Result<(), Errno> {
-    use rustix::fs::{CWD, FileType, Mode, makedev, mknodat};
+    use rustix::fs::{AtFlags, CWD, FileType, Mode, chmodat, makedev, mknodat};
+    let mode = Mode::from_bits_truncate(mode);
     mknodat(
         CWD,
         target,
         FileType::CharacterDevice,
-        Mode::from_bits_truncate(mode),
+        mode,
         makedev(major, minor),
-    )
+    )?;
+    // mknod's mode is cut down by the umask of whoever typed `run`, and
+    // with the usual 022 that made /dev/null read-only to everyone but
+    // root: an image that drops to its own user could not redirect to it.
+    chmodat(CWD, target, mode, AtFlags::empty())
 }
 
 /// `mkdir`, tolerating a directory that already exists.

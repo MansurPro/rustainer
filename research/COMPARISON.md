@@ -338,7 +338,7 @@ the comparison rather than the numbers:
   that has never had a second thread. The "0 MiB resident" row above is still
   true of the engine; the server is opt-in and runs only while you are
   looking at it.
-- **Stacks** (`stack up/down/ps`), Compose-shaped and TOML-based.
+- **Stacks** (`stack up/down/ps`), from a TOML file or a Docker Compose file.
 - **Interactive terminals** — `run -it`, `exec -it`, and a pty in the page.
 - **Restart policies and an event log** (`--restart`, `events --follow`).
 - **`build` and `push`**, so an image can be made here and consumed by Docker.
@@ -630,6 +630,60 @@ And `watch`, in all three of Compose's actions:
   misses an event is worse than one that notices a second late, and
   inotify's queue overflows silently under a build that touches a
   thousand files.
+
+### Compose files themselves
+
+For a long time the answer to "can it run my `docker-compose.yml`" was
+no: a stack was a TOML file with Compose's ideas and its own spelling.
+`stack up -f docker-compose.yml` now reads the YAML. It is a
+translation, not a second engine - the file becomes the same table a
+`rustainer.toml` parses to, and everything after that is the stack code.
+
+What is translated: `image`, `build` (context, `dockerfile`, `args`),
+`command` and `entrypoint` as a string or a list, `environment` as a
+list or a mapping, `env_file`, `ports` and `volumes` in short and long
+form, `depends_on` with `service_started` and `service_healthy`,
+`healthcheck` (`CMD`, `CMD-SHELL`, durations like `1m30s`), `restart`,
+`profiles`, `user`, `working_dir`, `mem_limit`, `cpus`, `pids_limit`,
+`privileged`, `read_only`, `cap_add`, `cap_drop`, `security_opt`,
+`devices`, `platform`, `network_mode`, `configs`, `secrets`,
+`deploy.replicas`, `deploy.resources.limits`, `develop.watch`,
+`extends` from the same file or another, YAML anchors and `<<`, the
+`!override` and `!reset` tags, and the shell's substitution forms
+(`${V-d}`, `${V:-d}`, `${V:?msg}`, `${V:+x}`).
+
+What is not, in two kinds. Keys that do not change whether the
+application works are dropped and **said to be** on stderr:
+`container_name`, `hostname`, `labels`, `logging`, `networks`,
+`stop_grace_period`, `init`, `oom_score_adj`, `cpu_shares` and a few
+more. Anything else - `pid`, `tmpfs`, `sysctls`, `ulimits`, `build.target`,
+`depends_on` with `service_completed_successfully` - is refused by name
+before anything starts. Three differences in behaviour remain: several
+`-f` files replace a list where Compose appends to it; a service's
+containers are named `<stack>-<service>`, not `<project>-<service>-1`;
+and a bare `$VAR` without braces is not substituted.
+
+It was checked against a real project rather than a file written to
+pass: a development stack of Postgres 16, Redis, MinIO and a one-shot
+bucket-creation job, written for Docker Compose across three files with
+`extends`, `!override` and anchors, came up unmodified, with
+Postgres accepting connections, Redis answering and the job finding
+MinIO by name. Of that project's seven Compose files, the largest is
+still refused, for `pid: host` on a metrics exporter.
+
+Getting there found three bugs in the engine, none of them about YAML:
+
+- **`/dev/null` was read-only to everyone but root.** `mknod`'s mode is
+  cut down by the caller's umask, so the device nodes were `0644`.
+  Postgres' entrypoint drops to its own user and redirects to
+  `/dev/null`; it died on line 352.
+- **A read-only volume was also `noexec`.** `-v src:dst:ro` reused the
+  attribute set written for `/sys`. A script on a read-only volume could
+  be read and not run, and an entrypoint that asks `[ -x ]` before
+  choosing between running and sourcing chose wrongly.
+- **`--privileged` made read-only volumes writable.** It removes the
+  read-only attribute from `/sys` by removing every operation of that
+  kind, and a volume's `:ro` was one of them.
 
 ### What Compose still has that these stacks do not
 

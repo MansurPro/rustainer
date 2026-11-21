@@ -601,6 +601,7 @@ rustainer stack up    --profile debug -f examples/rustainer.toml
 rustainer stack up    -f base.toml -f prod.toml   # later wins, key by key
 rustainer stack run   -f examples/rustainer.toml db /bin/sh   # one-off
 rustainer stack watch -f examples/rustainer.toml   # rebuild on change
+rustainer stack up    -f docker-compose.yml       # a Compose file, translated
 ```
 
 ```toml

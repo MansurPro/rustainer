@@ -690,5 +690,64 @@ refuses "an extension whose page is not on this machine is refused" "must be on 
     timeout 60 "$B" extension install "$E"
 
 echo
+echo "A Compose file is read as the stack it describes"
+# Not a second engine: the YAML is translated and the stack code runs it.
+# What is checked is the translation of the shapes real files use - a
+# command written as a string, environment as a mapping, a CMD-SHELL
+# healthcheck, a dependency on healthy, extends from another file, and
+# ${VAR-default} with no colon.
+C="$SCRATCH/shop"
+mkdir -p "$C"
+cat > "$C/base.yml" <<EOF
+services:
+  db:
+    image: $IMG
+    environment:
+      FROM_BASE: "yes"
+EOF
+cat > "$C/compose.yml" <<EOF
+x-restart: &restart
+  restart: "no"
+services:
+  db:
+    <<: *restart
+    extends:
+      file: base.yml
+      service: db
+    container_name: whatever
+    command: sh -c "touch /ready; sleep 400"
+    environment:
+      GREETING: \${NOT_SET_ANYWHERE-hello there}
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /ready"]
+      interval: 1s
+      retries: 20
+  web:
+    image: $IMG
+    user: "1234"
+    command: ["/bin/sleep", "400"]
+    depends_on:
+      db:
+        condition: service_healthy
+EOF
+UPC=$(timeout 300 "$B" stack up -f "$C/compose.yml" 2>&1)
+contains "it comes up, named after its directory" "$UPC" "shop-web"
+contains "a key that changes nothing is dropped, and said to be" "$UPC" "container_name: ignored"
+check "both services run" \
+    "$("$B" stack ps -f "$C/compose.yml" 2>/dev/null | tail -n +2 | awk '$2 == "running"' | grep -c .)" "2"
+check "environment from the mapping, with the default substituted" \
+    "$(timeout 60 "$B" exec shop-db /bin/sh -c 'echo $GREETING' 2>&1 | tail -1)" "hello there"
+check "and from the file it extends" \
+    "$(timeout 60 "$B" exec shop-db /bin/sh -c 'echo $FROM_BASE' 2>&1 | tail -1)" "yes"
+# The same run is the check that /dev/null is writable by a user that is
+# not root: mknod's mode used to be cut down by the caller's umask.
+check "a service's user can write to /dev/null" \
+    "$(timeout 60 "$B" exec shop-web /bin/sh -c 'echo x > /dev/null && id -u' 2>&1 | tail -1)" "1234"
+printf 'services:\n  a:\n    image: x\n    pid: host\n' > "$C/bad.yml"
+refuses "a key that cannot be honoured is refused by name" '"pid"' "$B" stack ps -f "$C/bad.yml"
+timeout 300 "$B" stack down -t 0 -f "$C/compose.yml" >/dev/null 2>&1
+check "down removes it" "$("$B" ps -a | grep -c shop- || true)" "0"
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
