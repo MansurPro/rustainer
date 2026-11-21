@@ -230,17 +230,22 @@ mod tests {
             }
         });
 
-        let free = L::bind("127.0.0.1:0").unwrap();
-        let host_port = free.local_addr().unwrap().port();
-        drop(free);
-
-        let mut f = Forwarder::start(Publish {
-            host_ip: Ipv4Addr::LOCALHOST,
-            host_port,
-            container_ip: Ipv4Addr::LOCALHOST,
-            container_port: target_port,
-        })
-        .expect("bind the host side");
+        // A free port is only free until someone else takes it: the tests
+        // run in parallel and each asks the kernel for one, so the port
+        // released here can be gone again before the forwarder binds it.
+        let (mut f, host_port) = (0..20)
+            .find_map(|_| {
+                let host_port = L::bind("127.0.0.1:0").ok()?.local_addr().ok()?.port();
+                let f = Forwarder::start(Publish {
+                    host_ip: Ipv4Addr::LOCALHOST,
+                    host_port,
+                    container_ip: Ipv4Addr::LOCALHOST,
+                    container_port: target_port,
+                })
+                .ok()?;
+                Some((f, host_port))
+            })
+            .expect("bind the host side");
 
         let mut c = TcpStream::connect(("127.0.0.1", host_port)).expect("connect");
         c.write_all(b"ping").unwrap();
