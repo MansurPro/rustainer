@@ -743,8 +743,8 @@ check "and from the file it extends" \
 # not root: mknod's mode used to be cut down by the caller's umask.
 check "a service's user can write to /dev/null" \
     "$(timeout 60 "$B" exec shop-web /bin/sh -c 'echo x > /dev/null && id -u' 2>&1 | tail -1)" "1234"
-printf 'services:\n  a:\n    image: x\n    pid: host\n' > "$C/bad.yml"
-refuses "a key that cannot be honoured is refused by name" '"pid"' "$B" stack ps -f "$C/bad.yml"
+printf 'services:\n  a:\n    image: x\n    ipc: host\n' > "$C/bad.yml"
+refuses "a key that cannot be honoured is refused by name" '"ipc"' "$B" stack ps -f "$C/bad.yml"
 timeout 300 "$B" stack down -t 0 -f "$C/compose.yml" >/dev/null 2>&1
 check "down removes it" "$("$B" ps -a | grep -c shop- || true)" "0"
 

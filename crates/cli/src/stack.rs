@@ -178,6 +178,9 @@ pub struct Service {
     /// As the `run` flags of the same names.
     #[serde(default)]
     pub privileged: bool,
+    /// `host`, or nothing.
+    #[serde(default)]
+    pub pid: Option<String>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]

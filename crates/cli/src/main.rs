@@ -264,6 +264,11 @@ struct RunArgs {
     #[arg(long, default_value = "bridge")]
     network: String,
 
+    /// `host` shares the host's process tree: the container sees, and
+    /// with the privileges to can signal, every process on the machine.
+    #[arg(long, value_parser = ["host"])]
+    pid: Option<String>,
+
     /// Hostname inside the container's UTS namespace.
     #[arg(long, default_value = "container")]
     hostname: String,
@@ -1660,6 +1665,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         // The runtime state directory is usually a tmpfs and sometimes an
         // overlayfs, and overlayfs cannot host an upperdir at all.
         private_net,
+        host_pid: args.pid.is_some(),
         bridge,
         network: network_def.clone(),
         userns,
@@ -2952,6 +2958,7 @@ fn stack_run(paths: &Paths, st: &stack::Stack, args: &StackRunArgs) -> Result<Ex
         platform: svc.platform.clone(),
         entrypoint: svc.entrypoint.clone(),
         privileged: svc.privileged,
+        pid: svc.pid.clone(),
         read_only: svc.read_only,
         cap_add: svc.cap_add.clone(),
         cap_drop: svc.cap_drop.clone(),
@@ -3180,6 +3187,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 platform: svc.platform.clone(),
                 entrypoint: svc.entrypoint.clone(),
                 privileged: svc.privileged,
+                pid: svc.pid.clone(),
                 read_only: svc.read_only,
                 cap_add: svc.cap_add.clone(),
                 cap_drop: svc.cap_drop.clone(),

@@ -191,6 +191,11 @@ pub struct Config {
     /// A network namespace of the container's own.
     #[serde(default)]
     pub private_net: bool,
+    /// Share the host's process tree instead of having one of its own:
+    /// `--pid host`. What a metrics exporter needs to see the host's
+    /// processes, and exactly as much exposure as that sounds like.
+    #[serde(default)]
+    pub host_pid: bool,
     /// Attach to the bridge and get an address. Implies `private_net`.
     #[serde(default)]
     pub bridge: bool,
@@ -324,6 +329,7 @@ impl Config {
             namespaces: Namespaces {
                 mount: self.rootfs.is_some(),
                 net: self.private_net || self.bridge,
+                pid: !self.host_pid,
                 user: self.userns,
                 ..Namespaces::STAGE1
             },
@@ -847,7 +853,19 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
                     let _ = out_log.write_all(bytes);
                 });
             }
-            None => pump(&out_r, &err_r, &spawned.pidfd, &mut out_log, &mut err_log)?,
+            None => pump(
+                &out_r,
+                &err_r,
+                &spawned.pidfd,
+                &mut out_log,
+                &mut err_log,
+                // Without a pid namespace nothing dies with init: what it
+                // started lives on, holding these pipes open, and the
+                // pump would wait on them for ever.
+                // ponytail: not done for a tty; `--pid host -t` with
+                // children that outlive init would need the same in relay.
+                cg.as_ref().filter(|_| config.host_pid),
+            )?,
         }
 
         // Drain and flush the logs BEFORE writing the terminal status. Writing
@@ -1074,6 +1092,7 @@ fn pump(
     pidfd: &OwnedFd,
     out_log: &mut StampedLog,
     err_log: &mut StampedLog,
+    kill_on_exit: Option<&Cgroup>,
 ) -> Result<(), Error> {
     let mut out_open = true;
     let mut err_open = true;
@@ -1114,6 +1133,9 @@ fn pump(
         }
         if !exited && !fds[i].revents().is_empty() {
             exited = true;
+            if let Some(c) = kill_on_exit {
+                let _ = c.kill_all();
+            }
             // Do NOT break here. The pipes may still hold output the
             // container wrote just before dying, and dropping it would make
             // a crash look like a silent exit.
@@ -1649,6 +1671,7 @@ mod tests {
             read_only: false,
             overlay_dir: None,
             private_net: false,
+            host_pid: false,
             bridge: false,
             ip: None,
             ports: Vec::new(),

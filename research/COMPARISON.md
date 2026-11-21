@@ -656,7 +656,7 @@ What is not, in two kinds. Keys that do not change whether the
 application works are dropped and **said to be** on stderr:
 `container_name`, `hostname`, `labels`, `logging`, `networks`,
 `stop_grace_period`, `init`, `oom_score_adj`, `cpu_shares` and a few
-more. Anything else - `pid`, `tmpfs`, `sysctls`, `ulimits`, `build.target`,
+more. Anything else - `ipc`, `tmpfs`, `sysctls`, `ulimits`, `build.target`,
 `depends_on` with `service_completed_successfully` - is refused by name
 before anything starts. Three differences in behaviour remain: several
 `-f` files replace a list where Compose appends to it; a service's
@@ -668,8 +668,16 @@ pass: a development stack of Postgres 16, Redis, MinIO and a one-shot
 bucket-creation job, written for Docker Compose across three files with
 `extends`, `!override` and anchors, came up unmodified, with
 Postgres accepting connections, Redis answering and the job finding
-MinIO by name. Of that project's seven Compose files, the largest is
-still refused, for `pid: host` on a metrics exporter.
+MinIO by name. The project's largest file was refused at first, for
+`pid: host` on a metrics exporter; `run --pid host` exists now, and
+that file parses. Only the development stack was brought up - the
+others want registry images and production secrets.
+
+`--pid host` had a consequence worth writing down. With no pid
+namespace nothing dies with the container's first process, so what it
+started lived on holding the log pipes, and `stop` waited five seconds
+on a supervisor that was waiting for them. The supervisor now kills the
+container's cgroup when that process exits.
 
 Getting there found three bugs in the engine, none of them about YAML:
 
