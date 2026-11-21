@@ -172,6 +172,12 @@ pub struct Service {
     /// `bridge` (the default), `none`, or `host`.
     #[serde(default)]
     pub network: Option<String>,
+    /// Another platform's build of the image, as `run --platform`.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// Host devices, as `run --device`.
+    #[serde(default)]
+    pub devices: Vec<String>,
 }
 
 /// `depends_on`, in either of the two shapes Compose accepts.
