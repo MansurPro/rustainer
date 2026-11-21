@@ -2936,6 +2936,8 @@ fn stack_run(paths: &Paths, st: &stack::Stack, args: &StackRunArgs) -> Result<Ex
         network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
         hostname: args.service.clone(),
         workdir: svc.workdir.clone(),
+        platform: svc.platform.clone(),
+        devices: svc.devices.clone(),
         volumes: {
             // A one-off gets the service's configs and secrets too: the
             // whole point of it is to be the service, with a different
@@ -3156,6 +3158,8 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
                 hostname: name.clone(),
                 workdir: svc.workdir.clone(),
+                platform: svc.platform.clone(),
+                devices: svc.devices.clone(),
                 volumes: {
                     // Configs and secrets are read-only binds, which is
                     // all they are anywhere - Compose mounts them the

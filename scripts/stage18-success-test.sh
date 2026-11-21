@@ -232,6 +232,7 @@ image = "$IMG"
 command = ["/bin/sleep", "\${SLEEP}"]
 env = ["DOTENV=\${FROM_DOTENV}", "OVERRIDE=\${OVERRIDE:-default-used}"]
 restart = "on-failure:2"
+devices = ["/dev/zero:/dev/myzero"]
 
 [services.built]
 build = "ctx"
@@ -263,6 +264,8 @@ contains "and a default filled in for what .env did not set" \
 check "the interpolated command is the one that ran" \
     "$(timeout 60 "$B" exec featstack-plain /bin/sh -c 'cat /proc/1/cmdline | tr "\0" " "' 2>&1 | tail -1)" \
     "/bin/sleep 400 "
+check "a device from the stack file is there" \
+    "$(timeout 60 "$B" exec featstack-plain /bin/sh -c 'test -c /dev/myzero && echo yes' 2>&1 | tail -1)" "yes"
 check "the built service runs the image the stack built" \
     "$(timeout 60 "$B" exec featstack-built /bin/cat /payload.txt 2>&1 | tail -1)" "built-in-a-stack"
 contains "the restart policy reached the container" \
