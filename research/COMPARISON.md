@@ -642,26 +642,29 @@ translation, not a second engine - the file becomes the same table a
 What is translated: `image`, `build` (context, `dockerfile`, `args`),
 `command` and `entrypoint` as a string or a list, `environment` as a
 list or a mapping, `env_file`, `ports` and `volumes` in short and long
-form, `depends_on` with `service_started` and `service_healthy`,
+form, `depends_on` with `service_started`, `service_healthy` and
+`service_completed_successfully`,
 `healthcheck` (`CMD`, `CMD-SHELL`, durations like `1m30s`), `restart`,
 `profiles`, `user`, `working_dir`, `mem_limit`, `cpus`, `pids_limit`,
 `privileged`, `read_only`, `cap_add`, `cap_drop`, `security_opt`,
-`devices`, `platform`, `network_mode`, `configs`, `secrets`,
+`devices`, `platform`, `network_mode`, `pid`, `tmpfs`, `extra_hosts`,
+`configs`, `secrets`,
 `deploy.replicas`, `deploy.resources.limits`, `develop.watch`,
 `extends` from the same file or another, YAML anchors and `<<`, the
 `!override` and `!reset` tags, and the shell's substitution forms
-(`${V-d}`, `${V:-d}`, `${V:?msg}`, `${V:+x}`).
+(`${V-d}`, `${V:-d}`, `${V:?msg}`, `${V:+x}`, and a bare `$V`). With
+no `-f`, `compose.yaml` and Compose's other three names are looked for
+after `rustainer.toml`.
 
 What is not, in two kinds. Keys that do not change whether the
 application works are dropped and **said to be** on stderr:
 `container_name`, `hostname`, `labels`, `logging`, `networks`,
 `stop_grace_period`, `init`, `oom_score_adj`, `cpu_shares` and a few
-more. Anything else - `ipc`, `tmpfs`, `sysctls`, `ulimits`, `build.target`,
-`depends_on` with `service_completed_successfully` - is refused by name
-before anything starts. Three differences in behaviour remain: several
-`-f` files replace a list where Compose appends to it; a service's
-containers are named `<stack>-<service>`, not `<project>-<service>-1`;
-and a bare `$VAR` without braces is not substituted.
+more. Anything else - `ipc`, `sysctls`, `ulimits`, `shm_size`, `build.target`
+- is refused by name before anything starts. Two differences in
+behaviour remain: several
+`-f` files replace a list where Compose appends to it, and a service's
+containers are named `<stack>-<service>`, not `<project>-<service>-1`.
 
 It was checked against a real project rather than a file written to
 pass: a development stack of Postgres 16, Redis, MinIO and a one-shot

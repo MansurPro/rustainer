@@ -722,13 +722,25 @@ services:
       test: ["CMD-SHELL", "test -f /ready"]
       interval: 1s
       retries: 20
+  job:
+    image: $IMG
+    command: sh -c "sleep 1; echo done > /shared/flag"
+    volumes:
+      - shopshared:/shared
   web:
     image: $IMG
     user: "1234"
-    command: ["/bin/sleep", "400"]
+    command: ["/bin/sh", "-c", "cat /shared/flag > /scratch/seen; sleep 400"]
+    volumes:
+      - shopshared:/shared
+    tmpfs: /scratch:size=1m
+    extra_hosts:
+      - "partner=10.9.8.7"
     depends_on:
       db:
         condition: service_healthy
+      job:
+        condition: service_completed_successfully
 EOF
 UPC=$(timeout 300 "$B" stack up -f "$C/compose.yml" 2>&1)
 contains "it comes up, named after its directory" "$UPC" "shop-web"
@@ -743,10 +755,38 @@ check "and from the file it extends" \
 # not root: mknod's mode used to be cut down by the caller's umask.
 check "a service's user can write to /dev/null" \
     "$(timeout 60 "$B" exec shop-web /bin/sh -c 'echo x > /dev/null && id -u' 2>&1 | tail -1)" "1234"
+# The job sleeps before it writes, and web reads the moment it starts:
+# web has what the job wrote only if `up` waited for the job to finish.
+check "a service waits for a job it depends on to complete" \
+    "$(timeout 60 "$B" exec shop-web /bin/cat /scratch/seen 2>&1 | tail -1)" "done"
+check "tmpfs is a tmpfs" \
+    "$(timeout 60 "$B" exec shop-web /bin/sh -c 'grep -c " /scratch tmpfs " /proc/mounts' 2>&1 | tail -1)" "1"
+contains "extra_hosts reaches /etc/hosts" \
+    "$(timeout 60 "$B" exec shop-web /bin/cat /etc/hosts 2>&1)" "partner"
+check "with no -f, a compose.yml in the directory is found" \
+    "$(cd "$C" && "$B" stack ps 2>/dev/null | grep -c shop-)" "3"
+cat > "$C/failing.yml" <<EOF
+name: failing
+services:
+  job:
+    image: $IMG
+    command: ["/bin/false"]
+  web:
+    image: $IMG
+    command: ["/bin/sleep", "400"]
+    depends_on:
+      job:
+        condition: service_completed_successfully
+EOF
+contains "a job that fails stops the stack there, and says why" \
+    "$(timeout 120 "$B" stack up -f "$C/failing.yml" 2>&1)" "had to complete"
+check "what depended on it was not started" "$("$B" ps -a | grep -c failing-web || true)" "0"
+timeout 60 "$B" stack down -t 0 -f "$C/failing.yml" >/dev/null 2>&1
 printf 'services:\n  a:\n    image: x\n    ipc: host\n' > "$C/bad.yml"
 refuses "a key that cannot be honoured is refused by name" '"ipc"' "$B" stack ps -f "$C/bad.yml"
 timeout 300 "$B" stack down -t 0 -f "$C/compose.yml" >/dev/null 2>&1
 check "down removes it" "$("$B" ps -a | grep -c shop- || true)" "0"
+"$B" volume rm shopshared >/dev/null 2>&1
 
 echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"

@@ -284,6 +284,12 @@ struct RunArgs {
     #[arg(short = 'v', long = "volume")]
     volumes: Vec<String>,
 
+    /// An empty in-memory filesystem at a path: `--tmpfs /run` or
+    /// `--tmpfs /tmp:size=64m,mode=1777`. Gone when the container is.
+    /// Repeatable.
+    #[arg(long = "tmpfs")]
+    tmpfs: Vec<String>,
+
     /// Give the container a host device: `--device /dev/fuse` or
     /// `--device /dev/sdb:/dev/xvdc`. Repeatable.
     #[arg(long = "device")]
@@ -945,7 +951,7 @@ struct StackArgs {
     /// key, which is what `-f base.toml -f prod.toml` means everywhere
     /// else. A list REPLACES rather than appends - appending would make
     /// an override that sets `command` run something nobody wrote.
-    #[arg(short = 'f', long, default_value = "rustainer.toml")]
+    #[arg(short = 'f', long, default_values_os_t = vec![default_stack_file()])]
     file: Vec<PathBuf>,
 
     /// Include the services in this profile. Repeatable.
@@ -959,7 +965,7 @@ struct StackArgs {
 #[derive(Args)]
 struct StackRunArgs {
     /// The stack file(s). Repeatable, later over earlier.
-    #[arg(short = 'f', long, default_value = "rustainer.toml")]
+    #[arg(short = 'f', long, default_values_os_t = vec![default_stack_file()])]
     file: Vec<PathBuf>,
 
     /// Include the services in this profile. Repeatable.
@@ -977,7 +983,7 @@ struct StackRunArgs {
 #[derive(Args)]
 struct StackDownArgs {
     /// The stack file(s). Repeatable, later over earlier, as with `up`.
-    #[arg(short = 'f', long, default_value = "rustainer.toml")]
+    #[arg(short = 'f', long, default_values_os_t = vec![default_stack_file()])]
     file: Vec<PathBuf>,
 
     /// Include the services in this profile. Repeatable.
@@ -1601,6 +1607,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .iter()
         .map(|v| parse_volume(v))
         .chain(args.devices.iter().map(|d| parse_device(d)))
+        .chain(args.tmpfs.iter().map(|t| parse_tmpfs(t)))
         .collect::<Result<Vec<_>>>()?;
 
     let (restart_policy, restart_max) = supervise::RestartPolicy::parse(&args.restart)
@@ -2497,6 +2504,45 @@ fn parse_volume(spec: &str) -> Result<rustainer_core::mount::VolumeMount> {
         target: dst.trim_end_matches('/').to_owned(),
         read_only,
         is_file,
+        tmpfs: None,
+    })
+}
+
+/// `--tmpfs /path[:options]`. Docker's options, the ones that mean
+/// something to a tmpfs; anything else is refused rather than passed to
+/// the kernel to be refused there with EINVAL and no word about which.
+fn parse_tmpfs(spec: &str) -> Result<rustainer_core::mount::VolumeMount> {
+    let (target, opts) = spec.split_once(':').unwrap_or((spec, ""));
+    if !target.starts_with('/') || target.trim_end_matches('/').is_empty() {
+        bail!("--tmpfs {spec:?}: the path must be absolute, and not `/`");
+    }
+    if target.split('/').any(|c| c == "..") {
+        bail!("--tmpfs {spec:?}: the path may not contain `..`");
+    }
+    let mut exec = false;
+    let mut data = Vec::new();
+    for o in opts.split(',').filter(|o| !o.is_empty()) {
+        match o {
+            "exec" => exec = true,
+            "rw" | "noexec" | "nosuid" | "nodev" => {}
+            o if ["size=", "mode=", "uid=", "gid="]
+                .iter()
+                .any(|p| o.starts_with(p)) =>
+            {
+                data.push(o)
+            }
+            other => bail!("--tmpfs {spec:?}: {other:?} is not an option this takes"),
+        }
+    }
+    Ok(rustainer_core::mount::VolumeMount {
+        source: PathBuf::from("tmpfs"),
+        target: target.trim_end_matches('/').to_owned(),
+        read_only: false,
+        is_file: false,
+        tmpfs: Some(rustainer_core::mount::TmpfsMount {
+            options: data.join(","),
+            exec,
+        }),
     })
 }
 
@@ -2537,6 +2583,23 @@ fn shellexpand_home(s: &str) -> String {
 pub(crate) fn supervise_restart_check(spec: &str) -> Result<()> {
     supervise::RestartPolicy::parse(spec).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+/// With no `-f`: `rustainer.toml`, and failing that the names Compose
+/// looks for, in the order it looks for them.
+fn default_stack_file() -> PathBuf {
+    const NAMES: [&str; 5] = [
+        "rustainer.toml",
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.yml",
+    ];
+    NAMES
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(NAMES[0]))
 }
 
 fn read_stack(files: &[PathBuf], profiles: &[String]) -> Result<stack::Stack> {
@@ -2959,6 +3022,7 @@ fn stack_run(paths: &Paths, st: &stack::Stack, args: &StackRunArgs) -> Result<Ex
         entrypoint: svc.entrypoint.clone(),
         privileged: svc.privileged,
         pid: svc.pid.clone(),
+        tmpfs: svc.tmpfs.clone(),
         read_only: svc.read_only,
         cap_add: svc.cap_add.clone(),
         cap_drop: svc.cap_drop.clone(),
@@ -2985,7 +3049,10 @@ fn stack_run(paths: &Paths, st: &stack::Stack, args: &StackRunArgs) -> Result<Ex
             }
             v
         },
-        add_host,
+        add_host: add_host
+            .into_iter()
+            .chain(svc.extra_hosts.iter().cloned())
+            .collect(),
         stack_name: Some(st.name.clone()),
         service_name: Some(args.service.clone()),
         memory: svc.memory.clone(),
@@ -3188,6 +3255,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 entrypoint: svc.entrypoint.clone(),
                 privileged: svc.privileged,
                 pid: svc.pid.clone(),
+                tmpfs: svc.tmpfs.clone(),
                 read_only: svc.read_only,
                 cap_add: svc.cap_add.clone(),
                 cap_drop: svc.cap_drop.clone(),
@@ -3214,6 +3282,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                     .iter()
                     .filter(|(n, _)| n != name && *n != id)
                     .map(|(n, ip)| format!("{n}:{ip}"))
+                    .chain(svc.extra_hosts.iter().cloned())
                     .collect(),
                 ip: address.get(&id).cloned(),
                 stack_name: Some(st.name.clone()),
@@ -3245,6 +3314,34 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 .any(|(_, other)| other.depends_on.wants_healthy(name));
             if waited_on && let Some(h) = &svc.healthcheck {
                 wait_until_healthy(paths, &id, name, h)?;
+            }
+            // A job something waits on - a migration, a bucket to make -
+            // has to have finished, and finished well, before the next
+            // service starts. Compose waits as long as it takes and so
+            // does this: a bound here would be a guess about somebody
+            // else's migration.
+            if st
+                .services
+                .iter()
+                .any(|(_, other)| other.depends_on.wants_completed(name))
+            {
+                loop {
+                    let state = State::load(paths, &id).with_context(|| format!("reading {id}"))?;
+                    if !matches!(state.observed_status(), Status::Running | Status::Created) {
+                        if state.exit_code != Some(0) {
+                            bail!(
+                                "service {name:?} had to complete before what depends on it \
+                                 could start, and it exited with {}. `rustainer logs {id}` \
+                                 has its output.",
+                                state
+                                    .exit_code
+                                    .map_or("a signal".into(), |c| format!("status {c}"))
+                            );
+                        }
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
             // And then a watcher, for every service that defines a
             // healthcheck rather than only those something waits on.

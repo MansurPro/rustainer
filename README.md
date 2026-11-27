@@ -602,6 +602,7 @@ rustainer stack up    -f base.toml -f prod.toml   # later wins, key by key
 rustainer stack run   -f examples/rustainer.toml db /bin/sh   # one-off
 rustainer stack watch -f examples/rustainer.toml   # rebuild on change
 rustainer stack up    -f docker-compose.yml       # a Compose file, translated
+rustainer stack up                              # rustainer.toml, else compose.yaml
 ```
 
 ```toml
@@ -940,6 +941,7 @@ registered (Docker Desktop's VM does):
     rustainer run --platform linux/amd64 alpine uname -m     # x86_64
 rustainer run --device /dev/fuse alpine ls -l /dev/fuse
 rustainer run --pid host alpine ps            # the host's processes
+rustainer run --tmpfs /scratch:size=64m alpine df -h /scratch
 
 **The test is a round trip**: build, push, pull into a *clean* store, run.
 Anything less proves the request succeeded, not that the right bytes

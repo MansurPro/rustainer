@@ -448,6 +448,21 @@ pub struct VolumeMount {
     /// Bind a file rather than a directory. Decided by the caller, which
     /// can stat the source; the child cannot.
     pub is_file: bool,
+    /// Not a bind at all: a fresh tmpfs at `target`, with these mount
+    /// options (`size=64m,mode=1777`). `source` is then unused. Kept
+    /// here rather than in a list of its own because everything a volume
+    /// needs - the mount point made above the overlay, the user's order
+    /// - a tmpfs needs too.
+    #[serde(default)]
+    pub tmpfs: Option<TmpfsMount>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TmpfsMount {
+    /// The data string: `size=`, `mode=`, `uid=`, `gid=`.
+    pub options: String,
+    /// Docker's `--tmpfs` is noexec unless told `exec`.
+    pub exec: bool,
 }
 
 pub fn plan(
@@ -927,6 +942,27 @@ pub fn plan(
             // It is also why `:ro` below has to be recursive: a plain
             // read-only remount would leave every one of those submounts
             // writable, which is the same trap /sys hit at stage 2.
+            if let Some(t) = &v.tmpfs {
+                let mut flags = sys::MountFlags::NOSUID | sys::MountFlags::NODEV;
+                if !t.exec {
+                    flags |= sys::MountFlags::NOEXEC;
+                }
+                push(
+                    Op::Mount {
+                        source: CString::new("tmpfs").unwrap(),
+                        target: target.clone(),
+                        fstype: CString::new("tmpfs").unwrap(),
+                        flags,
+                        data: Some(
+                            CString::new(t.options.as_str())
+                                .map_err(|_| PlanError::NotADirectory(t.options.clone().into()))?,
+                        ),
+                    },
+                    false,
+                    "mounting a tmpfs",
+                );
+                continue;
+            }
             push(
                 Op::RecursiveBind {
                     source: cstr(&v.source)?,

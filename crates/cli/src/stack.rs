@@ -181,6 +181,13 @@ pub struct Service {
     /// `host`, or nothing.
     #[serde(default)]
     pub pid: Option<String>,
+    /// `name:address` lines for the container's `/etc/hosts`, as
+    /// `run --add-host`.
+    #[serde(default)]
+    pub extra_hosts: Vec<String>,
+    /// `/path` or `/path:size=64m`, as `run --tmpfs`.
+    #[serde(default)]
+    pub tmpfs: Vec<String>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
@@ -241,14 +248,24 @@ impl DependsOn {
         }
     }
 
+    /// Does this dependency have to have RUN AND EXITED 0 - a migration,
+    /// a bucket to create - before this service starts?
+    pub fn wants_completed(&self, dep: &str) -> bool {
+        match self {
+            DependsOn::Names(_) => false,
+            DependsOn::Conditions(m) => m.get(dep).map(String::as_str) == Some("completed"),
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         if let DependsOn::Conditions(m) = self {
             for (name, cond) in m {
-                if cond != "started" && cond != "healthy" {
+                if cond != "started" && cond != "healthy" && cond != "completed" {
                     bail!(
                         "{cond:?} is not a condition for {name:?}. Use \"started\" \
-                         (the default) or \"healthy\", which waits for that \
-                         service's healthcheck to pass."
+                         (the default), \"healthy\", which waits for that \
+                         service's healthcheck to pass, or \"completed\", which \
+                         waits for it to exit with status 0."
                     );
                 }
             }
@@ -713,6 +730,23 @@ impl Stack {
                 }
                 i = end + 1;
                 continue;
+            }
+            // `$VAR` with no braces, which Compose substitutes and a
+            // stack file does not: in TOML a dollar sign followed by a
+            // word is far more likely to be a price or a regex.
+            if compose && b[i] == b'$' {
+                let end = text[i + 1..]
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .map_or(text.len(), |e| i + 1 + e);
+                let name = &text[i + 1..end];
+                if name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                    match vars.get(name) {
+                        Some(v) => out.push_str(v),
+                        None => eprintln!("rustainer: {name} is not set; using an empty string"),
+                    }
+                    i = end;
+                    continue;
+                }
             }
             let ch = text[i..].chars().next().unwrap();
             out.push(ch);
