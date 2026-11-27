@@ -17,10 +17,8 @@
 //!
 //! # What is deliberately not here
 //!
-//! No parallelism, no content-addressed build cache keyed on
-//! instructions, no multi-stage `--from`. BuildKit is those three things
-//! and they are each a project. A cache that is wrong is worse than no
-//! cache, and `--from` needs a graph where this has a list.
+//! No parallelism: stages are built in the order the file lists them,
+//! every one up to the target, whether or not the target uses it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,6 +29,7 @@ use crate::dockerfile::Instruction;
 
 /// What the build accumulates: layers on disk, and the config that will
 /// describe them.
+#[derive(Clone, Default)]
 pub struct Built {
     pub layers: Vec<PathBuf>,
     pub diff_ids: Vec<String>,
@@ -220,14 +219,265 @@ pub fn resolve_source(context: &Path, source: &str) -> Result<PathBuf> {
     Ok(canon)
 }
 
-/// Copy a file or directory tree into `dest`, preserving modes.
-pub fn copy_into(src: &Path, dest: &Path) -> Result<()> {
-    let md = std::fs::symlink_metadata(src)?;
+/// `*` and `?` inside a name, `**` across names. What `COPY` sources
+/// and `.dockerignore` lines are written in.
+pub fn glob(pattern: &str, path: &str) -> bool {
+    fn name(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => name(&p[1..], s) || (!s.is_empty() && name(p, &s[1..])),
+            (Some(b'?'), Some(_)) => name(&p[1..], &s[1..]),
+            (Some(a), Some(b)) if a == b => name(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    fn parts(p: &[&str], s: &[&str]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(&"**"), _) => parts(&p[1..], s) || (!s.is_empty() && parts(p, &s[1..])),
+            (Some(a), Some(b)) => name(a.as_bytes(), b.as_bytes()) && parts(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    let split = |x: &'_ str| -> Vec<String> {
+        x.split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .map(str::to_owned)
+            .collect()
+    };
+    let (p, s) = (split(pattern), split(path));
+    parts(
+        &p.iter().map(String::as_str).collect::<Vec<_>>(),
+        &s.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+}
+
+/// The context's `.dockerignore`: what a `COPY` leaves behind.
+///
+/// A line names a path or anything beneath it, the last line that
+/// matches decides, and `!` turns a line into "keep this after all".
+pub struct Ignore {
+    root: PathBuf,
+    rules: Vec<(bool, String)>,
+}
+
+impl Ignore {
+    pub fn load(context: &Path) -> Self {
+        let text = std::fs::read_to_string(context.join(".dockerignore")).unwrap_or_default();
+        let rules = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| match l.strip_prefix('!') {
+                Some(keep) => (true, keep.trim().to_owned()),
+                None => (false, l.to_owned()),
+            })
+            .collect();
+        Self {
+            root: context.to_path_buf(),
+            rules,
+        }
+    }
+
+    fn keeps_something(&self) -> bool {
+        self.rules.iter().any(|(keep, _)| *keep)
+    }
+
+    pub fn skips(&self, path: &Path) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let rel = rel.to_string_lossy();
+        let mut skipped = false;
+        for (keep, pattern) in &self.rules {
+            // The path itself or any directory above it.
+            let hit = rel
+                .match_indices('/')
+                .map(|(i, _)| &rel[..i])
+                .chain([&rel[..]])
+                .any(|prefix| glob(pattern, prefix));
+            if hit {
+                skipped = !keep;
+            }
+        }
+        skipped
+    }
+}
+
+/// The context paths a `COPY` source names: one, or every match of a
+/// wildcard such as `package*.json`.
+pub fn sources(context: &Path, source: &str) -> Result<Vec<PathBuf>> {
+    if !source.contains(['*', '?']) {
+        return Ok(vec![resolve_source(context, source)?]);
+    }
+    let mut found = vec![context.to_path_buf()];
+    for part in source.split('/').filter(|c| !c.is_empty() && *c != ".") {
+        let mut next = Vec::new();
+        for dir in &found {
+            if !part.contains(['*', '?']) {
+                next.push(dir.join(part));
+                continue;
+            }
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                if glob(part, &e.file_name().to_string_lossy()) {
+                    next.push(e.path());
+                }
+            }
+        }
+        found = next;
+    }
+    found.retain(|p| p.symlink_metadata().is_ok());
+    found.sort();
+    if found.is_empty() {
+        bail!("{source:?} matches nothing in the build context");
+    }
+    found
+        .iter()
+        .map(|p| resolve_source(context, &p.strip_prefix(context).unwrap().to_string_lossy()))
+        .collect()
+}
+
+/// What a stack of layers (bottom first) shows at `rel`: the
+/// directories that merge there, top first, or the one file that wins.
+/// Empty when nothing is there, which includes "deleted by a layer
+/// above".
+fn visible(layers: &[PathBuf], rel: &Path) -> Vec<PathBuf> {
+    let parts: Vec<_> = rel.components().collect();
+    let mut out: Vec<PathBuf> = Vec::new();
+    'layers: for layer in layers.iter().rev() {
+        let mut p = layer.clone();
+        let mut opaque = false;
+        let mut missing = false;
+        let mut is_dir = true;
+        for (i, c) in parts.iter().enumerate() {
+            p.push(c);
+            let Ok(md) = std::fs::symlink_metadata(&p) else {
+                missing = true;
+                break;
+            };
+            if is_whiteout_device(&md) {
+                break 'layers;
+            }
+            is_dir = md.is_dir();
+            if !is_dir && i + 1 != parts.len() {
+                // A file where the path needs a directory hides
+                // whatever the layers below had under that name.
+                break 'layers;
+            }
+            opaque |= is_dir && is_opaque(&p);
+        }
+        if !missing {
+            if !is_dir && !out.is_empty() {
+                break;
+            }
+            out.push(p);
+            if !is_dir {
+                break;
+            }
+        }
+        if opaque {
+            break;
+        }
+    }
+    out
+}
+
+/// The paths in a stack of layers that a `COPY --from` source names.
+// ponytail: a wildcard is honoured in the last name only, which is where
+// people put one (`/lib/ld-musl-*`); walk every level if that changes.
+pub fn sources_in(layers: &[PathBuf], source: &str) -> Result<Vec<PathBuf>> {
+    let rel = PathBuf::from(source.trim_start_matches('/'));
+    let pattern = rel.file_name().map(|n| n.to_string_lossy().into_owned());
+    let Some(pattern) = pattern.filter(|p| p.contains(['*', '?'])) else {
+        return Ok(vec![rel]);
+    };
+    let parent = rel.parent().unwrap_or(Path::new(""));
+    let mut names = std::collections::BTreeSet::new();
+    for dir in visible(layers, parent) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            names.insert(e.file_name());
+        }
+    }
+    let found: Vec<PathBuf> = names
+        .iter()
+        .filter(|n| glob(&pattern, &n.to_string_lossy()))
+        .map(|n| parent.join(n))
+        .filter(|p| exists_in(layers, p))
+        .collect();
+    if found.is_empty() {
+        bail!("{source:?} matches nothing in what it is copied from");
+    }
+    Ok(found)
+}
+
+/// Whether a container over these layers would find anything at `rel`.
+pub fn exists_in(layers: &[PathBuf], rel: &Path) -> bool {
+    !visible(layers, rel).is_empty()
+}
+
+/// Whether what it would find there is a directory.
+pub fn is_dir_in(layers: &[PathBuf], rel: &Path) -> bool {
+    visible(layers, rel)
+        .first()
+        .is_some_and(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+}
+
+/// Copy `rel` out of a stack of layers as a container over them would
+/// see it: `COPY --from`.
+///
+/// Read in user space rather than by mounting the overlay, because the
+/// build's own process may be an unprivileged user who cannot mount one.
+// ponytail: one walk of the layer stack per entry, and a symlink in the
+// middle of the source path is not followed. Mount the overlay in a
+// helper container if a `COPY --from` of a huge tree is ever slow.
+pub fn copy_merged(layers: &[PathBuf], rel: &Path, dest: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let found = visible(layers, rel);
+    let Some(top) = found.first() else {
+        bail!("/{} is not in what it is copied from", rel.display());
+    };
+    let md = std::fs::symlink_metadata(top)?;
     if md.is_dir() {
         std::fs::create_dir_all(dest)?;
+        let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(md.mode()));
+        let mut names = std::collections::BTreeSet::new();
+        for dir in &found {
+            for e in std::fs::read_dir(dir)? {
+                names.insert(e?.file_name());
+            }
+        }
+        for n in names {
+            let child = rel.join(&n);
+            if !visible(layers, &child).is_empty() {
+                copy_merged(layers, &child, &dest.join(&n))?;
+            }
+        }
+    } else {
+        copy_into(top, dest, None)?;
+    }
+    // The owner comes along, as Docker's does; without the privilege to
+    // set it, it is whoever is building.
+    let _ = std::os::unix::fs::lchown(dest, Some(md.uid()), Some(md.gid()));
+    Ok(())
+}
+
+/// Copy a file or directory tree into `dest`, preserving modes and
+/// leaving out what `ignore` names.
+pub fn copy_into(src: &Path, dest: &Path, ignore: Option<&Ignore>) -> Result<()> {
+    let md = std::fs::symlink_metadata(src)?;
+    let skipped = ignore.is_some_and(|i| i.skips(src));
+    // A skipped directory is still walked when some line says `!keep`:
+    // the thing to keep may be inside it.
+    if skipped && !(md.is_dir() && ignore.is_some_and(Ignore::keeps_something)) {
+        return Ok(());
+    }
+    if md.is_dir() {
+        if !skipped {
+            std::fs::create_dir_all(dest)?;
+        }
         for e in std::fs::read_dir(src)? {
             let e = e?;
-            copy_into(&e.path(), &dest.join(e.file_name()))?;
+            copy_into(&e.path(), &dest.join(e.file_name()), ignore)?;
         }
         return Ok(());
     }
@@ -276,8 +526,16 @@ pub fn describe(i: &Instruction) -> String {
     match i {
         Instruction::From { image, .. } => format!("FROM {image}"),
         Instruction::Run(argv) => format!("RUN {}", argv.join(" ")),
-        Instruction::Copy { sources, dest, .. } => {
-            format!("COPY {} {dest}", sources.join(" "))
+        Instruction::Copy {
+            sources,
+            dest,
+            from,
+        } => {
+            let from = from
+                .as_ref()
+                .map(|f| format!("--from={f} "))
+                .unwrap_or_default();
+            format!("COPY {from}{} {dest}", sources.join(" "))
         }
         Instruction::Env(k, v) => format!("ENV {k}={v}"),
         Instruction::Workdir(w) => format!("WORKDIR {w}"),
@@ -305,6 +563,68 @@ mod tests {
         unsafe { std::env::set_var("RUSTAINER_BUILD_TEST", "leaked") };
         assert_eq!(expand("$RUSTAINER_BUILD_TEST", &vars), "");
         assert_eq!(expand("100$ and ${UNSET}x", &vars), "100$ and x");
+    }
+
+    #[test]
+    fn globs_and_dockerignore() {
+        assert!(glob("package*.json", "package-lock.json"));
+        assert!(!glob("package*.json", "sub/package.json"));
+        assert!(glob("**/*.log", "a/b/c.log"));
+        assert!(glob("**/*.log", "c.log"));
+        assert!(!glob("a?", "a"));
+
+        let dir = std::env::temp_dir().join(format!("rustainer-ign-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("node_modules/keep")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join(".dockerignore"),
+            "# c\nnode_modules\n!node_modules/keep\n*.log\n",
+        )
+        .unwrap();
+        for f in [
+            "node_modules/x.js",
+            "node_modules/keep/k.js",
+            "src/a.rs",
+            "b.log",
+        ] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let out = dir.join("out");
+        let ig = Ignore::load(&dir);
+        for name in ["node_modules", "src", "b.log"] {
+            copy_into(&dir.join(name), &out.join(name), Some(&ig)).unwrap();
+        }
+        assert!(out.join("src/a.rs").exists());
+        assert!(out.join("node_modules/keep/k.js").exists());
+        assert!(!out.join("node_modules/x.js").exists());
+        assert!(!out.join("b.log").exists());
+        assert_eq!(sources(&dir, "s*").unwrap().len(), 1);
+        assert!(sources(&dir, "nothing*").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_copy_from_layers_sees_what_a_container_would() {
+        let dir = std::env::temp_dir().join(format!("rustainer-merged-{}", std::process::id()));
+        let (low, high) = (dir.join("low"), dir.join("high"));
+        std::fs::create_dir_all(low.join("app/sub")).unwrap();
+        std::fs::create_dir_all(high.join("app")).unwrap();
+        std::fs::write(low.join("app/old"), "old").unwrap();
+        std::fs::write(low.join("app/both"), "low").unwrap();
+        std::fs::write(low.join("app/sub/deep"), "deep").unwrap();
+        std::fs::write(high.join("app/both"), "high").unwrap();
+        std::fs::write(high.join("app/new"), "new").unwrap();
+        let out = dir.join("out");
+        copy_merged(&[low, high], Path::new("app"), &out).unwrap();
+        assert_eq!(std::fs::read_to_string(out.join("both")).unwrap(), "high");
+        assert_eq!(std::fs::read_to_string(out.join("old")).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(out.join("new")).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(out.join("sub/deep")).unwrap(),
+            "deep"
+        );
+        assert!(copy_merged(&[dir.join("low")], Path::new("nope"), &out).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

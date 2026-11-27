@@ -1050,6 +1050,11 @@ struct BuildArgs {
     #[arg(long)]
     no_cache: bool,
 
+    /// Stop at this stage of a multi-stage Dockerfile and tag it: the
+    /// name after `AS`, or the stage's number counting from 0.
+    #[arg(long)]
+    target: Option<String>,
+
     /// The build context: the directory COPY may read from.
     #[arg(default_value = ".")]
     context: PathBuf,
@@ -3106,6 +3111,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 build_args: svc.build_args.clone(),
                 network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
                 no_cache: false,
+                target: svc.target.clone(),
                 context,
             },
         )
@@ -4503,7 +4509,27 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
         .unwrap_or_else(|| context.join("Dockerfile"));
     let text =
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
-    let instructions = crate::dockerfile::parse(&text)?;
+    let mut instructions = crate::dockerfile::parse(&text)?;
+    if let Some(target) = &args.target {
+        // The file up to the end of the target stage is the whole build.
+        let starts: Vec<(usize, Option<&String>)> = instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ins)| match ins {
+                Instruction::From { alias, .. } => Some((i, alias.as_ref())),
+                _ => None,
+            })
+            .collect();
+        let at = starts
+            .iter()
+            .position(|(_, a)| a.is_some_and(|a| a.eq_ignore_ascii_case(target)))
+            .or_else(|| target.parse().ok().filter(|n| *n < starts.len()))
+            .with_context(|| format!("{} has no stage {target:?}", file.display()))?;
+        if let Some((end, _)) = starts.get(at + 1) {
+            instructions.truncate(*end);
+        }
+    }
+    let ignore = build::Ignore::load(&context);
 
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
     for a in &args.build_args {
@@ -4513,18 +4539,38 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
         vars.insert(k.to_owned(), v.to_owned());
     }
 
+    // What ARG and --build-arg define outlives a stage; what ENV defines
+    // does not, so each FROM starts again from this.
+    // ponytail: an ARG declared inside one stage is visible in the ones
+    // after it too, where Docker wants it declared again.
+    let mut arg_vars = vars.clone();
+
     let store = Store::new(Store::default_root());
-    let mut built = build::Built {
-        layers: Vec::new(),
-        diff_ids: Vec::new(),
-        env: Vec::new(),
-        workdir: None,
-        user: None,
-        cmd: Vec::new(),
-        entrypoint: Vec::new(),
-        labels: BTreeMap::new(),
-        exposed: Vec::new(),
+    let mut built = build::Built::default();
+    /// A stage that has finished, kept for a later `FROM <name>` or
+    /// `COPY --from=<name>`.
+    #[derive(Clone, Default)]
+    struct Stage {
+        alias: Option<String>,
+        built: build::Built,
+        sealed: Vec<(String, PathBuf, Vec<u8>)>,
+        base_diff_ids: Vec<String>,
+        base_descriptors: Vec<rustainer_image::registry::Descriptor>,
+        chain: String,
+    }
+    let mut stages: Vec<Stage> = Vec::new();
+    let find_stage = |stages: &[Stage], name: &str| {
+        stages
+            .iter()
+            .position(|s| {
+                s.alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(name))
+            })
+            .or_else(|| name.parse().ok().filter(|n| *n < stages.len()))
     };
+    let mut alias_now: Option<String> = None;
+    let mut started = false;
     // Layers are sealed as they are produced, and their tars kept, so the
     // image can be pushed later without rebuilding it.
     let mut sealed: Vec<(String, PathBuf, Vec<u8>)> = Vec::new();
@@ -4559,29 +4605,51 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
             Instruction::Arg(k, default) => {
                 // A --build-arg wins over the file's default, which is the
                 // point of having a default.
-                if !vars.contains_key(k)
+                if !arg_vars.contains_key(k)
                     && let Some(d) = default
                 {
-                    vars.insert(k.clone(), d.clone());
+                    let d = build::expand(d, &vars);
+                    arg_vars.insert(k.clone(), d);
+                }
+                if let Some(v) = arg_vars.get(k) {
+                    vars.entry(k.clone()).or_insert_with(|| v.clone());
                 }
             }
-            Instruction::From { image, .. } => {
-                if !built.layers.is_empty() {
-                    cleanup_staging();
-                    bail!(
-                        "a second FROM starts a new build stage, which is not \
-                         implemented. Multi-stage builds need a graph where this \
-                         has a list; build the stages separately and COPY between \
-                         images instead."
-                    );
+            Instruction::From { image, alias } => {
+                if started {
+                    stages.push(Stage {
+                        alias: alias_now.take(),
+                        built: std::mem::take(&mut built),
+                        sealed: std::mem::take(&mut sealed),
+                        base_diff_ids: std::mem::take(&mut base_diff_ids),
+                        base_descriptors: std::mem::take(&mut base_descriptors),
+                        chain: std::mem::take(&mut chain),
+                    });
                 }
+                started = true;
+                alias_now = alias.clone();
+                vars = arg_vars.clone();
                 let reference = build::expand(image, &vars);
+                if let Some(i) = find_stage(&stages, &reference) {
+                    // A stage built on an earlier one carries on exactly
+                    // where that one stopped.
+                    let s = stages[i].clone();
+                    (built, sealed, chain) = (s.built, s.sealed, s.chain);
+                    (base_diff_ids, base_descriptors) = (s.base_diff_ids, s.base_descriptors);
+                    continue;
+                }
+                if reference == "scratch" {
+                    // No base at all: the image is only what is copied in.
+                    chain = hash(&["from", "scratch"]);
+                    continue;
+                }
                 let base = match store.local(&reference) {
                     Some(i) => i,
                     None => store
                         .pull(&reference, false)
                         .with_context(|| format!("pulling the base image {reference}"))?,
                 };
+                built = build::Built::default();
                 built.layers = base.layers.clone();
                 base_diff_ids = base.diff_ids.clone();
                 base_descriptors = store
@@ -4595,7 +4663,6 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                          with `rustainer pull {reference} --force`."
                     );
                 }
-                built.diff_ids = Vec::new();
                 built.env = base.env.clone();
                 built.workdir = base.working_dir.clone();
                 built.user = base.user.clone();
@@ -4615,7 +4682,33 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
             Instruction::Label(k, v) => {
                 built.labels.insert(k.clone(), build::expand(v, &vars));
             }
-            Instruction::Workdir(w) => built.workdir = Some(build::expand(w, &vars)),
+            Instruction::Workdir(w) => {
+                // Relative to the one before, and made if the image has
+                // no such directory: a WORKDIR is somewhere the next
+                // step can stand.
+                let w = build::expand(w, &vars);
+                let w = if w.starts_with('/') {
+                    w
+                } else {
+                    format!(
+                        "{}/{w}",
+                        built.workdir.as_deref().unwrap_or("").trim_end_matches('/')
+                    )
+                };
+                let rel = Path::new(w.trim_start_matches('/'));
+                if !build::exists_in(&built.layers, rel) {
+                    let layer_dir = staging.join(format!("layer{n}"));
+                    std::fs::create_dir_all(layer_dir.join(rel))?;
+                    build::settle_directory_times(&layer_dir);
+                    let (diff_id, tar) = build::seal_layer(&layer_dir)?;
+                    chain = hash(&[&chain, "workdir", &diff_id]);
+                    let layer_dir = store.commit_layer(&diff_id, &layer_dir)?;
+                    built.layers.push(layer_dir.clone());
+                    built.diff_ids.push(diff_id.clone());
+                    sealed.push((diff_id, layer_dir, tar));
+                }
+                built.workdir = Some(w);
+            }
             Instruction::User(u) => built.user = Some(build::expand(u, &vars)),
             Instruction::Expose(p) => built.exposed.push(build::expand(p, &vars)),
             Instruction::Cmd(c) => {
@@ -4629,31 +4722,66 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 dest,
                 from,
             } => {
-                if from.is_some() {
-                    cleanup_staging();
-                    bail!("COPY --from needs multi-stage builds, which are not implemented");
-                }
+                // `--from` reads an earlier stage, or any image, where a
+                // plain COPY reads the context.
+                let from_layers = match from {
+                    None => None,
+                    Some(f) => {
+                        let f = build::expand(f, &vars);
+                        Some(match find_stage(&stages, &f) {
+                            Some(i) => stages[i].built.layers.clone(),
+                            None => match store.local(&f) {
+                                Some(i) => i.layers,
+                                None => {
+                                    store
+                                        .pull(&f, false)
+                                        .with_context(|| format!("pulling {f} for COPY --from"))?
+                                        .layers
+                                }
+                            },
+                        })
+                    }
+                };
+                // A destination that is not absolute is inside WORKDIR.
                 let dest = build::expand(dest, &vars);
+                let dest = if dest.starts_with('/') {
+                    dest
+                } else {
+                    format!("{}/{dest}", built.workdir.as_deref().unwrap_or(""))
+                };
+                // Through `components` so `/app/.` is `app`: a trailing
+                // `.` names a directory that cannot be created.
+                let rel: PathBuf = Path::new(dest.trim_start_matches('/'))
+                    .components()
+                    .collect();
                 let layer_dir = staging.join(format!("layer{n}"));
                 std::fs::create_dir_all(&layer_dir)?;
-                // A trailing slash means "into this directory", exactly as
-                // `cp` reads it, and several sources always do.
-                let into_dir = dest.ends_with('/') || sources.len() > 1;
+                let mut found: Vec<PathBuf> = Vec::new();
                 for src in sources {
                     let src = build::expand(src, &vars);
-                    let from_path = build::resolve_source(&context, &src)?;
-                    let rel = dest.trim_start_matches('/');
-                    let target = if into_dir {
-                        layer_dir.join(rel).join(
-                            from_path
-                                .file_name()
-                                .ok_or_else(|| anyhow::anyhow!("{src:?} has no name"))?,
-                        )
-                    } else {
-                        layer_dir.join(rel)
+                    match &from_layers {
+                        Some(layers) => found.extend(build::sources_in(layers, &src)?),
+                        None => found.extend(build::sources(&context, &src)?),
+                    }
+                }
+                // A trailing slash means "into this directory", exactly as
+                // `cp` reads it, and several sources always do. A source
+                // that is a directory gives its contents, not itself.
+                let into_dir = dest.ends_with('/') || dest.ends_with("/.") || found.len() > 1;
+                for src in &found {
+                    let is_dir = match &from_layers {
+                        Some(layers) => build::is_dir_in(layers, src),
+                        None => src.is_dir(),
                     };
-                    build::copy_into(&from_path, &target)
-                        .with_context(|| format!("copying {src} into the image"))?;
+                    let target = match src.file_name() {
+                        Some(name) if into_dir && !is_dir => layer_dir.join(&rel).join(name),
+                        _ => layer_dir.join(&rel),
+                    };
+                    match &from_layers {
+                        Some(layers) => build::copy_merged(layers, src, &target),
+                        None => build::copy_into(src, &target, Some(&ignore)),
+                    }
+                    .with_context(|| format!("copying {} into the image", src.display()))?;
                 }
                 // A COPY is not looked up - doing it is as cheap as
                 // checking - but what it copied is part of the identity

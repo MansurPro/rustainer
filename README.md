@@ -848,6 +848,7 @@ and asserts that not one row was spliced.
 rustainer build -t myapp:1 .
 rustainer build -t myapp:1 --build-arg VERSION=3.21 -f ./Dockerfile .
 rustainer build -t myapp:1 --network none .      # hermetic, and rootless
+rustainer build -t myapp:test --target test .    # stop at a stage
 ```
 
 **A build step that changes the filesystem is a container run on the
@@ -894,10 +895,22 @@ layer sharing entirely.
   produce a different image on every machine, which is the one thing a
   Dockerfile exists to prevent.
 
-What is deliberately absent: no parallelism, no instruction-keyed build
-cache, and no multi-stage `--from`. BuildKit is those three things and
-they are each a project; a cache that is wrong is worse than no cache, and
-`--from` needs a graph where this has a list.
+**Stages.** A second `FROM` starts a new stage, and the last one is the
+image: `FROM golang AS build` ... `FROM scratch` / `COPY --from=build
+/out/app /app`. `--from` takes a stage's name, its number, or any image;
+`FROM <stage>` carries on from where that stage stopped; `FROM scratch`
+starts from nothing; `--target <stage>` stops there and tags it. A stage's
+files are read in user space, layer by layer with the deletions applied,
+not by mounting them, so this works for an unprivileged user too.
+
+`COPY` follows Docker's rules: a destination that is not absolute is
+inside `WORKDIR`, a directory source gives its contents, `package*.json`
+matches every file it names, and what `.dockerignore` lists (with `!`
+exceptions) stays out. `WORKDIR` is relative to the one before and makes
+the directory if the image has none.
+
+What is deliberately absent: parallelism. Stages are built in file order,
+every one up to the target, whether or not the target uses it.
 
 ### Pushing
 
