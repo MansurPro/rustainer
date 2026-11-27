@@ -265,6 +265,9 @@ fn service(svc: &J, dir: &Path, notes: &mut Vec<String>) -> Result<Table> {
                                 "dockerfile" => {
                                     t.insert("dockerfile".into(), T::String(scalar(bv)?));
                                 }
+                                "target" => {
+                                    t.insert("target".into(), T::String(scalar(bv)?));
+                                }
                                 "args" => {
                                     t.insert("build_args".into(), pairs(bv).context("build.args")?);
                                 }

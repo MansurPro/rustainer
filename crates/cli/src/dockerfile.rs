@@ -32,7 +32,7 @@ pub enum Instruction {
     Copy {
         sources: Vec<String>,
         dest: String,
-        /// `--from=<stage>`, which this engine does not implement.
+        /// `--from=<stage or image>`: read from there, not the context.
         from: Option<String>,
     },
     Env(String, String),

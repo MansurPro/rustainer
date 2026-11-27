@@ -203,6 +203,10 @@ pub struct Service {
     /// `KEY=value` for the Dockerfile's `ARG`s, as `build --build-arg`.
     #[serde(default)]
     pub build_args: Vec<String>,
+    /// The stage of a multi-stage Dockerfile to stop at, as
+    /// `build --target`.
+    #[serde(default)]
+    pub target: Option<String>,
     /// Replaces the image's entrypoint, as `run --entrypoint`: one
     /// word, and empty for none.
     #[serde(default)]

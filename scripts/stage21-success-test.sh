@@ -15,9 +15,7 @@
 # any of them. The test checks that claim from both ends: the built image
 # runs, and the layer in the store is the shape a layer is supposed to be.
 #
-# What is deliberately absent: no parallelism, no instruction-keyed build
-# cache, no multi-stage `--from`. BuildKit is those three things and they
-# are each a project; a cache that is wrong is worse than no cache.
+# What is deliberately absent: parallelism. Stages build in file order.
 
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -302,6 +300,81 @@ check "with no arguments, CMD supplies them" "$(epr ep:1)" "entry default-arg"
 check "arguments replace CMD and keep the entrypoint" "$(epr ep:1 one two)" "entry one two"
 check "--entrypoint replaces it, and drops CMD with it" "$(epr --entrypoint /bin/pwd ep:1)" "/"
 check "an empty --entrypoint makes the arguments the whole command" "$(epr --entrypoint "" ep:1 /bin/echo bare)" "bare"
+
+echo
+echo "7d. Stages: FROM ... AS, COPY --from, --target"
+# The Dockerfile nearly every real project has: build in one image, ship
+# another, and the shipped one holds only what was copied across.
+M="$SCRATCH/msctx"; mkdir -p "$M/src/sub" "$M/node_modules/dep" "$M/node_modules/keep"
+echo '{"name":"x"}' > "$M/package.json"
+echo '{"lock":1}' > "$M/package-lock.json"
+echo "main" > "$M/src/main.txt"
+echo "deep" > "$M/src/sub/deep.txt"
+echo "dep" > "$M/node_modules/dep/index.js"
+echo "kept" > "$M/node_modules/keep/k.js"
+echo "noise" > "$M/debug.log"
+printf 'node_modules\n!node_modules/keep\n*.log\n' > "$M/.dockerignore"
+cat > "$M/Dockerfile" <<MSEND
+ARG WHO=world
+FROM $IMG AS build
+ARG WHO
+ENV ONLY_IN_BUILD=yes
+WORKDIR /app
+COPY package*.json ./
+COPY . .
+WORKDIR out
+RUN echo "hello \$WHO" > artefact && echo junk > /app/junk && rm /app/src/main.txt && pwd > /where
+
+FROM build AS tested
+RUN echo tested > /app/out/tested
+
+FROM $IMG
+WORKDIR /srv
+COPY --from=build /app/out/ ./
+COPY --from=build /app/src /srv/src
+COPY --from=0 /app/package.json /srv/sub/
+COPY --from=$IMG /etc/alpine-release /base-release
+RUN env | grep -c ONLY_IN_BUILD > /env-leak; true
+CMD ["cat", "/srv/artefact"]
+MSEND
+mrun() { timeout 60 "$B" run --network none "$@" 2>/dev/null; }
+OUT=$(timeout 600 "$B" build --network none --build-arg WHO=stages -t ms:1 "$M" 2>&1); RC=$?
+check "a Dockerfile with three stages builds" "$RC" "0"
+[ "$RC" -eq 0 ] || echo "$OUT" | tail -5
+check "the last stage is the image, with what an earlier one made" "$(mrun ms:1)" "hello stages"
+check "a COPY of a directory gives its contents" "$(mrun ms:1 cat /srv/src/sub/deep.txt)" "deep"
+check "a file an earlier stage deleted is not copied" "$(mrun ms:1 ls /srv/src)" "sub"
+check "--from takes a stage's number" "$(mrun ms:1 cat /srv/sub/package.json)" '{"name":"x"}'
+check "and an image" "$(mrun ms:1 sh -c 'test -s /base-release && echo yes')" "yes"
+check "what the build stage held is not in the image" "$(mrun ms:1 sh -c 'ls /app 2>/dev/null | wc -l')" "0"
+check "nor is its environment" "$(mrun ms:1 cat /env-leak)" "0"
+check "a stage that nothing copies from leaves nothing" "$(mrun ms:1 sh -c 'test -e /srv/tested || echo absent')" "absent"
+
+timeout 600 "$B" build --network none --target build -t ms:build "$M" >/dev/null 2>&1
+check "--target stops at a stage and tags it" "$?" "0"
+check "a relative WORKDIR is inside the one before" "$(mrun ms:build cat /where)" "/app/out"
+check "a wildcard source matches every file it names" "$(mrun ms:build sh -c 'ls /app/package*.json | wc -l')" "2"
+check "a relative destination is inside WORKDIR" "$(mrun ms:build cat /app/src/sub/deep.txt)" "deep"
+check ".dockerignore keeps a directory out" "$(mrun ms:build sh -c 'test -e /app/node_modules/dep || echo absent')" "absent"
+check "and a pattern" "$(mrun ms:build sh -c 'test -e /app/debug.log || echo absent')" "absent"
+check "and lets a ! line back in" "$(mrun ms:build cat /app/node_modules/keep/k.js)" "kept"
+timeout 600 "$B" build --network none --target tested -t ms:tested "$M" >/dev/null 2>&1
+check "a stage built on a stage has both" "$(mrun ms:tested sh -c 'cat /app/out/tested /app/out/artefact' | tr '\n' ' ')" "tested hello world "
+refuses "a --target the file does not have is refused" "has no stage" \
+    timeout 60 "$B" build --network none --target nope -t ms:x "$M"
+
+# No base at all: the image is exactly what was copied into it.
+cat > "$M/Dockerfile" <<MSEND
+FROM $IMG AS build
+RUN mkdir /out && cp /bin/busybox /out/busybox
+FROM scratch
+COPY --from=build /out/busybox /bin/busybox
+COPY --from=build /lib/ld-musl-* /lib/
+ENTRYPOINT ["/bin/busybox"]
+MSEND
+timeout 600 "$B" build --network none -t ms:scratch "$M" >/dev/null 2>&1
+check "FROM scratch builds" "$?" "0"
+check "and runs with only what was copied in" "$(mrun ms:scratch ls / | grep -c -x -e bin -e lib)" "2"
 
 echo
 echo "8. The built image is an ordinary image"
