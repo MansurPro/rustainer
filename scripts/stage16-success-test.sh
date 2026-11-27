@@ -208,6 +208,12 @@ check "a missing host directory is created" "$(cat "$NEW/f" 2>/dev/null)" "made"
 echo hostfile > "$SCRATCH/single.txt"
 check "a host FILE binds as a file" \
     "$(R -v "$SCRATCH/single.txt:/etc/single.txt" /bin/cat /etc/single.txt)" "hostfile"
+check "--tmpfs is a tmpfs of the size asked for, at a path the image does not have" \
+    "$(R --tmpfs /made/up:size=2m /bin/sh -c 'grep " /made/up tmpfs " /proc/mounts | grep -c size=2048k')" "1"
+case "$(R --tmpfs /x:bogus /bin/true 2>&1)" in
+*"not an option"*) ok "--tmpfs refuses an option it does not know" ;;
+*) bad "--tmpfs refuses an option it does not know" ;;
+esac
 # A socket and a device node need a file as their mount point too;
 # is_file() is false for both, which once made `-v docker.sock` fail.
 python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$SCRATCH/s.sock"

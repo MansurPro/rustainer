@@ -359,6 +359,7 @@ fn service(svc: &J, dir: &Path, notes: &mut Vec<String>) -> Result<Table> {
                                 match cond.unwrap_or("service_started") {
                                     "service_started" => "started",
                                     "service_healthy" => "healthy",
+                                    "service_completed_successfully" => "completed",
                                     other => bail!(
                                         "depends_on.{dep}: the condition {other:?} is not supported"
                                     ),
@@ -425,6 +426,32 @@ fn service(svc: &J, dir: &Path, notes: &mut Vec<String>) -> Result<Table> {
                 if h.contains_key("test") {
                     t.insert(k.into(), T::Table(h));
                 }
+            }
+            "tmpfs" => {
+                let list = match v {
+                    J::String(s) => T::Array(vec![T::String(s.clone())]),
+                    other => strings(other).context("tmpfs")?,
+                };
+                t.insert(k.into(), list);
+            }
+            // `name:address`, `name=address`, or a mapping of one to the
+            // other.
+            "extra_hosts" => {
+                let hosts: Vec<String> = match v {
+                    J::Object(o) => o
+                        .iter()
+                        .map(|(h, ip)| Ok(format!("{h}:{}", scalar(ip)?)))
+                        .collect::<Result<_>>()?,
+                    J::Array(a) => a
+                        .iter()
+                        .map(|e| scalar(e).map(|e| e.replacen('=', ":", 1)))
+                        .collect::<Result<_>>()?,
+                    _ => bail!("extra_hosts is neither a list nor a mapping"),
+                };
+                t.insert(
+                    k.into(),
+                    T::Array(hosts.into_iter().map(T::String).collect()),
+                );
             }
             "configs" | "secrets" => {
                 t.insert(
@@ -729,6 +756,9 @@ services:
       - "8080:80"
       - target: 443
         published: 8443
+    tmpfs: /run
+    extra_hosts:
+      - "host.docker.internal=10.0.0.1"
     depends_on:
       db:
         condition: service_healthy
@@ -766,6 +796,11 @@ volumes:
         assert_eq!(s["web"]["ports"][1].as_str(), Some("8443:443"));
         assert_eq!(s["web"]["depends_on"]["db"].as_str(), Some("healthy"));
         assert_eq!(s["web"]["replicas"].as_integer(), Some(2));
+        assert_eq!(s["web"]["tmpfs"][0].as_str(), Some("/run"));
+        assert_eq!(
+            s["web"]["extra_hosts"][0].as_str(),
+            Some("host.docker.internal:10.0.0.1")
+        );
         assert_eq!(s["web"]["memory"].as_str(), Some("256M"));
     }
 
@@ -817,5 +852,8 @@ volumes:
         assert!(i("${NOPE:?give it}").unwrap_err().contains("give it"));
         assert!(i("${EMPTY:?give it}").is_err());
         assert_eq!(i("${NOPE-http://x:9090}").unwrap(), "http://x:9090");
+        let c = |t: &str| crate::stack::Stack::interpolate_as(t, &vars, true).unwrap();
+        assert_eq!(c("$SET/$NOPE. $$SET $1 ${SET}"), "v/. $SET $1 v");
+        assert_eq!(i("$SET").unwrap(), "$SET");
     }
 }
