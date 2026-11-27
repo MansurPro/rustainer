@@ -382,11 +382,54 @@ fn visible(layers: &[PathBuf], rel: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// `rel` with every symlink among its directories followed **inside
+/// the layers**: `/lib/x` where `/lib -> usr/lib`, as most distributions
+/// have it. Done by hand because letting the kernel follow one would
+/// resolve an absolute link against the host's root, and copy the
+/// host's file into the image.
+fn follow(layers: &[PathBuf], rel: &Path) -> PathBuf {
+    let names = |p: &Path| -> Vec<std::ffi::OsString> {
+        p.components()
+            .rev()
+            .map(|c| c.as_os_str().to_owned())
+            .collect()
+    };
+    let mut todo = names(rel);
+    let mut done = PathBuf::new();
+    let mut hops = 0;
+    while let Some(c) = todo.pop() {
+        if c == "/" || c == "." {
+            continue;
+        }
+        if c == ".." {
+            done.pop();
+            continue;
+        }
+        done.push(&c);
+        // The last name is the thing being copied, link or not.
+        if todo.is_empty() || hops == 40 {
+            continue;
+        }
+        if let Some(top) = visible(layers, &done).first()
+            && let Ok(target) = std::fs::read_link(top)
+        {
+            hops += 1;
+            if target.is_absolute() {
+                done = PathBuf::new();
+            } else {
+                done.pop();
+            }
+            todo.extend(names(&target));
+        }
+    }
+    done
+}
+
 /// The paths in a stack of layers that a `COPY --from` source names.
 // ponytail: a wildcard is honoured in the last name only, which is where
 // people put one (`/lib/ld-musl-*`); walk every level if that changes.
 pub fn sources_in(layers: &[PathBuf], source: &str) -> Result<Vec<PathBuf>> {
-    let rel = PathBuf::from(source.trim_start_matches('/'));
+    let rel = follow(layers, Path::new(source));
     let pattern = rel.file_name().map(|n| n.to_string_lossy().into_owned());
     let Some(pattern) = pattern.filter(|p| p.contains(['*', '?'])) else {
         return Ok(vec![rel]);
@@ -624,6 +667,25 @@ mod tests {
             "deep"
         );
         assert!(copy_merged(&[dir.join("low")], Path::new("nope"), &out).is_err());
+        // A link among the directories is followed inside the layers,
+        // absolute or not, and never out to the host.
+        let low = dir.join("low");
+        std::os::unix::fs::symlink("/app", low.join("abs")).unwrap();
+        std::os::unix::fs::symlink("app/sub", low.join("rel")).unwrap();
+        std::os::unix::fs::symlink("/etc", low.join("host")).unwrap();
+        let layers = [low];
+        assert_eq!(
+            sources_in(&layers, "/abs/sub/deep").unwrap(),
+            [PathBuf::from("app/sub/deep")]
+        );
+        assert_eq!(
+            sources_in(&layers, "/rel/d*").unwrap(),
+            [PathBuf::from("app/sub/deep")]
+        );
+        assert!(!exists_in(
+            &layers,
+            &follow(&layers, Path::new("/host/passwd"))
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
