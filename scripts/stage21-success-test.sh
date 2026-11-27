@@ -104,7 +104,7 @@ echo "1. The file is read before anything is built"
 printf 'FROM %s\nFROB x\n' "$IMG" > "$CTX/Dockerfile"
 refuses "an unknown instruction is named" "not a Dockerfile instruction" \
     "$B" build --network none -t x:1 "$CTX"
-printf 'FROM %s\nHEALTHCHECK CMD true\n' "$IMG" > "$CTX/Dockerfile"
+printf 'FROM %s\nONBUILD RUN true\n' "$IMG" > "$CTX/Dockerfile"
 refuses "an instruction we do not implement is refused, not skipped" "not implemented" \
     "$B" build --network none -t x:1 "$CTX"
 printf 'RUN true\n' > "$CTX/Dockerfile"
@@ -375,6 +375,80 @@ MSEND
 timeout 600 "$B" build --network none -t ms:scratch "$M" >/dev/null 2>&1
 check "FROM scratch builds" "$?" "0"
 check "and runs with only what was copied in" "$(mrun ms:scratch ls / | grep -c -x -e bin -e lib)" "2"
+
+echo
+echo "7e. The rest of the language"
+R="$SCRATCH/restctx"; mkdir -p "$R/payload/dir"
+echo "inside" > "$R/payload/dir/file.txt"
+tar -C "$R/payload" -czf "$R/bundle.tar.gz" dir
+echo '#!/bin/sh' > "$R/run.sh"; echo 'echo ran' >> "$R/run.sh"; chmod 644 "$R/run.sh"
+rfile() {
+    { printf 'FROM %s\n' "$IMG"; cat; } > "$R/Dockerfile"
+    timeout 600 "$B" build --network none -t "$1" "$R" 2>&1
+}
+OUT=$(rfile rest:1 <<'RSEND'
+RUN adduser -D -u 1234 app
+COPY --chown=app:app --chmod=755 run.sh /usr/local/bin/run.sh
+COPY --chown=4321 run.sh /numeric.sh
+ADD bundle.tar.gz /unpacked/
+COPY bundle.tar.gz /copied/
+SHELL ["/bin/sh", "-ec"]
+RUN false; echo "should not get here" > /shell-ignored-errors || true
+RSEND
+)
+contains "a step run by a SHELL with -e stops at the first failure" "$OUT" "failed with exit status"
+OUT=$(rfile rest:1 <<'RSEND'
+RUN adduser -D -u 1234 app
+COPY --chown=app:app --chmod=755 run.sh /usr/local/bin/run.sh
+COPY --chown=4321 run.sh /numeric.sh
+ADD bundle.tar.gz /unpacked/
+COPY bundle.tar.gz /copied/
+RUN --mount=type=cache,target=/cache sh -c 'echo x >> /cache/count; wc -l < /cache/count > /cache-lines'
+MAINTAINER someone
+VOLUME /data
+STOPSIGNAL SIGQUIT
+HEALTHCHECK --interval=1s --retries=2 CMD test -e /tmp/well
+CMD ["sleep", "300"]
+RSEND
+); RC=$?
+check "a file using the rest of the language builds" "$RC" "0"
+[ "$RC" -eq 0 ] || echo "$OUT" | tail -5
+rrun() { timeout 60 "$B" run --network none "$@" 2>/dev/null; }
+if [ "$(awk '{print $1, $2, $3}' /proc/self/uid_map 2>/dev/null)" = "0 0 4294967295" ]; then
+    check "--chown takes names from the image" "$(rrun rest:1 stat -c %u:%g /usr/local/bin/run.sh)" "1234:1234"
+    check "and a number alone is both" "$(rrun rest:1 stat -c %u:%g /numeric.sh)" "4321:4321"
+else
+    skip "--chown needs root"; skip "--chown needs root"
+fi
+check "--chmod sets the mode" "$(rrun rest:1 stat -c %a /usr/local/bin/run.sh)" "755"
+check "ADD unpacks a tar archive" "$(rrun rest:1 cat /unpacked/dir/file.txt)" "inside"
+check "COPY does not" "$(rrun rest:1 ls /copied)" "bundle.tar.gz"
+check "a cache mount is not in the image" "$(rrun rest:1 sh -c 'test -e /cache/count || echo absent')" "absent"
+check "the first build saw it empty" "$(rrun rest:1 cat /cache-lines | tr -d ' ')" "1"
+OUT=$(rfile rest:2 <<'RSEND'
+RUN --mount=type=cache,target=/cache sh -c 'echo y >> /cache/count; wc -l < /cache/count > /cache-lines'
+RSEND
+)
+check "and a later build finds what it left" "$(rrun rest:2 cat /cache-lines | tr -d ' ')" "2"
+
+# The image's own healthcheck runs without being asked for.
+HC=$("$B" run -d --network none rest:1 2>/dev/null | tail -1)
+health() { cat "$RUSTAINER_ROOT/containers/$1/health" 2>/dev/null || cat "$RUSTAINER_ROOT/$1/health" 2>/dev/null; }
+for _ in $(seq 1 40); do [ "$(health "$HC")" = unhealthy ] && break; sleep 0.25; done
+check "a container from an image with a HEALTHCHECK is checked" "$(health "$HC")" "unhealthy"
+"$B" exec "$HC" touch /tmp/well >/dev/null 2>&1
+for _ in $(seq 1 40); do [ "$(health "$HC")" = healthy ] && break; sleep 0.25; done
+check "and is healthy once the check passes" "$(health "$HC")" "healthy"
+contains "ps says so" "$("$B" ps)" "healthy"
+"$B" rm --force "$HC" >/dev/null 2>&1
+HC=$("$B" run -d --network none --no-healthcheck rest:1 2>/dev/null | tail -1)
+sleep 1.5
+check "--no-healthcheck leaves it unchecked" "$(health "$HC")" ""
+"$B" rm --force "$HC" >/dev/null 2>&1
+HC=$("$B" run -d --network none --health-cmd true --health-interval 1 "$IMG" sleep 300 2>/dev/null | tail -1)
+for _ in $(seq 1 40); do [ "$(health "$HC")" = healthy ] && break; sleep 0.25; done
+check "--health-cmd gives any container one" "$(health "$HC")" "healthy"
+"$B" rm --force "$HC" >/dev/null 2>&1
 
 echo
 echo "8. The built image is an ordinary image"

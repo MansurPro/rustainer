@@ -232,6 +232,24 @@ enum Command {
 // from a file instead.
 #[derive(Args, Default)]
 struct RunArgs {
+    /// A command, run by `/bin/sh -c` inside the container, that says
+    /// whether it is well: exit 0 for yes. `ps` shows the answer. An
+    /// image may bring its own (`HEALTHCHECK`); this replaces it.
+    #[arg(long, value_name = "COMMAND")]
+    health_cmd: Option<String>,
+
+    /// Seconds between health checks.
+    #[arg(long, value_name = "SECONDS")]
+    health_interval: Option<u64>,
+
+    /// Failed checks in a row before the container is `unhealthy`.
+    #[arg(long, value_name = "N")]
+    health_retries: Option<u64>,
+
+    /// Do not run the image's own healthcheck.
+    #[arg(long)]
+    no_healthcheck: bool,
+
     /// Root filesystem: a directory tree you extracted yourself. `/` keeps
     /// the host's filesystem view. Omit it and the first positional
     /// argument is an image reference instead.
@@ -1365,6 +1383,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
     //   --rootfs <dir>   a tree you extracted yourself (stage 2)
     //   no --rootfs      an image reference (stage 6)
     let mut image_env: Vec<String> = Vec::new();
+    let mut image_health: Option<rustainer_image::Health> = None;
     let mut workdir: Option<String> = None;
     let mut image_user: Option<String> = None;
 
@@ -1440,6 +1459,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             }
 
             image_env = image.env.clone();
+            image_health = image.healthcheck.clone();
             workdir = image.working_dir.clone();
             image_user = image.user.clone();
             layers = image
@@ -1788,6 +1808,31 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
     );
 
     if args.detach {
+        // The flags win over the image, one field at a time, so
+        // `--health-interval 5` alone retunes the image's own check.
+        // ponytail: detached containers only. A foreground run has the
+        // terminal to say how it is doing.
+        let test = match &args.health_cmd {
+            Some(c) => vec!["/bin/sh".to_owned(), "-c".to_owned(), c.clone()],
+            None => image_health
+                .as_ref()
+                .map(|h| h.test.clone())
+                .unwrap_or_default(),
+        };
+        if !args.no_healthcheck && !test.is_empty() {
+            let from_image = |f: fn(&rustainer_image::Health) -> u64| image_health.as_ref().map(f);
+            spawn_health_watch(
+                paths,
+                &id,
+                args.health_interval
+                    .or(from_image(|h| h.interval))
+                    .unwrap_or(30),
+                args.health_retries
+                    .or(from_image(|h| h.retries))
+                    .unwrap_or(3),
+                &test,
+            );
+        }
         // Reap the supervisor's *launcher* relationship: it is our child
         // only until we exit, after which init takes it over. Nothing to
         // wait for.
@@ -2054,10 +2099,17 @@ fn cmd_ps(paths: &Paths, args: PsArgs) -> Result<ExitCode> {
             (Status::Unknown, _, _, _) => "?".into(),
             _ => "-".into(),
         };
+        // What its healthcheck last said, beside the status as Docker
+        // puts it. Only while it runs: the watcher removes the file
+        // when the container stops.
+        let status = match std::fs::read_to_string(health_file(paths, &id)) {
+            Ok(h) if observed == Status::Running => format!("{observed} ({})", h.trim()),
+            _ => observed.to_string(),
+        };
         println!(
             "{:<14} {:<9} {:<8} {:<10} {}",
             id,
-            observed.to_string(),
+            status,
             pid,
             exit,
             st.command.join(" ")
@@ -3284,6 +3336,10 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                     }
                     v
                 },
+                // The service's own check is started below; without
+                // this the image's would run beside it and the two
+                // would take turns writing the answer.
+                no_healthcheck: svc.healthcheck.is_some(),
                 add_host: peers
                     .iter()
                     .filter(|(n, _)| n != name && *n != id)
@@ -3355,26 +3411,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
             // answers "is it still well", which is the question an
             // operator asks of a page at three in the morning.
             if let Some(h) = &svc.healthcheck {
-                let mut w = std::process::Command::new("/proc/self/exe");
-                w.arg("--root")
-                    .arg(paths_root(paths))
-                    .arg("health-watch")
-                    .arg(&id)
-                    .arg("--interval")
-                    .arg(h.interval.to_string())
-                    .arg("--retries")
-                    .arg(h.retries.to_string());
-                w.arg("--");
-                for t in &h.test {
-                    w.arg(t);
-                }
-                // Detached on purpose: it outlives `stack up`, and it
-                // exits by itself once the container is gone.
-                let _ = w
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
+                spawn_health_watch(paths, &id, h.interval, h.retries, &h.test);
             }
         }
     }
@@ -3688,6 +3725,28 @@ fn stack_ps(paths: &Paths, st: &stack::Stack) -> Result<ExitCode> {
 /// field there would be erased within milliseconds.
 pub(crate) fn health_file(paths: &Paths, id: &str) -> PathBuf {
     paths.dir(id).join("health")
+}
+
+/// Start the process that keeps asking a container whether it is well.
+///
+/// Detached on purpose: it outlives the command that started it, and it
+/// exits by itself once the container is gone.
+fn spawn_health_watch(paths: &Paths, id: &str, interval: u64, retries: u64, test: &[String]) {
+    let _ = std::process::Command::new("/proc/self/exe")
+        .arg("--root")
+        .arg(paths_root(paths))
+        .arg("health-watch")
+        .arg(id)
+        .arg("--interval")
+        .arg(interval.to_string())
+        .arg("--retries")
+        .arg(retries.to_string())
+        .arg("--")
+        .args(test)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// Run a container's healthcheck until the container goes away.
@@ -4664,6 +4723,10 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                     );
                 }
                 built.env = base.env.clone();
+                built.healthcheck = base
+                    .healthcheck
+                    .as_ref()
+                    .map(|h| (h.test.clone(), h.interval, h.retries));
                 built.workdir = base.working_dir.clone();
                 built.user = base.user.clone();
                 built.cmd = base.cmd.clone();
@@ -4717,11 +4780,39 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
             Instruction::Entrypoint(c) => {
                 built.entrypoint = c.iter().map(|x| build::expand(x, &vars)).collect();
             }
+            Instruction::Healthcheck {
+                test,
+                interval,
+                retries,
+            } => {
+                let test = test.iter().map(|x| build::expand(x, &vars)).collect();
+                built.healthcheck = Some((test, *interval, *retries));
+            }
+            Instruction::StopSignal(s) => built.stop_signal = Some(build::expand(s, &vars)),
+            Instruction::Volume(v) => {
+                built
+                    .volumes
+                    .extend(v.iter().map(|x| build::expand(x, &vars)));
+            }
             Instruction::Copy {
                 sources,
                 dest,
                 from,
+                chown,
+                chmod,
+                unpack,
             } => {
+                let owner = chown
+                    .as_ref()
+                    .map(|c| build::owner(&built.layers, &build::expand(c, &vars)))
+                    .transpose()?;
+                let mode = chmod
+                    .as_ref()
+                    .map(|m| {
+                        u32::from_str_radix(m, 8)
+                            .with_context(|| format!("--chmod={m} is not an octal mode like 755"))
+                    })
+                    .transpose()?;
                 // `--from` reads an earlier stage, or any image, where a
                 // plain COPY reads the context.
                 let from_layers = match from {
@@ -4779,9 +4870,17 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                     };
                     match &from_layers {
                         Some(layers) => build::copy_merged(layers, src, &target),
+                        None if *unpack && build::is_archive(src) => {
+                            build::unpack(src, &layer_dir.join(&rel))
+                        }
                         None => build::copy_into(src, &target, Some(&ignore)),
                     }
                     .with_context(|| format!("copying {} into the image", src.display()))?;
+                    // Only what was copied: the directories above it
+                    // that the copy had to make stay root's.
+                    if (owner.is_some() || mode.is_some()) && target.symlink_metadata().is_ok() {
+                        build::retouch(&target, owner, mode)?;
+                    }
                 }
                 // A COPY is not looked up - doing it is as cheap as
                 // checking - but what it copied is part of the identity
@@ -4795,7 +4894,12 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 built.diff_ids.push(diff_id.clone());
                 sealed.push((diff_id, layer_dir, tar));
             }
-            Instruction::Run(argv) => {
+            Instruction::Run {
+                argv,
+                caches,
+                network,
+            } => {
+                let network = network.as_ref().unwrap_or(&args.network);
                 let expanded: Vec<String> = argv.iter().map(|a| build::expand(a, &vars)).collect();
                 let key = hash(&[
                     &chain,
@@ -4804,7 +4908,7 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                     &built.env.join("\u{1f}"),
                     built.workdir.as_deref().unwrap_or(""),
                     built.user.as_deref().unwrap_or(""),
-                    &args.network,
+                    network,
                 ]);
                 chain = key.clone();
                 let record = cache_dir.join(key.trim_start_matches("sha256:"));
@@ -4842,7 +4946,21 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 let run = RunArgs {
                     name: Some(step_id.clone()),
                     layer: built.layers.clone(),
-                    network: args.network.clone(),
+                    network: network.clone(),
+                    // A cache mount is a directory of the store's that
+                    // every build sharing its id sees, and that never
+                    // becomes part of a layer.
+                    volumes: caches
+                        .iter()
+                        .map(|(id, target)| {
+                            let dir = cache_dir
+                                .join("mounts")
+                                .join(hash(&[id]).trim_start_matches("sha256:"));
+                            std::fs::create_dir_all(&dir)?;
+                            Ok(format!("{}:{target}", dir.display()))
+                        })
+                        .collect::<Result<_>>()?,
+                    no_healthcheck: true,
                     hostname: "build".into(),
                     workdir: built.workdir.clone(),
                     user: built.user.clone(),
@@ -4919,6 +5037,19 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
             "WorkingDir": built.workdir,
             "User": built.user,
             "Labels": built.labels,
+            "StopSignal": built.stop_signal,
+            "Volumes": built.volumes.iter()
+                .map(|v| (v.clone(), serde_json::json!({})))
+                .collect::<serde_json::Map<_, _>>(),
+            "Healthcheck": built.healthcheck.as_ref().map(|(test, interval, retries)| {
+                // Always the exec form: the shell, if there was one, is
+                // already the first words of the command.
+                let test: Vec<&str> = match test.is_empty() {
+                    true => vec!["NONE"],
+                    false => std::iter::once("CMD").chain(test.iter().map(String::as_str)).collect(),
+                };
+                serde_json::json!({ "Test": test, "Interval": interval * 1_000_000_000, "Retries": retries })
+            }),
             "ExposedPorts": built.exposed.iter()
                 .map(|p| (format!("{p}/tcp"), serde_json::json!({})))
                 .collect::<serde_json::Map<_, _>>(),

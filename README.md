@@ -883,7 +883,7 @@ layer sharing entirely.
 **TOML-grade strictness about the file**, for the same reason as stacks:
 
 - An **unknown instruction is refused**, not skipped. An image built from
-  a file containing `HEALTHCHECK` does not do what the file says, and
+  a file containing `ONBUILD` does not do what the file says, and
   ignoring the line quietly is how that reaches production.
 - **A bracketed line that is not valid JSON is an error.** Docker falls
   back to the shell form there, which turns a misplaced quote into an
@@ -908,6 +908,20 @@ inside `WORKDIR`, a directory source gives its contents, `package*.json`
 matches every file it names, and what `.dockerignore` lists (with `!`
 exceptions) stays out. `WORKDIR` is relative to the one before and makes
 the directory if the image has none.
+
+The rest of the language: `COPY --chown=app:app --chmod=755` (names are
+looked up in the image being built), `ADD` of a local `.tar`/`.tar.gz`
+unpacks it, `SHELL`, `MAINTAINER`, and `RUN --mount=type=cache,target=…`,
+which gives the step a directory that outlives the build and never
+becomes part of a layer. `VOLUME` and `STOPSIGNAL` are recorded in the
+image and not acted on: a container's writes land in its own layer either
+way, and `stop` sends `SIGTERM`. `ONBUILD`, `ADD <url>` and the other
+`--mount` types are refused by name.
+
+`HEALTHCHECK` is recorded and **acted on**: `run -d` on an image that has
+one starts checking it, and `ps` shows `running (healthy)`. `--health-cmd`,
+`--health-interval` and `--health-retries` set or retune it for any
+container; `--no-healthcheck` turns the image's off.
 
 What is deliberately absent: parallelism. Stages are built in file order,
 every one up to the target, whether or not the target uses it.
