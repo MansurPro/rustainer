@@ -4879,7 +4879,16 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                     // Only what was copied: the directories above it
                     // that the copy had to make stay root's.
                     if (owner.is_some() || mode.is_some()) && target.symlink_metadata().is_ok() {
-                        build::retouch(&target, owner, mode)?;
+                        // An unprivileged build has one user id to its
+                        // name and cannot give a file to another. Said,
+                        // not fatal: the same build pulls its base image
+                        // with every file owned by that one user too.
+                        if let Err(e) = build::retouch(&target, owner, None) {
+                            eprintln!(
+                                "rustainer: {e:#}; the files stay owned by whoever is building"
+                            );
+                        }
+                        build::retouch(&target, None, mode)?;
                     }
                 }
                 // A COPY is not looked up - doing it is as cheap as

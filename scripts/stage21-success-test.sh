@@ -434,21 +434,28 @@ check "and a later build finds what it left" "$(rrun rest:2 cat /cache-lines | t
 # The image's own healthcheck runs without being asked for.
 HC=$("$B" run -d --network none rest:1 2>/dev/null | tail -1)
 health() { cat "$RUSTAINER_ROOT/containers/$1/health" 2>/dev/null || cat "$RUSTAINER_ROOT/$1/health" 2>/dev/null; }
-for _ in $(seq 1 40); do [ "$(health "$HC")" = unhealthy ] && break; sleep 0.25; done
-check "a container from an image with a HEALTHCHECK is checked" "$(health "$HC")" "unhealthy"
-"$B" exec "$HC" touch /tmp/well >/dev/null 2>&1
-for _ in $(seq 1 40); do [ "$(health "$HC")" = healthy ] && break; sleep 0.25; done
-check "and is healthy once the check passes" "$(health "$HC")" "healthy"
-contains "ps says so" "$("$B" ps)" "healthy"
-"$B" rm --force "$HC" >/dev/null 2>&1
-HC=$("$B" run -d --network none --no-healthcheck rest:1 2>/dev/null | tail -1)
-sleep 1.5
-check "--no-healthcheck leaves it unchecked" "$(health "$HC")" ""
-"$B" rm --force "$HC" >/dev/null 2>&1
-HC=$("$B" run -d --network none --health-cmd true --health-interval 1 "$IMG" sleep 300 2>/dev/null | tail -1)
-for _ in $(seq 1 40); do [ "$(health "$HC")" = healthy ] && break; sleep 0.25; done
-check "--health-cmd gives any container one" "$(health "$HC")" "healthy"
-"$B" rm --force "$HC" >/dev/null 2>&1
+# The check is `exec` in the container, and a shell that is itself inside
+# a user namespace cannot enter the container's: nothing to check with.
+if "$B" exec "$HC" true >/dev/null 2>&1; then
+    for _ in $(seq 1 40); do [ "$(health "$HC")" = unhealthy ] && break; sleep 0.25; done
+    check "a container from an image with a HEALTHCHECK is checked" "$(health "$HC")" "unhealthy"
+    "$B" exec "$HC" touch /tmp/well >/dev/null 2>&1
+    for _ in $(seq 1 40); do [ "$(health "$HC")" = healthy ] && break; sleep 0.25; done
+    check "and is healthy once the check passes" "$(health "$HC")" "healthy"
+    contains "ps says so" "$("$B" ps)" "healthy"
+    "$B" rm --force "$HC" >/dev/null 2>&1
+    HC=$("$B" run -d --network none --no-healthcheck rest:1 2>/dev/null | tail -1)
+    sleep 1.5
+    check "--no-healthcheck leaves it unchecked" "$(health "$HC")" ""
+    "$B" rm --force "$HC" >/dev/null 2>&1
+    HC=$("$B" run -d --network none --health-cmd true --health-interval 1 "$IMG" sleep 300 2>/dev/null | tail -1)
+    for _ in $(seq 1 40); do [ "$(health "$HC")" = healthy ] && break; sleep 0.25; done
+    check "--health-cmd gives any container one" "$(health "$HC")" "healthy"
+    "$B" rm --force "$HC" >/dev/null 2>&1
+else
+    "$B" rm --force "$HC" >/dev/null 2>&1
+    for _ in 1 2 3 4 5; do skip "healthchecks need exec, which this shell cannot do"; done
+fi
 
 echo
 echo "8. The built image is an ordinary image"
