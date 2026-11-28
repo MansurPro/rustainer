@@ -113,8 +113,13 @@ pub fn resolve(names: &[String]) -> Result<Edits> {
             apply(part, &mut edits, &mut folders).with_context(|| format!("--device {full}"))?;
         }
     }
-    // `update-ldcache`, by its effect: each library reachable under the
-    // name programs were linked against.
+    link_sonames(&mut edits, &folders);
+    Ok(edits)
+}
+
+/// `update-ldcache`, by its effect: each library mounted into one of
+/// `folders` reachable under the name programs were linked against.
+fn link_sonames(edits: &mut Edits, folders: &[String]) {
     let wanted: Vec<(PathBuf, String)> = edits
         .mounts
         .iter()
@@ -137,7 +142,65 @@ pub fn resolve(names: &[String]) -> Result<Edits> {
             edits.links.push(link);
         }
     }
-    Ok(edits)
+}
+
+/// What an NVIDIA GPU needs, from the driver's own tool, on a host
+/// that has the driver and no CDI spec for it.
+///
+/// `nvidia-container-cli list` prints the device nodes, driver
+/// libraries, programs and firmware a container must be given, one
+/// path a line, for the driver actually loaded. It is the same
+/// information `nvidia-ctk` writes into a CDI spec, without needing
+/// that tool or root to write the file.
+pub fn nvidia_from_host() -> Option<Edits> {
+    // As root it changes privilege to do its work, which a root that
+    // exists only inside a user namespace is not allowed to; `--user`
+    // is its own mode for a caller like that, and for a plain user.
+    for flags in [&[][..], &["--user"][..]] {
+        let out = std::process::Command::new("nvidia-container-cli")
+            .args(flags)
+            .arg("list")
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let edits = from_paths(&String::from_utf8_lossy(&out.stdout));
+        if out.status.success() && !edits.mounts.is_empty() {
+            return Some(edits);
+        }
+    }
+    None
+}
+
+fn from_paths(listing: &str) -> Edits {
+    let mut edits = Edits::default();
+    let mut folders: Vec<String> = Vec::new();
+    for path in listing
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('/'))
+    {
+        let source = PathBuf::from(path);
+        let Ok(md) = std::fs::metadata(&source) else {
+            continue;
+        };
+        let device = path.starts_with("/dev/");
+        if path.contains(".so")
+            && let Some(dir) = source.parent().and_then(|d| d.to_str())
+            && !folders.iter().any(|f| f == dir)
+        {
+            folders.push(dir.to_owned());
+        }
+        edits.mounts.push(VolumeMount {
+            source,
+            target: path.to_owned(),
+            // The driver's files are the host's; a container reads them.
+            read_only: !device,
+            is_file: !md.is_dir(),
+            tmpfs: None,
+        });
+    }
+    link_sonames(&mut edits, &folders);
+    edits
 }
 
 fn apply(part: &serde_json::Value, edits: &mut Edits, folders: &mut Vec<String>) -> Result<()> {
@@ -271,6 +334,22 @@ pub fn soname(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listing_of_paths_becomes_devices_and_read_only_files() {
+        let dir = std::env::temp_dir().join(format!("rustainer-nv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = dir.join("libnvidia-ml.so.580.1");
+        std::fs::write(&lib, "x").unwrap();
+        let edits = from_paths(&format!(
+            "/dev/null\n{}\n/no/such/file\nnot a path\n",
+            lib.display()
+        ));
+        assert_eq!(edits.mounts.len(), 2);
+        assert!(!edits.mounts[0].read_only && edits.mounts[0].target == "/dev/null");
+        assert!(edits.mounts[1].read_only && edits.mounts[1].is_file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_cdi_name_is_not_a_path() {

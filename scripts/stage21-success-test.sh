@@ -662,6 +662,7 @@ ENV A=1 B="two words" \
 RUN --mount=type=secret,id=tok --mount=type=secret,id=envtok,target=/etc/envtok \
     sh -c 'cat /run/secrets/tok /etc/envtok | grep -c s3cr3t > /secret-lines; echo "$A/$B/$C" > /env-pairs'
 RUN --mount=type=secret,id=absent sh -c 'test -e /run/secrets/absent || echo none > /absent'
+RUN --mount=type=secret,id=envtok,env=AS_A_VARIABLE sh -c 'echo "${AS_A_VARIABLE}" | grep -c s3cr3t > /secret-as-env; echo "${NOT_GIVEN:-unset}" > /secret-env-absent'
 RSEND
 } > "$R/Dockerfile"
 OUT=$(MY_TOKEN="s3cr3t-from-the-environment" timeout 600 "$B" build --network none \
@@ -676,6 +677,8 @@ if grep -rqs -e s3cr3t-from "$RUSTAINER_IMAGE_ROOT" 2>/dev/null; then
 else
     ok "nor does anything in the image store"
 fi
+check "a secret asked for as a variable is one, for that step" "$(rrun rest:3 cat /secret-as-env)" "1"
+check "and is not in the image's environment" "$(rrun rest:3 sh -c 'echo "${AS_A_VARIABLE:-gone}"')" "gone"
 check "a secret the build was not given is simply absent" "$(rrun rest:3 cat /absent)" "none"
 check "one ENV sets several variables" "$(rrun rest:3 cat /env-pairs)" "1/two words/3"
 check "and each is in the image's environment" "$(rrun rest:3 sh -c 'echo "$B"')" "two words"
@@ -706,6 +709,18 @@ if "$B" exec "$HC" true >/dev/null 2>&1; then
     for _ in $(seq 1 40); do [ "$(health "$HC")" = healthy ] && break; sleep 0.25; done
     check "--health-cmd gives any container one" "$(health "$HC")" "healthy"
     "$B" rm --force "$HC" >/dev/null 2>&1
+    # The process doing the checking goes when what it checks does, and
+    # not at its next check: that one is five minutes away.
+    HC=$("$B" run -d --network none --health-cmd true --health-interval 300 "$IMG" sleep 300 2>/dev/null | tail -1)
+    sleep 1
+    WATCHER=$(pgrep -f "health-watch $HC" | head -1)
+    "$B" rm --force "$HC" >/dev/null 2>&1
+    for _ in $(seq 1 16); do kill -0 "$WATCHER" 2>/dev/null || break; sleep 0.25; done
+    if [ -n "$WATCHER" ] && ! kill -0 "$WATCHER" 2>/dev/null; then
+        ok "the watcher leaves with its container, not at its next check"
+    else
+        bad "the watcher leaves with its container, not at its next check (pid '$WATCHER')"
+    fi
 else
     "$B" rm --force "$HC" >/dev/null 2>&1
     for _ in 1 2 3 4 5; do skip "healthchecks need exec, which this shell cannot do"; done

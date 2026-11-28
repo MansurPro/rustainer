@@ -532,6 +532,12 @@ enum ModelCmd {
         /// `llama-server` will do, e.g. a `server-cuda` build.
         #[arg(long, default_value = "ghcr.io/ggml-org/llama.cpp:server")]
         image: String,
+        /// `all` runs the model on this machine's GPU: the server is
+        /// given the GPU the way `run --gpus all` gives it, and told to
+        /// put every layer there. Use it with a GPU build of the
+        /// server, e.g. `--image ghcr.io/ggml-org/llama.cpp:server-cuda`.
+        #[arg(long, value_parser = ["all"])]
+        gpus: Option<String>,
     },
     /// Stop serving a model. Its file is kept.
     Stop { model: String },
@@ -609,6 +615,7 @@ fn cmd_model(paths: &Paths, cmd: ModelCmd) -> Result<ExitCode> {
             model: m,
             port,
             image,
+            gpus,
         } => {
             let r = parse(&m)?;
             let id = container(&r);
@@ -633,6 +640,10 @@ fn cmd_model(paths: &Paths, cmd: ModelCmd) -> Result<ExitCode> {
                 ]
                 .map(OsString::from),
             );
+            if gpus.is_some() {
+                // More layers than any model has: all of them.
+                command.extend(["--n-gpu-layers", "999"].map(OsString::from));
+            }
             let _ = cmd_run(
                 paths,
                 RunArgs {
@@ -643,6 +654,7 @@ fn cmd_model(paths: &Paths, cmd: ModelCmd) -> Result<ExitCode> {
                     volumes: vec![format!("{}:/models:ro", path.parent().unwrap().display())],
                     publish: vec![format!("127.0.0.1:{port}:8080")],
                     restart: "no".into(),
+                    gpus,
                     command,
                     ..Default::default()
                 },
@@ -1669,7 +1681,46 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .iter()
         .find_map(|e| e.strip_prefix("PATH="))
         .map(|p| p.to_owned());
-    let exe = resolve_exe(&command[0], &search, image_path.as_deref())?;
+    // Devices named the way their vendor describes them, and `--gpus`
+    // when the vendor has described this machine's: see `cdi`.
+    let mut cdi_names: Vec<String> = args
+        .devices
+        .iter()
+        .filter(|d| cdi::is_name(d))
+        .cloned()
+        .collect();
+    let gpus_by_spec = args.gpus.is_some() && cdi::has_kind("nvidia.com/gpu");
+    if gpus_by_spec {
+        cdi_names.push("nvidia.com/gpu=all".into());
+    }
+    let mut cdi = cdi::resolve(&cdi_names)?;
+    // No spec for the GPU, but the driver's own tool is here and will
+    // say what a container needs: the same thing, asked directly.
+    let mut gpus_by_spec = gpus_by_spec;
+    if args.gpus.is_some()
+        && !gpus_by_spec
+        && let Some(from_driver) = cdi::nvidia_from_host()
+    {
+        cdi.mounts.extend(from_driver.mounts);
+        cdi.links.extend(from_driver.links);
+        gpus_by_spec = true;
+    }
+    for note in &cdi.notes {
+        eprintln!("rustainer: {note}");
+    }
+    let exe = resolve_exe(&command[0], &search, image_path.as_deref()).or_else(|e| {
+        // A program a device brings with it - `nvidia-smi` - is mounted
+        // into the container and is in no layer of the image.
+        let name = Path::new(&command[0]);
+        image_path
+            .as_deref()
+            .unwrap_or(DEFAULT_PATH)
+            .split(':')
+            .map(|dir| Path::new(dir).join(name))
+            .find(|c| cdi.mounts.iter().any(|m| Path::new(&m.target) == c))
+            .map(PathBuf::into_os_string)
+            .ok_or(e)
+    })?;
 
     // Stage 11. Without CAP_SYS_ADMIN here, the only way to get it is to
     // make a user namespace and be root inside that. We do it ourselves
@@ -1771,22 +1822,6 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .with_context(|| format!("container {id} already exists"))?;
 
     let (seccomp_profile, seccomp_unconfined) = resolve_seccomp(&args.security_opt)?;
-    // Devices named the way their vendor describes them, and `--gpus`
-    // when the vendor has described this machine's: see `cdi`.
-    let mut cdi_names: Vec<String> = args
-        .devices
-        .iter()
-        .filter(|d| cdi::is_name(d))
-        .cloned()
-        .collect();
-    let gpus_by_spec = args.gpus.is_some() && cdi::has_kind("nvidia.com/gpu");
-    if gpus_by_spec {
-        cdi_names.push("nvidia.com/gpu=all".into());
-    }
-    let cdi = cdi::resolve(&cdi_names)?;
-    for note in &cdi.notes {
-        eprintln!("rustainer: {note}");
-    }
     if !layers.is_empty() {
         // Links go into the container's own layer before it starts.
         let upper = Store::default_root()
@@ -4293,7 +4328,16 @@ fn cmd_health_watch(
             state = next;
             let _ = std::fs::write(&file, state);
         }
-        std::thread::sleep(Duration::from_secs(interval.max(1)));
+        // Waited a second at a time, looking each second for the
+        // container having gone: an image may ask to be checked every
+        // five minutes, and a process that outlives what it watches by
+        // that long is a process somebody finds and wonders about.
+        for _ in 0..interval.max(1) {
+            if !paths.dir(id).exists() {
+                return Ok(ExitCode::SUCCESS);
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 }
 
@@ -5897,7 +5941,9 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                         )
                         .chain(secrets.iter().filter_map(|(id, target)| {
                             let src = given_secrets.get(id)?;
-                            Some(Ok(format!("{}:{target}:ro", src.display())))
+                            target
+                                .starts_with('/')
+                                .then(|| Ok(format!("{}:{target}:ro", src.display())))
                         }))
                         .collect::<Result<_>>()?,
                     no_healthcheck: true,
@@ -5909,6 +5955,13 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                         .iter()
                         .cloned()
                         .chain(agent.iter().map(|_| format!("SSH_AUTH_SOCK={AGENT_AT}")))
+                        // A secret asked for as a variable: in this
+                        // step's environment, and nowhere in the image.
+                        .chain(secrets.iter().filter_map(|(id, target)| {
+                            let var = target.strip_prefix("env:")?;
+                            let value = std::fs::read_to_string(given_secrets.get(id)?).ok()?;
+                            Some(format!("{var}={value}"))
+                        }))
                         .collect(),
                     command: expanded.iter().map(OsString::from).collect(),
                     ..Default::default()
