@@ -5128,24 +5128,66 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                     .transpose()?;
                 // `--from` reads an earlier stage, or any image, where a
                 // plain COPY reads the context.
+                // With it, what identifies the source: the stage's own
+                // chain, or the image's digest. Either says everything
+                // about what is there to be copied.
+                let mut from_identity = String::new();
                 let from_layers = match from {
                     None => None,
                     Some(f) => {
                         let f = build::expand(f, &vars);
                         Some(match find_stage(&stages, &f) {
-                            Some(i) => stages[i].built.layers.clone(),
-                            None => match store.local(&f) {
-                                Some(i) => i.layers,
-                                None => {
-                                    store
+                            Some(i) => {
+                                from_identity = stages[i].chain.clone();
+                                stages[i].built.layers.clone()
+                            }
+                            None => {
+                                let image = match store.local(&f) {
+                                    Some(i) => i,
+                                    None => store
                                         .pull(&f, false)
-                                        .with_context(|| format!("pulling {f} for COPY --from"))?
-                                        .layers
-                                }
-                            },
+                                        .with_context(|| format!("pulling {f} for COPY --from"))?,
+                                };
+                                from_identity = image.digest;
+                                image.layers
+                            }
                         })
                     }
                 };
+                // So a COPY --from is looked up like a RUN: same source,
+                // same paths, same place, same owner - same layer. A
+                // copy from the context is not: reading the files to
+                // know whether they changed is the copy.
+                let from_record = from_layers.as_ref().map(|_| {
+                    let key = hash(&[
+                        &chain,
+                        "copy-from",
+                        &from_identity,
+                        &sources
+                            .iter()
+                            .map(|s| build::expand(s, &vars))
+                            .collect::<Vec<_>>()
+                            .join("\u{1f}"),
+                        &build::expand(dest, &vars),
+                        built.workdir.as_deref().unwrap_or(""),
+                        chown.as_deref().unwrap_or(""),
+                        chmod.as_deref().unwrap_or(""),
+                    ]);
+                    cache_dir.join(key.trim_start_matches("sha256:"))
+                });
+                if let Some(record) = from_record.as_ref().filter(|_| !args.no_cache)
+                    && let Ok(d) = std::fs::read_to_string(record)
+                    && let d = d.trim().to_owned()
+                    && store.layer_path(&d).is_dir()
+                {
+                    println!("        cached");
+                    reused += 1;
+                    chain = hash(&[&chain, "copy", &d]);
+                    built.layers.push(store.layer_path(&d));
+                    built.diff_ids.push(d.clone());
+                    sealed.push((d.clone(), store.layer_path(&d), Vec::new()));
+                    continue;
+                }
                 // A destination that is not absolute is inside WORKDIR.
                 let dest = build::expand(dest, &vars);
                 let dest = if dest.starts_with('/') {
@@ -5225,6 +5267,10 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 let (diff_id, tar) = build::seal_layer(&layer_dir)?;
                 chain = hash(&[&chain, "copy", &diff_id]);
                 let layer_dir = store.commit_layer(&diff_id, &layer_dir)?;
+                if let Some(record) = &from_record {
+                    let _ = std::fs::create_dir_all(&cache_dir);
+                    let _ = std::fs::write(record, &diff_id);
+                }
                 built.layers.push(layer_dir.clone());
                 built.diff_ids.push(diff_id.clone());
                 sealed.push((diff_id, layer_dir, tar));
@@ -5249,19 +5295,22 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 ]);
                 chain = key.clone();
                 let record = cache_dir.join(key.trim_start_matches("sha256:"));
-                // A hit needs three things to agree: a record of what
-                // this step produced, that layer still being in the
-                // store, and the layer still hashing to what the record
-                // says. The third is what stops a damaged or edited
-                // layer being built on as if it were the step's result.
+                // A hit needs two things: a record of what this step
+                // produced, and that layer still being in the store.
+                // The layer is not read again to check it still hashes
+                // to its name - it did when it was committed, the store
+                // is trusted with every pulled layer on the same terms,
+                // and reading it made a hit cost time in proportion to
+                // the layer, which is the opposite of what a cache is
+                // for. Its archive is made later, and only if the image
+                // turns out to need one.
                 let hit = (!args.no_cache)
                     .then(|| std::fs::read_to_string(&record).ok())
                     .flatten()
                     .map(|d| d.trim().to_owned())
                     .and_then(|d| {
                         let dir = store.layer_path(&d);
-                        let (now, tar) = dir.is_dir().then(|| build::seal_layer(&dir).ok())??;
-                        (now == d).then_some((d, dir, tar))
+                        dir.is_dir().then_some((d, dir, Vec::new()))
                     });
                 if let Some((diff_id, dir, tar)) = hit {
                     println!("        cached");
@@ -5408,6 +5457,13 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
         "rootfs": { "type": "layers", "diff_ids": diff_ids },
     });
     let config_bytes = serde_json::to_vec_pretty(&config)?;
+    // A reused layer came without its archive. One is only needed to
+    // compress the layer for a registry, and only the first time.
+    for (diff_id, dir, tar) in &mut sealed {
+        if tar.is_empty() && store.known_blob(diff_id).is_none() {
+            *tar = build::seal_layer(dir)?.1;
+        }
+    }
     let digest = store
         .adopt(&base_descriptors, &sealed, &config_bytes, &args.tag)
         .context("storing the built image")?;

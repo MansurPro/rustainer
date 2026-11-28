@@ -215,6 +215,24 @@ impl Store {
 
     /// Where a layer with this `diff_id` lives, or would live, for the
     /// kind of mount this process can make.
+    /// The compressed blob a layer was already written as, `(digest,
+    /// size)`, if that was noted and the blob is still there at that
+    /// size. A build asks so that it need not read a layer it reuses.
+    pub fn known_blob(&self, diff_id: &str) -> Option<(String, u64)> {
+        let note = self
+            .root
+            .join("blobs/by-layer")
+            .join(diff_id.trim_start_matches("sha256:"));
+        let n = std::fs::read_to_string(note).ok()?;
+        let (d, size) = n.trim().split_once(' ')?;
+        let size: u64 = size.parse().ok()?;
+        let blob = self
+            .root
+            .join("blobs/sha256")
+            .join(d.trim_start_matches("sha256:"));
+        (std::fs::metadata(blob).ok()?.len() == size).then(|| (d.to_owned(), size))
+    }
+
     pub fn layer_path(&self, diff_id: &str) -> PathBuf {
         self.layer_dir(diff_id, Self::userxattr())
     }
@@ -488,16 +506,7 @@ impl Store {
                 .root
                 .join("blobs/by-layer")
                 .join(diff_id.trim_start_matches("sha256:"));
-            let known = std::fs::read_to_string(&note).ok().and_then(|n| {
-                let (d, size) = n.trim().split_once(' ')?;
-                let size: u64 = size.parse().ok()?;
-                let blob = self
-                    .root
-                    .join("blobs/sha256")
-                    .join(d.trim_start_matches("sha256:"));
-                (std::fs::metadata(blob).ok()?.len() == size).then(|| (d.to_owned(), size))
-            });
-            let (d, size) = match known {
+            let (d, size) = match self.known_blob(diff_id) {
                 Some(k) => k,
                 None => {
                     let gz = {

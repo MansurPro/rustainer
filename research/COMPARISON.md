@@ -29,6 +29,12 @@ away.** Twelve speed ratios were measured against Docker, on two hosts:
 - The one that is not is network throughput, which is the same as
   Docker's and will stay the same: both hand packets to the same kernel
   bridge, and there is nothing in between to make faster.
+- **Docker wins one that is not in the table: a multi-stage build from
+  nothing.** The two build rows above are five trivial steps. A real
+  four-stage Node build takes rustainer 9.0 s and Docker 5.5 s, because
+  BuildKit builds independent stages at the same time and this engine
+  builds them in turn. Rebuilding the same image after a source edit
+  goes the other way, 0.86 s to 1.37 s (section 3, Build).
 - Memory is a separate axis and a larger one: 7× to 18× less per running
   container, and nothing resident when nothing runs (Docker: 120-170 MiB).
 - Compatibility: **29 of 29** Docker Hub images behave identically to
@@ -233,16 +239,33 @@ random value: a reused step is one whose value did not change.
 steps. A four-stage Node application - `apk add nodejs npm`, `npm
 install` under a cache mount, a build step, then a runtime stage that
 takes `node_modules` and `dist` with `COPY --from --chown` and runs as a
-non-root user with a `HEALTHCHECK` - builds in 9-12 s from nothing (the
-network is most of it), **0.73 s** when nothing changed and **1.5 s**
-after a source edit, where three of the cached steps are reused. The
-last two were 2.6 s and 3.4 s until this was measured: every build
-compressed every layer of the final image again to describe it for a
-registry. What a layer compresses to is now written down once, beside
-the blob. **Docker was not timed on this build**: the machine's Docker
-disk was 97% full and a build would have added cache that could not be
-removed without touching the owner's, so this is a figure for
-rustainer and not a ratio.
+non-root user with a `HEALTHCHECK` - was built by both engines from the
+same Dockerfile, the base image pinned by digest, on the same machine
+(Docker 29 with BuildKit 0.34 in Docker Desktop's VM; rustainer in a
+privileged container in that VM). Three runs of each rebuild:
+
+| | rustainer | Docker | |
+|---|---|---|---|
+| build from nothing | 8.9-9.0 s | 5.5 s | **Docker 1.6×** |
+| rebuild, nothing changed | 0.01 s | 0.20-0.22 s | rustainer ~20× |
+| rebuild after a source edit | 0.85-0.88 s | 1.29-1.45 s | rustainer 1.6× |
+
+Read the three rows separately. **From nothing, Docker is faster**, and
+for a reason that will not go away by tuning: BuildKit builds the
+`runtime` stage's `apk add` while the `base` stage's is still running,
+and this engine builds the stages it needs one after another. Docker
+also had the base image on disk and rustainer pulled it (about a
+second). The unchanged-rebuild ratio flatters rustainer: Docker's
+0.2 s includes its CLI on macOS talking to the VM, and nobody waits on
+either figure. The row that matters day to day is the third, and it was
+not always a win - the first measurement of this build had rustainer at
+2.6 s unchanged and 3.4 s after an edit, behind Docker on both. Three
+things were wrong: every build compressed every layer of the final image
+again to describe it for a registry; every cache hit read its whole
+layer back to check it still hashed to its name; and every `COPY --from`
+was done again. What a layer compresses to is now noted once beside the
+blob, a hit trusts the store as a `run` of a pulled image already does,
+and a `COPY --from` is keyed on the chain of the stage it reads.
 
 Thirteen Dockerfiles from a production monorepo were then read with
 `build --check` and three built. All thirteen parse. The exercise found
@@ -252,12 +275,10 @@ path`; one base image repeats an empty layer seven times), `ENV A=1
 B=2` set one variable to `1 B=2`, and `RUN --mount=type=secret` was
 refused.
 
-Two limits. A hit re-hashes the layer it is about to reuse, so that a
-damaged layer is never built upon - which makes a hit cost time
-proportional to the layer's size, where Docker's costs nothing. And the
-key cannot see the outside world: `RUN apk add curl` is one key whatever
-the package index says today, here as in Docker, and `--no-cache` is the
-answer in both.
+One limit, shared with Docker: the key cannot see the outside world.
+`RUN apk add curl` is one key whatever the package index says today,
+and `--no-cache` is the answer in both. A hit used to re-hash the layer
+it reused; it no longer does, for the reason in the table above.
 
 ### Network — the same
 

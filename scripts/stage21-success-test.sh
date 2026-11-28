@@ -351,6 +351,13 @@ check "nor is its environment" "$(mrun ms:1 cat /env-leak)" "0"
 contains "a stage the image does not need is not built" "$OUT" "skipped: nothing"
 check "a stage that nothing copies from leaves nothing" "$(mrun ms:1 sh -c 'test -e /srv/tested || echo absent')" "absent"
 
+# A COPY --from is reused while its source stage is what it was, and
+# done again the moment that stage is not.
+OUT=$(timeout 600 "$B" build --network none --build-arg WHO=stages -t ms:1b "$M" 2>&1)
+contains "a rebuild reuses every step, the copies between stages too" "$OUT" "6 step(s) reused"
+timeout 600 "$B" build --network none --build-arg WHO=again -t ms:2 "$M" >/dev/null 2>&1
+check "a copy from a stage that changed is made again" "$(mrun ms:2)" "hello again"
+check "and the earlier image is still what it was" "$(mrun ms:1b)" "hello stages"
 timeout 600 "$B" build --network none --target build -t ms:build "$M" >/dev/null 2>&1
 check "--target stops at a stage and tags it" "$?" "0"
 check "a relative WORKDIR is inside the one before" "$(mrun ms:build cat /where)" "/app/out"
