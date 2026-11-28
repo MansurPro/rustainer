@@ -2036,10 +2036,26 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
                     &read_from_layers(&search, "etc/group"),
                 )
                 .map_err(|e| anyhow::anyhow!("--user: {e}"))?;
-                if let Some(why) = spec.unmapped_reason(userns) {
-                    bail!("--user {u}: {why}");
+                match spec.unmapped_reason(userns) {
+                    None => Some(spec),
+                    // Asked for on the command line: refused, because
+                    // whoever typed it meant it.
+                    Some(why) if args.user.is_some() => bail!("--user {u}: {why}"),
+                    // Asked for by the image: nearly every image has a
+                    // `USER`, and refusing them all would mean a user
+                    // with one id can run almost nothing. It runs as
+                    // the one user there is - which outside the
+                    // container is the unprivileged caller, whatever it
+                    // reads as inside - and says so.
+                    Some(_) => {
+                        eprintln!(
+                            "rustainer: the image asks to run as {u}, and this user has one id \
+                             to be. Running as that one. With a sub-id range (/etc/subuid and \
+                             newuidmap) the image's user is a real one."
+                        );
+                        None
+                    }
                 }
-                Some(spec)
             }
         },
         seccomp: seccomp_profile,
