@@ -55,11 +55,20 @@ pub struct Built {
 /// exists to prevent.
 pub fn expand(text: &str, vars: &BTreeMap<String, String>) -> String {
     let b = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    // Bytes, put back together as text at the end: a `$` is ASCII, so
+    // cutting at one never splits a character, and everything between
+    // is copied as it is.
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        if b[i] == b'\\' && b.get(i + 1) == Some(&b'$') {
+            // `\$` is a dollar and not a variable.
+            out.push(b'$');
+            i += 2;
+            continue;
+        }
         if b[i] != b'$' {
-            out.push(b[i] as char);
+            out.push(b[i]);
             i += 1;
             continue;
         }
@@ -67,7 +76,7 @@ pub fn expand(text: &str, vars: &BTreeMap<String, String>) -> String {
             match b[i + 2..].iter().position(|&c| c == b'}') {
                 Some(end) => (&text[i + 2..i + 2 + end], i + 3 + end),
                 None => {
-                    out.push('$');
+                    out.push(b'$');
                     i += 1;
                     continue;
                 }
@@ -79,19 +88,34 @@ pub fn expand(text: &str, vars: &BTreeMap<String, String>) -> String {
                 .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
                 .map_or(b.len(), |p| start + p);
             if end == start {
-                out.push('$');
+                out.push(b'$');
                 i += 1;
                 continue;
             }
             (&text[start..end], end)
         };
+        // `${NAME:-default}` and `${NAME:+alternative}`, the two forms
+        // a Dockerfile has beside the plain one.
+        let (name, default, alternative) = match (name.split_once(":-"), name.split_once(":+")) {
+            (Some((n, d)), _) => (n, Some(d), None),
+            (_, Some((n, a))) => (n, None, Some(a)),
+            _ => (name, None, None),
+        };
         // An unset variable expands to nothing, as a shell would, rather
         // than being left as `$NAME`: leaving it produces a path with a
         // dollar in it and a failure far from the cause.
-        out.push_str(vars.get(name).map(String::as_str).unwrap_or(""));
+        let value = vars.get(name).map(String::as_str).filter(|v| !v.is_empty());
+        let value = match (value, default, alternative) {
+            (Some(_), _, Some(a)) => a,
+            (None, _, Some(_)) => "",
+            (Some(v), ..) => v,
+            (None, Some(d), _) => d,
+            (None, None, None) => "",
+        };
+        out.extend_from_slice(value.as_bytes());
         i = next;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Turn a finished overlay upper directory into a layer in the store.
@@ -717,6 +741,11 @@ mod tests {
         unsafe { std::env::set_var("RUSTAINER_BUILD_TEST", "leaked") };
         assert_eq!(expand("$RUSTAINER_BUILD_TEST", &vars), "");
         assert_eq!(expand("100$ and ${UNSET}x", &vars), "100$ and x");
+        assert_eq!(
+            expand("${V:-9}/${UNSET:-9}/${V:+set}/${UNSET:+set}", &vars),
+            "3.21/9/set/"
+        );
+        assert_eq!(expand("caf\u{e9} \\$V $V", &vars), "caf\u{e9} $V 3.21");
     }
 
     #[test]

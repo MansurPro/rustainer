@@ -117,6 +117,9 @@ pub struct Materialised {
     pub stop_signal: Option<String>,
     /// `ONBUILD` instructions: what a build FROM this image runs first.
     pub on_build: Vec<String>,
+    /// `VOLUME` paths: where the image expects data that is not part of
+    /// the container's own layer.
+    pub volumes: Vec<String>,
     pub report: extract::Report,
 }
 
@@ -836,6 +839,7 @@ impl Store {
             healthcheck: c.healthcheck.and_then(Health::from_config),
             stop_signal: c.stop_signal.filter(|s| !s.is_empty()),
             on_build: c.on_build.unwrap_or_default(),
+            volumes: c.volumes.unwrap_or_default().into_keys().collect(),
             report,
         })
     }
@@ -933,6 +937,7 @@ mod tests {
             healthcheck: None,
             stop_signal: None,
             on_build: vec![],
+            volumes: vec![],
             report: extract::Report::default(),
         };
         assert_eq!(m.command(), vec!["/bin/sh", "-c", "echo hi"]);
@@ -968,6 +973,7 @@ mod tests {
             healthcheck: None,
             stop_signal: None,
             on_build: vec![],
+            volumes: vec![],
             report: extract::Report::default(),
         };
         assert_eq!(m.command(), vec!["/bin/sh"]);

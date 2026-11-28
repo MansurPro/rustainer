@@ -157,8 +157,9 @@ echo "5. A volume shadows the image's content, and only while it is mounted"
 mkdir -p "$BASE/shadowed" && echo from-the-image > "$BASE/shadowed/which"
 check "without a volume the image's file is there" \
     "$(R /bin/cat /shadowed/which)" "from-the-image"
-check "with a volume the image's file is hidden" \
-    "$(R -v keeper:/shadowed /bin/sh -c 'cat /shadowed/which 2>/dev/null || echo hidden')" "hidden"
+mkdir -p "$SCRATCH/hostdir"
+check "a host directory mounted there hides the image's file" \
+    "$(R -v "$SCRATCH/hostdir:/shadowed" /bin/sh -c 'cat /shadowed/which 2>/dev/null || echo hidden')" "hidden"
 check "and the image is unchanged afterwards" \
     "$(cat "$BASE/shadowed/which")" "from-the-image"
 

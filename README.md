@@ -919,13 +919,26 @@ becomes part of a layer. `RUN --mount=type=secret,id=…` binds a file
 given with `--secret` (from a path, or from an environment variable) for
 that one step, read-only; no layer holds it, and one the build was not
 given is simply absent. `RUN --mount=type=bind,source=…,target=…` lends
-the step a file from the context without copying it. `ADD <url>` fetches
-the file. `ONBUILD` is recorded and runs first in a build `FROM` the
-image, against that build's context, once. `STOPSIGNAL` is what `stop`
-sends before it kills (`run --stop-signal` overrides it). `VOLUME` is
-recorded and not acted on: a container's writes land in its own layer
-either way. `--mount=type=ssh` and a bind mount from another stage are
-refused by name.
+the step a file from the context, or with `from=` from another stage or
+image, without copying it into the layer. `RUN --mount=type=ssh` gives
+the step the caller's SSH agent, and only when the build was started
+with `--ssh default`. `ADD <url>` fetches the file. `ONBUILD` is
+recorded and runs first in a build `FROM` the image, against that
+build's context, once. `STOPSIGNAL` is what `stop` sends before it kills
+(`run --stop-signal` overrides it).
+
+`VOLUME /data` gives each container a directory of its own at that
+path, outside its layer, started with what the image has there and
+removed with the container. A **named volume that is still empty**
+starts with the image's files too (`-v site:/usr/share/nginx/html`
+serves nginx's page, not nothing); a host directory never does.
+
+**A `$` in a command is the shell's.** `RUN`, `CMD`, `ENTRYPOINT` and a
+`HEALTHCHECK` command are kept exactly as written; `ARG` and `ENV` reach
+a `RUN` as its environment, as in Docker. Everywhere else - `FROM`,
+`COPY`, `ENV`, `WORKDIR`, `LABEL`, `USER`, `EXPOSE` - the build
+substitutes `$VAR`, `${VAR}`, `${VAR:-default}` and `${VAR:+alt}` itself,
+from `ARG` and `ENV` only.
 
 `HEALTHCHECK` is recorded and **acted on**: `run -d` on an image that has
 one starts checking it, and `ps` shows `running (healthy)`. `--health-cmd`,
@@ -983,6 +996,7 @@ rustainer run --device /dev/fuse alpine ls -l /dev/fuse
 rustainer run --pid host alpine ps            # the host's processes
 rustainer run --tmpfs /scratch:size=64m alpine df -h /scratch
 rustainer run --shm-size 1g --ulimit nofile=65536 postgres:16-alpine
+rustainer run --gpus all alpine ls /dev/dri            # the machine's GPU device nodes
 rustainer run --sysctl net.core.somaxconn=4096 nginx    # the host's settings are refused
 
 **The test is a round trip**: build, push, pull into a *clean* store, run.

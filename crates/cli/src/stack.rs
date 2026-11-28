@@ -188,6 +188,10 @@ pub struct Service {
     /// `/path` or `/path:size=64m`, as `run --tmpfs`.
     #[serde(default)]
     pub tmpfs: Vec<String>,
+    /// The container's name, when `<stack>-<service>` is not the one
+    /// wanted. Not with `replicas`: one name cannot be several.
+    #[serde(default)]
+    pub container_name: Option<String>,
     /// The signal `stop` sends first, as `run --stop-signal`.
     #[serde(default)]
     pub stop_signal: Option<String>,
@@ -848,7 +852,16 @@ impl Stack {
     /// `rustainer ps`, `logs`, `exec` and the page all work on them
     /// without knowing a stack exists.
     pub fn container_name(&self, service: &str) -> String {
-        format!("{}-{}", self.name, service)
+        // The name the file gives it, when it gives one: scripts and
+        // other tools find the container by it.
+        match self
+            .services
+            .get(service)
+            .and_then(|s| s.container_name.as_ref())
+        {
+            Some(n) => n.clone(),
+            None => format!("{}-{}", self.name, service),
+        }
     }
 
     /// Every container name for a service, which is one name unless it
@@ -971,6 +984,17 @@ image = "nginx:1.27-alpine"
 ports = ["8080:80"]
 depends_on = ["db"]
 "#;
+
+    #[test]
+    fn a_service_may_name_its_container() {
+        let s = Stack::parse_many(&[
+            "name=\"shop\"\n[services.db]\nimage=\"x\"\ncontainer_name=\"pg\"\n[services.web]\nimage=\"y\"\n"
+                .to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(s.container_names("db"), ["pg"]);
+        assert_eq!(s.container_names("web"), ["shop-web"]);
+    }
 
     #[test]
     fn a_stack_parses_and_orders_its_services() {

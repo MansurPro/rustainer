@@ -250,6 +250,13 @@ struct RunArgs {
     #[arg(long)]
     no_healthcheck: bool,
 
+    /// `all` gives the container this machine's GPU devices: the
+    /// `/dev/dri` nodes, and NVIDIA's and AMD's compute nodes where
+    /// they exist. The devices only - a program still needs the
+    /// userspace driver that matches them, from its image.
+    #[arg(long, value_parser = ["all"])]
+    gpus: Option<String>,
+
     /// The signal `stop` sends before it gives up and kills: `SIGQUIT`,
     /// `QUIT` or `3`. The image's `STOPSIGNAL` if it has one, else TERM.
     #[arg(long, value_name = "SIGNAL")]
@@ -1108,6 +1115,12 @@ struct BuildArgs {
     #[arg(long = "secret", value_name = "id=ID,src=FILE")]
     secrets: Vec<String>,
 
+    /// Let `RUN --mount=type=ssh` steps use this user's SSH agent, to
+    /// clone a private repository without a key in the image. Only
+    /// `default` is known: the agent at `$SSH_AUTH_SOCK`.
+    #[arg(long, value_parser = ["default"])]
+    ssh: Option<String>,
+
     /// Read the Dockerfile, say what is wrong with it, and build
     /// nothing.
     #[arg(long)]
@@ -1431,6 +1444,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
     let mut image_env: Vec<String> = Vec::new();
     let mut image_health: Option<rustainer_image::Health> = None;
     let mut image_stop_signal: Option<String> = None;
+    let mut image_volumes: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
     let mut image_user: Option<String> = None;
 
@@ -1508,6 +1522,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             image_env = image.env.clone();
             image_health = image.healthcheck.clone();
             image_stop_signal = image.stop_signal.clone();
+            image_volumes = image.volumes.clone();
             workdir = image.working_dir.clone();
             image_user = image.user.clone();
             layers = image
@@ -1690,7 +1705,9 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         // The host's IPC namespace is not much use without the host's
         // shared memory files.
         .chain((args.ipc.as_deref() == Some("host")).then(|| parse_volume("/dev/shm:/dev/shm")))
+        .chain(gpu_devices(args.gpus.as_deref())?.into_iter().map(Ok))
         .collect::<Result<Vec<_>>>()?;
+    let volumes = with_image_data(volumes, &image_volumes, &layers, &id)?;
     // A stack file reaches here without clap's list of values, and
     // `service:db` would otherwise quietly mean "private".
     if let Some(ipc) = &args.ipc
@@ -2653,6 +2670,104 @@ fn parse_volume(spec: &str) -> Result<rustainer_core::mount::VolumeMount> {
     })
 }
 
+/// `--gpus all`: every GPU device node this machine has, as binds.
+fn gpu_devices(gpus: Option<&str>) -> Result<Vec<rustainer_core::mount::VolumeMount>> {
+    if gpus.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut found: Vec<PathBuf> = Vec::new();
+    if Path::new("/dev/dri").is_dir() {
+        found.push("/dev/dri".into());
+    }
+    for e in std::fs::read_dir("/dev").into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("nvidia") || name == "kfd" {
+            found.push(e.path());
+        }
+    }
+    if found.is_empty() {
+        bail!(
+            "--gpus: this machine has no GPU device nodes (no /dev/dri, /dev/nvidia* \
+             or /dev/kfd), so there is nothing to give the container"
+        );
+    }
+    found.sort();
+    Ok(found
+        .into_iter()
+        .map(|p| rustainer_core::mount::VolumeMount {
+            target: p.to_string_lossy().into_owned(),
+            is_file: !p.is_dir(),
+            source: p,
+            read_only: false,
+            tmpfs: None,
+        })
+        .collect())
+}
+
+/// What an image's own files have to do with a container's volumes.
+///
+/// Two rules, both Docker's. A **named volume that is still empty**
+/// starts with whatever the image has at that path - which is why `-v
+/// site:/usr/share/nginx/html` serves nginx's page rather than nothing.
+/// And a path the image declares a `VOLUME`, with nothing mounted on
+/// it, gets a directory of its own outside the container's layer,
+/// started the same way. That one lives beside the container and goes
+/// when `rm` removes it.
+fn with_image_data(
+    mut volumes: Vec<rustainer_core::mount::VolumeMount>,
+    image_volumes: &[String],
+    layers: &[String],
+    id: &str,
+) -> Result<Vec<rustainer_core::mount::VolumeMount>> {
+    let layers: Vec<PathBuf> = layers.iter().map(PathBuf::from).collect();
+    if layers.is_empty() {
+        return Ok(volumes);
+    }
+    let seed = |dir: &Path, target: &str| -> Result<()> {
+        let rel = Path::new(target.trim_start_matches('/'));
+        let empty = std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none());
+        if empty && build::is_dir_in(&layers, rel) {
+            build::copy_merged(&layers, rel, dir).with_context(|| {
+                format!("starting the volume at {target} with the image's files")
+            })?;
+        }
+        Ok(())
+    };
+    for v in &volumes {
+        if v.tmpfs.is_none() && v.source.starts_with(volumes_root()) {
+            seed(&v.source, &v.target)?;
+        }
+    }
+    for (n, path) in image_volumes.iter().enumerate() {
+        let target = path.trim_end_matches('/');
+        if !target.starts_with('/') || target.is_empty() || target.split('/').any(|c| c == "..") {
+            continue;
+        }
+        // Something is already mounted there, or above it.
+        if volumes
+            .iter()
+            .any(|v| Path::new(target).starts_with(&v.target))
+        {
+            continue;
+        }
+        let dir = Store::default_root()
+            .join("containers")
+            .join(id)
+            .join("volumes")
+            .join(n.to_string());
+        std::fs::create_dir_all(&dir)?;
+        seed(&dir, target)?;
+        volumes.push(rustainer_core::mount::VolumeMount {
+            source: dir,
+            target: target.to_owned(),
+            read_only: false,
+            is_file: false,
+            tmpfs: None,
+        });
+    }
+    Ok(volumes)
+}
+
 /// A signal by name, with or without `SIG`, or by number.
 fn parse_signal(s: &str) -> Result<i32> {
     // Linux's numbers for the ones an image asks to be stopped with.
@@ -3355,6 +3470,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 target: svc.target.clone(),
                 secrets: Vec::new(),
                 check: false,
+                ssh: None,
                 warm: None,
                 context,
             },
@@ -4926,6 +5042,12 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                         s.1.push(f.clone());
                     }
                 }
+                // A bind mount from a stage reads that stage too.
+                Instruction::Run { binds, .. } => {
+                    if let Some(s) = stage_refs.last_mut() {
+                        s.1.extend(binds.iter().filter_map(|(from, ..)| from.clone()));
+                    }
+                }
                 _ => {}
             }
         }
@@ -4986,6 +5108,13 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                     current = (!from_stage).then(|| (k, image.clone(), true));
                 }
                 Instruction::Copy { from: Some(_), .. } => {
+                    if let Some(c) = &mut current {
+                        c.2 = false;
+                    }
+                }
+                // A step that binds from somewhere else ends the part
+                // of a stage that needs nothing, as a COPY --from does.
+                Instruction::Run { binds, .. } if binds.iter().any(|b| b.0.is_some()) => {
                     if let Some(c) = &mut current {
                         c.2 = false;
                     }
@@ -5067,6 +5196,9 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                         }
                         for s in &args.secrets {
                             c.arg("--secret").arg(s);
+                        }
+                        if let Some(s) = &args.ssh {
+                            c.arg("--ssh").arg(s);
                         }
                         c.arg(&context)
                             .stdin(std::process::Stdio::null())
@@ -5201,19 +5333,16 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
             }
             Instruction::User(u) => built.user = Some(build::expand(u, &vars)),
             Instruction::Expose(p) => built.exposed.push(build::expand(p, &vars)),
-            Instruction::Cmd(c) => {
-                built.cmd = c.iter().map(|x| build::expand(x, &vars)).collect();
-            }
-            Instruction::Entrypoint(c) => {
-                built.entrypoint = c.iter().map(|x| build::expand(x, &vars)).collect();
-            }
+            // Kept as written: `CMD echo $HOME` means the container's
+            // HOME when it runs, not a build's.
+            Instruction::Cmd(c) => built.cmd = c.clone(),
+            Instruction::Entrypoint(c) => built.entrypoint = c.clone(),
             Instruction::Healthcheck {
                 test,
                 interval,
                 retries,
             } => {
-                let test = test.iter().map(|x| build::expand(x, &vars)).collect();
-                built.healthcheck = Some((test, *interval, *retries));
+                built.healthcheck = Some((test.clone(), *interval, *retries));
             }
             Instruction::StopSignal(s) => built.stop_signal = Some(build::expand(s, &vars)),
             Instruction::OnBuild(s) => built.on_build.push(s.clone()),
@@ -5402,14 +5531,49 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 network,
                 secrets,
                 binds,
+                ssh,
             } => {
+                if args.warm.is_some() && binds.iter().any(|b| b.0.is_some()) {
+                    cleanup_staging();
+                    return Ok((String::new(), 0, 0));
+                }
+                // The agent's socket, bound where BuildKit puts it, and
+                // only when the build was started with --ssh: a file
+                // that asks for the agent does not get it by asking.
+                let agent = (*ssh && args.ssh.is_some())
+                    .then(|| std::env::var("SSH_AUTH_SOCK").ok())
+                    .flatten()
+                    .filter(|s| Path::new(s).exists());
+                const AGENT_AT: &str = "/run/buildkit/ssh_agent.0";
                 let network = network.as_ref().unwrap_or(&args.network);
-                let expanded: Vec<String> = argv.iter().map(|a| build::expand(a, &vars)).collect();
+                // The command is the shell's to read, not this
+                // program's: `$f` in a `for f in ...` loop is a variable
+                // that does not exist until the step is running. What a
+                // step gets from the build is its environment - the
+                // image's ENV, and every ARG, which is in the step's
+                // environment and not in the image's.
+                let expanded: Vec<String> = argv.clone();
+                let step_env: Vec<String> = built
+                    .env
+                    .iter()
+                    .cloned()
+                    .chain(
+                        arg_vars
+                            .iter()
+                            .filter(|(k, _)| {
+                                !built
+                                    .env
+                                    .iter()
+                                    .any(|e| e.split('=').next() == Some(k.as_str()))
+                            })
+                            .map(|(k, v)| format!("{k}={v}")),
+                    )
+                    .collect();
                 let key = hash(&[
                     &chain,
                     "run",
                     &expanded.join("\u{1f}"),
-                    &built.env.join("\u{1f}"),
+                    &step_env.join("\u{1f}"),
                     built.workdir.as_deref().unwrap_or(""),
                     built.user.as_deref().unwrap_or(""),
                     network,
@@ -5471,10 +5635,31 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                         // the empty file it was mounted on. One the
                         // build was not given is simply absent, as in
                         // Docker, and the step decides if that matters.
-                        .chain(binds.iter().map(|(source, target)| {
-                            let src = build::resolve_source(&context, source)?;
+                        .chain(binds.iter().enumerate().map(|(i, (from, source, target))| {
+                            let src = match from {
+                                None => build::resolve_source(&context, source)?,
+                                // From a stage or an image there is no
+                                // directory to bind, only layers, so
+                                // what it shows is copied out first.
+                                Some(f) => {
+                                    let f = build::expand(f, &vars);
+                                    let layers = match find_stage(&stages, &f) {
+                                        Some(s) => stages[s].built.layers.clone(),
+                                        None => match store.local(&f) {
+                                            Some(image) => image.layers,
+                                            None => store.pull(&f, false)?.layers,
+                                        },
+                                    };
+                                    let out = staging.join(format!("bind{n}-{i}"));
+                                    for p in build::sources_in(&layers, source)? {
+                                        build::copy_merged(&layers, &p, &out)?;
+                                    }
+                                    out
+                                }
+                            };
                             Ok(format!("{}:{target}:ro", src.display()))
                         }))
+                        .chain(agent.iter().map(|sock| Ok(format!("{sock}:{AGENT_AT}"))))
                         .chain(secrets.iter().filter_map(|(id, target)| {
                             let src = given_secrets.get(id)?;
                             Some(Ok(format!("{}:{target}:ro", src.display())))
@@ -5484,7 +5669,11 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                     hostname: "build".into(),
                     workdir: built.workdir.clone(),
                     user: built.user.clone(),
-                    env: built.env.clone(),
+                    env: step_env
+                        .iter()
+                        .cloned()
+                        .chain(agent.iter().map(|_| format!("SSH_AUTH_SOCK={AGENT_AT}")))
+                        .collect(),
                     command: expanded.iter().map(OsString::from).collect(),
                     ..Default::default()
                 };

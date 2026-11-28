@@ -104,7 +104,7 @@ echo "1. The file is read before anything is built"
 printf 'FROM %s\nFROB x\n' "$IMG" > "$CTX/Dockerfile"
 refuses "an unknown instruction is named" "not a Dockerfile instruction" \
     "$B" build --network none -t x:1 "$CTX"
-printf 'FROM %s\nRUN --mount=type=ssh true\n' "$IMG" > "$CTX/Dockerfile"
+printf 'FROM %s\nRUN --mount=type=tmpfs,target=/x true\n' "$IMG" > "$CTX/Dockerfile"
 refuses "an instruction we do not implement is refused, not skipped" "not implemented" \
     "$B" build --network none -t x:1 "$CTX"
 printf 'RUN true\n' > "$CTX/Dockerfile"
@@ -523,6 +523,74 @@ check "ADD of a URL builds" "$RC" "0"
 check "the file is under the URL's name in a directory" "$(rrun rest:url cat /dl/file.txt)" "fetched"
 check "or under the name the destination gives" "$(rrun rest:url cat /named.txt)" "fetched"
 
+# VOLUME: a directory of the container's own, outside its layer, that
+# starts with what the image has there. And a named volume that is
+# still empty starts the same way - both as Docker has them.
+OUT=$(rfile rest:vol <<'RSEND'
+RUN mkdir -p /data/sub && echo seeded > /data/sub/file && chmod 700 /data/sub
+VOLUME /data
+RSEND
+)
+check "an image's VOLUME is a mount of its own" "$(rrun rest:vol sh -c 'grep -c " /data " /proc/mounts')" "1"
+check "that starts with the image's files" "$(rrun rest:vol cat /data/sub/file)" "seeded"
+check "modes included" "$(rrun rest:vol stat -c %a /data/sub)" "700"
+check "and is writable under a read-only root" \
+    "$(rrun --read-only rest:vol sh -c 'echo w > /data/w && cat /data/w')" "w"
+check "an empty named volume starts with the image's files too" \
+    "$(rrun -v r21seed:/data rest:vol cat /data/sub/file)" "seeded"
+rrun -v r21seed:/data rest:vol sh -c 'rm -r /data/sub && echo mine > /data/mine' >/dev/null
+check "and is left alone once it holds something" \
+    "$(rrun -v r21seed:/data rest:vol sh -c 'ls /data | tr "\n" " "')" "mine "
+check "a mount over a VOLUME path replaces the image's volume" \
+    "$(rrun -v r21seed:/data rest:vol sh -c 'grep -c " /data " /proc/mounts')" "1"
+"$B" volume rm r21seed >/dev/null 2>&1
+VC=$("$B" run -d --network none rest:vol sleep 300 2>/dev/null | tail -1)
+check "the volume is kept beside the container" "$(ls -d "$RUSTAINER_IMAGE_ROOT/containers/$VC/volumes" 2>/dev/null | wc -l | tr -d ' ')" "1"
+"$B" rm --force "$VC" >/dev/null 2>&1
+check "and goes when the container does" "$(ls -d "$RUSTAINER_IMAGE_ROOT/containers/$VC" 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+# A bind mount from another stage, and the caller's SSH agent.
+{ printf 'FROM %s AS tools\nRUN mkdir /kit && echo wrench > /kit/tool\n' "$IMG"
+  printf 'FROM %s\n' "$IMG"
+  cat <<'RSEND'
+RUN --mount=type=bind,from=tools,source=/kit,target=/kit cat /kit/tool > /used
+RUN --mount=type=ssh sh -c 'if [ -S "${SSH_AUTH_SOCK:-/none}" ]; then echo agent; else echo none; fi > /agent'
+RSEND
+} > "$R/Dockerfile"
+python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$SCRATCH/agent.sock"
+SSH_AUTH_SOCK="$SCRATCH/agent.sock" timeout 600 "$B" build --network none -t rest:noagent "$R" >/dev/null 2>&1
+check "a bind mount from a stage lends that stage's files" "$(rrun rest:noagent cat /used)" "wrench"
+check "and leaves nothing of them in the image" "$(rrun rest:noagent sh -c 'ls /kit 2>/dev/null | wc -l' | tr -d ' ')" "0"
+check "a step that asks for the SSH agent does not get it by asking" "$(rrun rest:noagent cat /agent)" "none"
+SSH_AUTH_SOCK="$SCRATCH/agent.sock" timeout 600 "$B" build --no-cache --ssh default --network none -t rest:agent "$R" >/dev/null 2>&1
+check "with --ssh the step can reach the agent" "$(rrun rest:agent cat /agent)" "agent"
+
+# --gpus gives the machine's GPU nodes, or says there are none.
+if [ -d /dev/dri ] || ls /dev/nvidia* /dev/kfd >/dev/null 2>&1; then
+    check "--gpus all makes the GPU nodes visible" \
+        "$(rrun --gpus all "$IMG" sh -c 'ls -d /dev/dri /dev/nvidia* /dev/kfd 2>/dev/null | wc -l | tr -d " " | sed "s/^[1-9][0-9]*$/some/"')" "some"
+else
+    refuses "--gpus on a machine with no GPU says so" "no GPU device nodes" \
+        "$B" run --network none --gpus all "$IMG" true
+fi
+
+# What a `$` in a command means is the shell's business, at the time it
+# runs: the build puts ARG and ENV in the step's environment and leaves
+# the text alone. Substituting them itself used to empty every variable
+# a step set for itself.
+OUT=$(rfile rest:shell <<'RSEND'
+ARG GREETING=hello
+ENV PLACE=world
+RUN for w in a b c; do printf '%s' "$w"; done > /loop
+RUN X=local && echo "$X ${UNSET:-fallback} $GREETING $PLACE" > /vars
+CMD echo "$HOSTNAME-$PLACE-${GREETING:-arg-is-not-in-the-image}"
+RSEND
+)
+check "a variable a step sets for itself survives" "$(rrun rest:shell cat /loop)" "abc"
+check "ARG and ENV reach the step as environment" "$(rrun rest:shell cat /vars)" "local fallback hello world"
+check "a CMD's variables are the container's, read when it runs" \
+    "$(rrun --hostname box rest:shell)" "box-world-arg-is-not-in-the-image"
+
 # A secret is a file one step can read and no layer holds.
 echo "s3cr3t-from-a-file" > "$SCRATCH/tok.txt"
 { printf 'FROM %s\n' "$IMG"; cat <<'RSEND'
@@ -550,7 +618,7 @@ check "one ENV sets several variables" "$(rrun rest:3 cat /env-pairs)" "1/two wo
 check "and each is in the image's environment" "$(rrun rest:3 sh -c 'echo "$B"')" "two words"
 contains "--check reads a file and builds nothing" \
     "$("$B" build --check "$R" 2>&1)" "nothing this engine refuses"
-printf 'FROM %s\nRUN --mount=type=ssh true\n' "$IMG" > "$R/Dockerfile"
+printf 'FROM %s\nRUN --mount=type=tmpfs,target=/x true\n' "$IMG" > "$R/Dockerfile"
 refuses "and says what is wrong with one" "not implemented" "$B" build --check "$R"
 refuses "a build with no name is refused" "needs a name" "$B" build "$R"
 

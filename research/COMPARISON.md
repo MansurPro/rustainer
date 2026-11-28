@@ -354,10 +354,9 @@ A benchmark that omits this is an advertisement. None of the following is
 implemented here, and several are deliberate permanent omissions rather than
 work not yet done — `research/pass-2/RND.md` §19 says which are which.
 
-- **BuildKit** — `build` reads the whole Dockerfile language except
-  `--mount=type=ssh` and a bind mount from another stage: stages, `COPY
-  --from`, `--target`, `.dockerignore`, `ONBUILD`, `ADD <url>`, cache, secret
-  and context bind mounts, and a layer cache are all there, and a stage the
+- **BuildKit** — `build` reads the whole Dockerfile language: stages, `COPY
+  --from`, `--target`, `.dockerignore`, `ONBUILD`, `ADD <url>`, cache, secret,
+  bind and ssh mounts, and a layer cache are all there, and a stage the
   image is not built from is skipped. What it still is not is a full
   solver: a stage that starts from an image is built alongside the ones
   before it, but two stages that both start from another stage still take
@@ -723,7 +722,8 @@ more. Anything else - `uts`, `ipc: service:x`, `network_mode: service:x`
 later file adds to the earlier one, and an entry naming the same
 variable or container path replaces it - where two stack files replace
 a list whole. One difference in behaviour remains: a service's
-containers are named `<stack>-<service>`, not `<project>-<service>-1`.
+containers are named `<stack>-<service>`, not `<project>-<service>-1`,
+unless the file gives a `container_name`, which is used as it is.
 
 It was checked against a real project rather than a file written to
 pass: a development stack of Postgres 16, Redis, MinIO and a one-shot

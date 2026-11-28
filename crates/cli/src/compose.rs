@@ -25,7 +25,6 @@ const IGNORED: &[&str] = &[
     "userns_mode",
     "domainname",
     "mac_address",
-    "container_name",
     "hostname",
     "networks",
     "labels",
@@ -240,7 +239,7 @@ fn service(svc: &J, dir: &Path, notes: &mut Vec<String>) -> Result<Table> {
         };
         match k {
             "image" | "restart" | "user" | "platform" | "pid" | "ipc" | "shm_size"
-            | "stop_signal" => put_str(&mut t, k)?,
+            | "stop_signal" | "container_name" => put_str(&mut t, k)?,
             "sysctls" => {
                 t.insert(k.into(), pairs(v).context("sysctls")?);
             }
@@ -822,6 +821,7 @@ services:
     <<: *common
     image: postgres:16-alpine
     container_name: shop-db
+    hostname: db-host
     environment:
       POSTGRES_PASSWORD: secret
       PORT: 5432
@@ -864,7 +864,11 @@ volumes:
   pgdata:
 "#;
         let (doc, notes) = to_stack(yaml, Path::new("/srv/shop"), &BTreeMap::new()).unwrap();
-        assert_eq!(notes, ["container_name: ignored"]);
+        assert_eq!(notes, ["hostname: ignored"]);
+        assert_eq!(
+            doc["services"]["db"]["container_name"].as_str(),
+            Some("shop-db")
+        );
         let s = &doc["services"];
         assert_eq!(doc["name"].as_str(), Some("shop"));
         assert_eq!(s["db"]["restart"].as_str(), Some("unless-stopped"));
