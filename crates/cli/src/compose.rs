@@ -657,6 +657,54 @@ fn strings(v: &J) -> Result<T> {
 /// `KEY=value` strings from either shape Compose allows: a list of
 /// them, or a mapping. A key with no value is passed on bare, which
 /// means "the value I have".
+/// Lay a later Compose file over an earlier one, the way Compose does.
+///
+/// Mappings merge and a scalar is replaced, as in a stack. A list is
+/// **added to**, where a stack file's replaces: `ports` in an override
+/// file are more ports. An entry that names the same thing as an
+/// earlier one - a variable, a path in the container - takes its place.
+/// A command is one thing and is replaced whole.
+pub fn merge(base: &mut T, over: T, key: &str) {
+    match (base, over) {
+        (T::Table(b), T::Table(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(existing) => merge(existing, v, &k),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (T::Array(b), T::Array(o)) if !["command", "test"].contains(&key) => {
+            let id = |v: &T| -> String {
+                let Some(s) = v.as_str() else {
+                    return v.to_string();
+                };
+                let mut parts = s.split(':');
+                match key {
+                    "env" | "build_args" | "sysctls" | "ulimits" => {
+                        s.split('=').next().unwrap_or(s).to_owned()
+                    }
+                    "volumes" => match (parts.next(), parts.next()) {
+                        (_, Some(target)) | (Some(target), None) => target.to_owned(),
+                        _ => s.to_owned(),
+                    },
+                    "tmpfs" => parts.next().unwrap_or(s).to_owned(),
+                    _ => s.to_owned(),
+                }
+            };
+            for v in o {
+                match b.iter_mut().find(|e| id(e) == id(&v)) {
+                    Some(e) => *e = v,
+                    None => b.push(v),
+                }
+            }
+        }
+        (b, o) => *b = o,
+    }
+}
+
 fn pairs(v: &J) -> Result<T> {
     Ok(T::Array(match v {
         J::Array(a) => a
@@ -851,6 +899,35 @@ volumes:
             Some("host.docker.internal:10.0.0.1")
         );
         assert_eq!(s["web"]["memory"].as_str(), Some("256M"));
+    }
+
+    #[test]
+    fn a_later_file_adds_to_lists_and_replaces_what_it_names_again() {
+        let read = |y: &str| to_stack(y, Path::new("/p"), &BTreeMap::new()).unwrap().0;
+        let mut doc = read(
+            "services:\n  web:\n    image: a\n    command: [\"one\", \"two\"]\n    ports: [\"80:80\"]\n    \
+             environment: {A: \"1\", B: \"2\"}\n    volumes: [\"data:/data\", \"/etc/x:/x:ro\"]\n",
+        );
+        let over = read(
+            "services:\n  web:\n    command: [\"three\"]\n    ports: [\"443:443\", \"80:80\"]\n    \
+             environment: {B: \"two\", C: \"3\"}\n    volumes: [\"other:/data\"]\n  db:\n    image: b\n",
+        );
+        merge(&mut doc, over, "");
+        let web = &doc["services"]["web"];
+        let list = |k: &str| -> Vec<&str> {
+            web[k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect()
+        };
+        assert_eq!(web["image"].as_str(), Some("a"));
+        assert_eq!(list("command"), ["three"]);
+        assert_eq!(list("ports"), ["80:80", "443:443"]);
+        assert_eq!(list("env"), ["A=1", "B=two", "C=3"]);
+        assert_eq!(list("volumes"), ["other:/data", "/etc/x:/x:ro"]);
+        assert_eq!(doc["services"]["db"]["image"].as_str(), Some("b"));
     }
 
     #[test]

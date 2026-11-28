@@ -2799,6 +2799,9 @@ fn read_stack(files: &[PathBuf], profiles: &[String]) -> Result<stack::Stack> {
     // The other order would let a value substituted into one file be
     // read as TOML structure when another is merged over it.
     let mut texts: Vec<String> = Vec::with_capacity(files.len());
+    // The Compose file before this one, if that is what it was: two in
+    // a row are merged by Compose's rules, not a stack's.
+    let mut compose_before: Option<toml::Value> = None;
     for f in files {
         let t = std::fs::read_to_string(f).with_context(|| {
             format!(
@@ -2818,7 +2821,18 @@ fn read_stack(files: &[PathBuf], profiles: &[String]) -> Result<stack::Stack> {
             for n in notes {
                 eprintln!("rustainer: {}: {n}", f.display());
             }
+            let doc = match compose_before.take() {
+                Some(mut earlier) => {
+                    compose::merge(&mut earlier, doc, "");
+                    texts.pop();
+                    earlier
+                }
+                None => doc,
+            };
             t = toml::to_string(&doc).context("writing the Compose file as a stack")?;
+            compose_before = Some(doc);
+        } else {
+            compose_before = None;
         }
         texts.push(t);
     }

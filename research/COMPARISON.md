@@ -686,9 +686,10 @@ application works are dropped and **said to be** on stderr:
 `container_name`, `hostname`, `labels`, `logging`, `networks`,
 `stop_grace_period`, `init`, `oom_score_adj`, `cpu_shares` and a few
 more. Anything else - `userns_mode`, `cgroup_parent`, `ipc: service:x`
-- is refused by name before anything starts. Two differences in
-behaviour remain: several
-`-f` files replace a list where Compose appends to it, and a service's
+- is refused by name before anything starts. Several `-f` Compose files are merged by Compose's rules - a list in a
+later file adds to the earlier one, and an entry naming the same
+variable or container path replaces it - where two stack files replace
+a list whole. One difference in behaviour remains: a service's
 containers are named `<stack>-<service>`, not `<project>-<service>-1`.
 
 It was checked against a real project rather than a file written to
