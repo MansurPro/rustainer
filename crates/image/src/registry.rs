@@ -298,6 +298,8 @@ pub struct ConfigSection {
     pub user: Option<String>,
     #[serde(default, rename = "Healthcheck")]
     pub healthcheck: Option<HealthConfig>,
+    #[serde(default, rename = "Volumes")]
+    pub volumes: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     #[serde(default, rename = "StopSignal")]
     pub stop_signal: Option<String>,
     #[serde(default, rename = "OnBuild")]

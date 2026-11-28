@@ -714,7 +714,7 @@ services:
     extends:
       file: base.yml
       service: db
-    container_name: whatever
+    hostname: whatever
     command: sh -c "touch /ready; sleep 400"
     environment:
       GREETING: \${NOT_SET_ANYWHERE-hello there}
@@ -751,7 +751,7 @@ services:
 EOF
 UPC=$(timeout 300 "$B" stack up -f "$C/compose.yml" 2>&1)
 contains "it comes up, named after its directory" "$UPC" "shop-web"
-contains "a key that changes nothing is dropped, and said to be" "$UPC" "container_name: ignored"
+contains "a key that changes nothing is dropped, and said to be" "$UPC" "hostname: ignored"
 check "both services run" \
     "$("$B" stack ps -f "$C/compose.yml" 2>/dev/null | tail -n +2 | awk '$2 == "running"' | grep -c .)" "2"
 check "environment from the mapping, with the default substituted" \

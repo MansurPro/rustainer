@@ -38,9 +38,12 @@ pub enum Instruction {
         /// `--mount=type=secret`: `(id, target)`, a file the step can
         /// read and the image never holds.
         secrets: Vec<(String, String)>,
-        /// `--mount=type=bind`: `(source in the context, target)`, there
-        /// for the step to read and not copied into the image.
-        binds: Vec<(String, String)>,
+        /// `--mount=type=bind`: `(from, source, target)`, there for the
+        /// step to read and not copied into the image. From the
+        /// context unless `from` names a stage or an image.
+        binds: Vec<(Option<String>, String, String)>,
+        /// `--mount=type=ssh`: the caller's SSH agent, for this step.
+        ssh: bool,
     },
     Copy {
         sources: Vec<String>,
@@ -267,6 +270,7 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                 let (flags, rest) = leading_flags(rest);
                 let (mut caches, mut secrets, mut network) = (Vec::new(), Vec::new(), None);
                 let mut binds = Vec::new();
+                let mut ssh = false;
                 for f in flags {
                     if let Some(n) = f.strip_prefix("--network=") {
                         network = Some(n.to_owned());
@@ -297,15 +301,14 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                             // A bind with no type is what `--mount=target=`
                             // means. From the context only: one from a
                             // stage would need that stage mounted.
-                            (Some("bind") | None, Some(t)) if opt(&["from"]).is_none() => {
-                                binds.push((
-                                    opt(&["source", "src"]).unwrap_or_else(|| ".".into()),
-                                    t,
-                                ));
+                            (Some("bind") | None, Some(t)) => {
+                                let source = opt(&["source", "src"]).unwrap_or_else(|| ".".into());
+                                binds.push((opt(&["from"]), source, t));
                             }
+                            (Some("ssh"), _) => ssh = true,
                             (kind, _) => bail!(
                                 "{}: RUN --mount of type {} is not implemented; \
-                                 type=cache, type=secret and type=bind from the context are",
+                                 cache, secret, bind and ssh are",
                                 at(),
                                 kind.unwrap_or("bind")
                             ),
@@ -326,6 +329,7 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                     network,
                     secrets,
                     binds,
+                    ssh,
                 }
             }
             "COPY" | "ADD" => {
@@ -508,6 +512,7 @@ mod tests {
                 network: None,
                 secrets: vec![],
                 binds: vec![],
+                ssh: false,
             }
         );
     }
@@ -523,6 +528,7 @@ mod tests {
                 network: None,
                 secrets: vec![],
                 binds: vec![],
+                ssh: false,
             }
         );
         // No shell, so `&&` is just two words inside one argument.
@@ -534,6 +540,7 @@ mod tests {
                 network: None,
                 secrets: vec![],
                 binds: vec![],
+                ssh: false,
             }
         );
     }
@@ -565,7 +572,7 @@ mod tests {
     fn instructions_we_do_not_implement_are_refused_by_name() {
         // Not skipped. An image that quietly ignored HEALTHCHECK is not
         // the image the file describes.
-        for line in ["CROSS_BUILD x", "RUN --mount=type=ssh git clone x"] {
+        for line in ["CROSS_BUILD x", "RUN --mount=type=tmpfs,target=/x true"] {
             let e = parse(&format!("FROM a\n{line}\n")).unwrap_err().to_string();
             assert!(e.contains("not implemented"), "{line}: {e}");
         }
@@ -575,7 +582,7 @@ mod tests {
         .unwrap();
         assert_eq!(d[1], Instruction::OnBuild("COPY . /app".into()));
         assert!(matches!(&d[2], Instruction::Run { binds, .. }
-            if binds == &[("req.txt".to_owned(), "/r.txt".to_owned())]));
+            if binds == &[(None, "req.txt".to_owned(), "/r.txt".to_owned())]));
         assert!(parse("FROM a\nONBUILD FROM b\n").is_err());
         assert!(parse("FROM a\nONBUILD FROB\n").is_err());
         let e = parse("FROM a\nFROB x\n").unwrap_err().to_string();
@@ -606,6 +613,7 @@ mod tests {
                 network: Some("none".into()),
                 secrets: vec![],
                 binds: vec![],
+                ssh: false,
             }
         );
         assert!(
