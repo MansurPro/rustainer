@@ -544,8 +544,13 @@ fn compile_skipping_unknown(
 ) -> Result<Vec<libc::sock_filter>, SeccompError> {
     let mut kept: Vec<&str> = Vec::new();
     for n in names {
+        // Two DIFFERENT actions. The compiler refuses a filter whose
+        // rule and default actions are the same, so a probe written
+        // with "allow" twice failed for every name, known or not - and
+        // a profile with one unknown name in it was applied with no
+        // rules at all.
         let probe = serde_json::json!({
-            "f": { "default_action": "allow", "filter_action": "allow",
+            "f": { "default_action": "allow", "filter_action": "trap",
                    "filter": [{ "syscall": n }] }
         })
         .to_string();
@@ -801,6 +806,33 @@ pub unsafe fn apply(sec: &Security) -> Result<(), (Step, Errno)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_this_architecture_lacks_does_not_empty_the_profile() {
+        // `chmod` does not exist on arm64, and Docker's own profiles
+        // name it beside `fchmodat` for exactly that reason. Skipping
+        // the one must leave the other denied.
+        let with = |names: &[&str]| {
+            compile(&Profile {
+                default_action: Action::Allow,
+                default_errno: None,
+                syscalls: vec![SyscallRule {
+                    names: names.iter().map(|n| n.to_string()).collect(),
+                    action: Action::Errno,
+                    errno: Some(13),
+                    args: None,
+                }],
+            })
+            .unwrap()
+            .len()
+        };
+        let nothing = with(&["no_such_syscall_anywhere"]);
+        assert_eq!(
+            with(&["no_such_syscall_anywhere", "mkdirat"]),
+            with(&["mkdirat"])
+        );
+        assert!(with(&["no_such_syscall_anywhere", "mkdirat"]) > nothing);
+    }
 
     #[test]
     fn an_unmapped_id_is_detected_from_the_map_file() {

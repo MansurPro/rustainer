@@ -120,7 +120,22 @@ pub fn exec(paths: &Paths, id: &str, req: &mut Request) -> Result<Exit, Error> {
     // `/proc`, but `/sys/fs/cgroup` and the state directory are gone.
     let exe = resolve(init, &req.argv[0], &config.envp)?;
     let security = config.security()?;
-    let cgroup_fd = cgroup::open_existing(init);
+    // Only a cgroup this caller may put a process in. An unprivileged
+    // user without a delegated subtree runs the container in whatever
+    // cgroup their own session has, which is root's to write: asking
+    // `clone3` to place the command there fails with EACCES, and that
+    // was every `exec` - and so every healthcheck - for such a user.
+    // The command then starts in the caller's cgroup, which without
+    // delegation is the same one the container is in.
+    let cgroup_fd = cgroup::open_existing(init).filter(|fd| {
+        rustix::fs::accessat(
+            fd,
+            c"cgroup.procs",
+            rustix::fs::Access::WRITE_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )
+        .is_ok()
+    });
 
     let ns = config.to_spec().namespaces;
     // Opened before any join, for the same reason: `/proc/<init>/ns/*` is

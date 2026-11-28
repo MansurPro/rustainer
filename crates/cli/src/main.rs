@@ -250,6 +250,11 @@ struct RunArgs {
     #[arg(long)]
     no_healthcheck: bool,
 
+    /// Internal, set for a build's steps and never from the command
+    /// line: see `Config::fake_ids`.
+    #[arg(skip)]
+    fake_ids: bool,
+
     /// `all` gives the container this machine's GPU devices: the
     /// `/dev/dri` nodes, and NVIDIA's and AMD's compute nodes where
     /// they exist. The devices only - a program still needs the
@@ -1806,6 +1811,9 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         private_net,
         host_pid: args.pid.is_some(),
         host_ipc: args.ipc.as_deref() == Some("host"),
+        // Only where it is needed: a build run as real root changes
+        // owners for real.
+        fake_ids: args.fake_ids && one_id_only(),
         join_net,
         join_ipc,
         stop_signal: args
@@ -2779,6 +2787,17 @@ fn with_image_data(
         });
     }
     Ok(volumes)
+}
+
+/// Whether this process can be only one user: not root, or root inside
+/// a user namespace that maps a single id. Such a user cannot change a
+/// file's owner or become anyone else, which is most of what a package
+/// manager does.
+fn one_id_only() -> bool {
+    !rustix::process::geteuid().is_root()
+        || std::fs::read_to_string("/proc/self/uid_map")
+            .map(|m| m.split_whitespace().collect::<Vec<_>>() != ["0", "0", "4294967295"])
+            .unwrap_or(true)
 }
 
 /// A signal by name, with or without `SIG`, or by number.
@@ -5613,6 +5632,21 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                     .flatten()
                     .filter(|s| Path::new(s).exists());
                 const AGENT_AT: &str = "/run/buildkit/ssh_agent.0";
+                // apt fetches as a user of its own and then CHECKS that
+                // it became that user, so telling it the switch worked
+                // is not enough. It has a setting for a builder who
+                // cannot switch, and that is this builder: the setting
+                // is lent to the step, where the image has apt at all,
+                // and is not left behind in the layer.
+                const APT_NOTE: &str = "etc/apt/apt.conf.d/99rustainer-one-user";
+                let apt_as_root = (one_id_only()
+                    && build::is_dir_in(&built.layers, Path::new("etc/apt/apt.conf.d")))
+                .then(|| -> Result<PathBuf> {
+                    let f = staging.join("apt-one-user.conf");
+                    std::fs::write(&f, "APT::Sandbox::User \"root\";\n")?;
+                    Ok(f)
+                })
+                .transpose()?;
                 let network = network.as_ref().unwrap_or(&args.network);
                 // The command is the shell's to read, not this
                 // program's: `$f` in a `for f in ...` loop is a variable
@@ -5728,12 +5762,18 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                             Ok(format!("{}:{target}:ro", src.display()))
                         }))
                         .chain(agent.iter().map(|sock| Ok(format!("{sock}:{AGENT_AT}"))))
+                        .chain(
+                            apt_as_root
+                                .iter()
+                                .map(|f| Ok(format!("{}:/{APT_NOTE}:ro", f.display()))),
+                        )
                         .chain(secrets.iter().filter_map(|(id, target)| {
                             let src = given_secrets.get(id)?;
                             Some(Ok(format!("{}:{target}:ro", src.display())))
                         }))
                         .collect::<Result<_>>()?,
                     no_healthcheck: true,
+                    fake_ids: true,
                     hostname: "build".into(),
                     workdir: built.workdir.clone(),
                     user: built.user.clone(),
@@ -5769,6 +5809,10 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 let layer_dir = staging.join(format!("layer{n}"));
                 std::fs::rename(&upper, &layer_dir)
                     .with_context(|| format!("harvesting the layer of step {}", n + 1))?;
+                // The empty file the apt setting was mounted on.
+                if apt_as_root.is_some() {
+                    let _ = std::fs::remove_file(layer_dir.join(APT_NOTE));
+                }
                 let _ = supervise::remove(paths, &step_id, true);
 
                 let (diff_id, tar) = build::seal_layer(&layer_dir)?;

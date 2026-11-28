@@ -186,7 +186,10 @@ cat > "$SCRATCH/prof.json" <<'JSON'
 {"defaultAction":"SCMP_ACT_ALLOW",
  "syscalls":[{"names":["chmod","fchmodat"],"action":"SCMP_ACT_ERRNO","errnoRet":1}]}
 JSON
-OUT=$(NR --security-opt "seccomp=$SCRATCH/prof.json" /bin/sh -c 'chmod 777 /tmp 2>&1' 2>/dev/null | tail -1)
+# As ROOT in the container, where chmod would otherwise succeed. Run as
+# an ordinary user it fails with the same words whether or not the
+# profile was applied, and for a long time that is what this checked.
+OUT=$(R --security-opt "seccomp=$SCRATCH/prof.json" /bin/sh -c 'chmod 777 /tmp 2>&1' 2>/dev/null | tail -1)
 echo "  $OUT"
 echo "$OUT" | grep -qi 'not permitted' && ok "the custom profile's errno is returned" \
     || bad "the custom profile was not applied"
