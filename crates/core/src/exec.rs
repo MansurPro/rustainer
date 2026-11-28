@@ -143,6 +143,15 @@ pub fn exec(paths: &Paths, id: &str, req: &mut Request) -> Result<Exit, Error> {
 
     let envp = merge_env(&config.envp, &req.env);
 
+    // The container's `--ulimit`s, taken on by this process so that the
+    // command inherits them: a limit that a shell opened with `exec`
+    // does not have is not a limit on the container. Best effort,
+    // because raising one needs a privilege this caller may lack where
+    // the supervisor had it.
+    for &(resource, soft, hard) in &config.rlimits {
+        let _ = sys::setrlimit(resource, soft, hard);
+    }
+
     let spec = Spec {
         exe: exe.into(),
         argv: req.argv.iter().map(Into::into).collect(),

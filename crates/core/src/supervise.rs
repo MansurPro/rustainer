@@ -196,6 +196,16 @@ pub struct Config {
     /// processes, and exactly as much exposure as that sounds like.
     #[serde(default)]
     pub host_pid: bool,
+    /// Share the host's System V IPC and POSIX message queues: `--ipc
+    /// host`.
+    #[serde(default)]
+    pub host_ipc: bool,
+    /// `--sysctl`: `(name, value)`, the name dotted as `sysctl` prints it.
+    #[serde(default)]
+    pub sysctls: Vec<(String, String)>,
+    /// `--ulimit`: `(resource number, soft, hard)`.
+    #[serde(default)]
+    pub rlimits: Vec<(u32, u64, u64)>,
     /// Attach to the bridge and get an address. Implies `private_net`.
     #[serde(default)]
     pub bridge: bool,
@@ -330,6 +340,7 @@ impl Config {
                 mount: self.rootfs.is_some(),
                 net: self.private_net || self.bridge,
                 pid: !self.host_pid,
+                ipc: !self.host_ipc,
                 user: self.userns,
                 ..Namespaces::STAGE1
             },
@@ -504,6 +515,28 @@ impl Config {
             &binds,
             &self.volumes,
         )?;
+        // A sysctl is only the container's to set if it lives in a
+        // namespace the container has to itself. Everything else under
+        // /proc/sys is the HOST's setting, and writing it from here would
+        // change it for every process on the machine.
+        let mut sysctls = Vec::new();
+        for (name, value) in &self.sysctls {
+            let own_net = self.private_net || self.bridge;
+            let allowed = name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                && !name.contains("..")
+                && ((name.starts_with("net.") && own_net)
+                    || (!self.host_ipc
+                        && ["kernel.shm", "kernel.msg", "kernel.sem", "fs.mqueue."]
+                            .iter()
+                            .any(|p| name.starts_with(p))));
+            if !allowed {
+                return Err(Error::Sysctl(name.clone()));
+            }
+            sysctls.push((name.replace('.', "/"), value.clone()));
+        }
+        let plan = plan.with_settings(&sysctls, &self.rlimits)?;
         Ok(Some(if self.privileged {
             plan.privileged()
         } else {
@@ -514,6 +547,13 @@ impl Config {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error(
+        "--sysctl {0}: not a setting a container can have to itself. Those are `net.*` \
+         (with a network of its own) and the IPC ones - `kernel.shm*`, `kernel.msg*`, \
+         `kernel.sem`, `fs.mqueue.*` (without --ipc host). Anything else is the host's, \
+         and setting it here would change it for every process on the machine"
+    )]
+    Sysctl(String),
     #[error(transparent)]
     Core(#[from] crate::Error),
     #[error(transparent)]
@@ -1672,6 +1712,9 @@ mod tests {
             overlay_dir: None,
             private_net: false,
             host_pid: false,
+            host_ipc: false,
+            sysctls: Vec::new(),
+            rlimits: Vec::new(),
             bridge: false,
             ip: None,
             ports: Vec::new(),

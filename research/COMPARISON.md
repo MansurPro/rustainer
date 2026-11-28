@@ -660,7 +660,7 @@ What is not, in two kinds. Keys that do not change whether the
 application works are dropped and **said to be** on stderr:
 `container_name`, `hostname`, `labels`, `logging`, `networks`,
 `stop_grace_period`, `init`, `oom_score_adj`, `cpu_shares` and a few
-more. Anything else - `ipc`, `sysctls`, `ulimits`, `shm_size`
+more. Anything else - `userns_mode`, `cgroup_parent`, `ipc: service:x`
 - is refused by name before anything starts. Two differences in
 behaviour remain: several
 `-f` files replace a list where Compose appends to it, and a service's

@@ -287,6 +287,28 @@ struct RunArgs {
     #[arg(long, value_parser = ["host"])]
     pid: Option<String>,
 
+    /// `host` shares the host's shared memory, semaphores and message
+    /// queues, `/dev/shm` included. `private`, the default, is its own.
+    #[arg(long, value_parser = ["host", "private", "shareable"])]
+    ipc: Option<String>,
+
+    /// How big `/dev/shm` is: `256m`, `1g`. 64m unless said. What
+    /// PostgreSQL, Chromium and PyTorch data loaders run out of.
+    #[arg(long, value_name = "SIZE")]
+    shm_size: Option<String>,
+
+    /// A resource limit for every process in the container:
+    /// `nofile=65536`, or `nofile=1024:65536` for soft and hard.
+    /// Repeatable.
+    #[arg(long = "ulimit", value_name = "NAME=SOFT[:HARD]")]
+    ulimits: Vec<String>,
+
+    /// A kernel setting for the container's own namespaces:
+    /// `net.core.somaxconn=1024`. Repeatable. A setting that belongs to
+    /// the host is refused.
+    #[arg(long = "sysctl", value_name = "NAME=VALUE")]
+    sysctls: Vec<String>,
+
     /// Hostname inside the container's UTS namespace.
     #[arg(long, default_value = "container")]
     hostname: String,
@@ -1633,6 +1655,37 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .map(|v| parse_volume(v))
         .chain(args.devices.iter().map(|d| parse_device(d)))
         .chain(args.tmpfs.iter().map(|t| parse_tmpfs(t)))
+        // Mounted after the default 64m one, and so over it.
+        .chain(
+            args.shm_size
+                .iter()
+                .map(|s| parse_tmpfs(&format!("/dev/shm:size={},mode=1777", parse_size(s)?))),
+        )
+        // The host's IPC namespace is not much use without the host's
+        // shared memory files.
+        .chain((args.ipc.as_deref() == Some("host")).then(|| parse_volume("/dev/shm:/dev/shm")))
+        .collect::<Result<Vec<_>>>()?;
+    // A stack file reaches here without clap's list of values, and
+    // `service:db` would otherwise quietly mean "private".
+    if let Some(ipc) = &args.ipc
+        && !["host", "private", "shareable"].contains(&ipc.as_str())
+    {
+        bail!("ipc {ipc:?} is not supported; it is `host` or `private`");
+    }
+    let rlimits = args
+        .ulimits
+        .iter()
+        .map(|u| parse_ulimit(u))
+        .collect::<Result<Vec<_>>>()?;
+    let sysctls = args
+        .sysctls
+        .iter()
+        .map(|s| {
+            let (k, v) = s
+                .split_once('=')
+                .with_context(|| format!("--sysctl {s:?} is not name=value"))?;
+            Ok((k.trim().to_owned(), v.to_owned()))
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let (restart_policy, restart_max) = supervise::RestartPolicy::parse(&args.restart)
@@ -1698,6 +1751,9 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         // overlayfs, and overlayfs cannot host an upperdir at all.
         private_net,
         host_pid: args.pid.is_some(),
+        host_ipc: args.ipc.as_deref() == Some("host"),
+        sysctls,
+        rlimits,
         bridge,
         network: network_def.clone(),
         userns,
@@ -2565,6 +2621,55 @@ fn parse_volume(spec: &str) -> Result<rustainer_core::mount::VolumeMount> {
     })
 }
 
+/// `--ulimit name=soft[:hard]` as `(resource number, soft, hard)`.
+fn parse_ulimit(spec: &str) -> Result<(u32, u64, u64)> {
+    // Linux's numbers, the same on every architecture this runs on.
+    const NAMES: [(&str, u32); 16] = [
+        ("cpu", 0),
+        ("fsize", 1),
+        ("data", 2),
+        ("stack", 3),
+        ("core", 4),
+        ("rss", 5),
+        ("nproc", 6),
+        ("nofile", 7),
+        ("memlock", 8),
+        ("as", 9),
+        ("locks", 10),
+        ("sigpending", 11),
+        ("msgqueue", 12),
+        ("nice", 13),
+        ("rtprio", 14),
+        ("rttime", 15),
+    ];
+    let (name, value) = spec
+        .split_once('=')
+        .with_context(|| format!("--ulimit {spec:?} is not name=soft[:hard]"))?;
+    let resource = NAMES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, r)| *r)
+        .with_context(|| {
+            let known: Vec<_> = NAMES.iter().map(|(n, _)| *n).collect();
+            format!(
+                "--ulimit {name:?} is not a limit; they are {}",
+                known.join(", ")
+            )
+        })?;
+    let number = |v: &str| match v {
+        "-1" | "unlimited" => Ok(u64::MAX),
+        v => v
+            .parse()
+            .with_context(|| format!("--ulimit {spec:?}: {v:?} is not a number or `unlimited`")),
+    };
+    let (soft, hard) = value.split_once(':').unwrap_or((value, value));
+    let (soft, hard) = (number(soft)?, number(hard)?);
+    if soft > hard {
+        bail!("--ulimit {spec:?}: the soft limit is above the hard one");
+    }
+    Ok((resource, soft, hard))
+}
+
 /// `--tmpfs /path[:options]`. Docker's options, the ones that mean
 /// something to a tmpfs; anything else is refused rather than passed to
 /// the kernel to be refused there with EINVAL and no word about which.
@@ -3080,6 +3185,10 @@ fn stack_run(paths: &Paths, st: &stack::Stack, args: &StackRunArgs) -> Result<Ex
         privileged: svc.privileged,
         pid: svc.pid.clone(),
         tmpfs: svc.tmpfs.clone(),
+        ipc: svc.ipc.clone(),
+        shm_size: svc.shm_size.clone(),
+        ulimits: svc.ulimits.clone(),
+        sysctls: svc.sysctls.clone(),
         read_only: svc.read_only,
         cap_add: svc.cap_add.clone(),
         cap_drop: svc.cap_drop.clone(),
@@ -3314,6 +3423,10 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 privileged: svc.privileged,
                 pid: svc.pid.clone(),
                 tmpfs: svc.tmpfs.clone(),
+                ipc: svc.ipc.clone(),
+                shm_size: svc.shm_size.clone(),
+                ulimits: svc.ulimits.clone(),
+                sysctls: svc.sysctls.clone(),
                 read_only: svc.read_only,
                 cap_add: svc.cap_add.clone(),
                 cap_drop: svc.cap_drop.clone(),

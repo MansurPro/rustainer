@@ -188,6 +188,18 @@ pub struct Service {
     /// `/path` or `/path:size=64m`, as `run --tmpfs`.
     #[serde(default)]
     pub tmpfs: Vec<String>,
+    /// `host`, or `private`: as `run --ipc`.
+    #[serde(default)]
+    pub ipc: Option<String>,
+    /// How big `/dev/shm` is, as `run --shm-size`.
+    #[serde(default)]
+    pub shm_size: Option<String>,
+    /// `name=soft[:hard]`, as `run --ulimit`.
+    #[serde(default)]
+    pub ulimits: Vec<String>,
+    /// `name=value`, as `run --sysctl`.
+    #[serde(default)]
+    pub sysctls: Vec<String>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
