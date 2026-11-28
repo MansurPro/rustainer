@@ -198,7 +198,9 @@ fn hold(
             for fd in 0..3 {
                 libc::dup2(null, fd);
             }
-            libc::close_range(3, u32::MAX, 0);
+            // The system call itself: musl's bindings have no wrapper
+            // for it, and the static binary is built against musl.
+            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
             libc::prctl(libc::PR_SET_NAME, c"rustainer-ns".as_ptr());
             loop {
                 libc::pause();
