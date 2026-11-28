@@ -1113,6 +1113,12 @@ struct BuildArgs {
     #[arg(long)]
     check: bool,
 
+    /// Internal: build one stage up to its first `COPY --from` and tag
+    /// nothing, so that the build that started this finds those steps
+    /// already done. See `build_image`.
+    #[arg(long, hide = true)]
+    warm: Option<usize>,
+
     /// The build context: the directory COPY may read from.
     #[arg(default_value = ".")]
     context: PathBuf,
@@ -3349,6 +3355,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 target: svc.target.clone(),
                 secrets: Vec::new(),
                 check: false,
+                warm: None,
                 context,
             },
         )
@@ -4716,7 +4723,7 @@ fn new_id() -> Result<String> {
 /// history that only lists the builds that worked cannot answer the
 /// question it is opened for, which is what went wrong.
 fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
-    if args.check {
+    if args.check || args.warm.is_some() {
         // Nothing is built, so there is nothing for the history.
         return build_image(paths, args).map(|_| ExitCode::SUCCESS);
     }
@@ -4766,7 +4773,8 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
     let text =
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     let mut instructions = crate::dockerfile::parse(&text)?;
-    if let Some(target) = &args.target {
+    let target = args.warm.map(|k| k.to_string()).or(args.target.clone());
+    if let Some(target) = &target {
         // The file up to the end of the target stage is the whole build.
         let starts: Vec<(usize, Option<&String>)> = instructions
             .iter()
@@ -4937,8 +4945,76 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 todo.extend(by_name.or_else(|| r.parse().ok().filter(|n| *n < i)));
             }
         }
-        needed
+        // Warming one stage: that stage and nothing else.
+        match args.warm {
+            Some(k) => (0..needed.len()).map(|i| i == k).collect(),
+            None => needed,
+        }
     };
+    // Stages to build at the same time as the ones before them: each a
+    // process of this program, building that one stage as far as its
+    // first `COPY --from` and tagging nothing. Their steps land in the
+    // cache, and this build, when it gets there, finds them done. It is
+    // the pattern nearly every multi-stage file has - a runtime stage
+    // that installs its packages while the builder stage compiles - and
+    // what a build from nothing spends its time on.
+    //
+    // Only a stage that starts from an image, not from another stage:
+    // such a stage needs nothing this build has yet to make.
+    // ponytail: the stages BEFORE the first `COPY --from` only. A full
+    // solver would also run two builder stages side by side.
+    let to_warm: Vec<(usize, String)> = {
+        let mut out = Vec::new();
+        let mut aliases: Vec<Option<String>> = Vec::new();
+        let mut current: Option<(usize, String, bool)> = None; // stage, image, still before a COPY --from
+        let mut runs = false;
+        for ins in &instructions {
+            match ins {
+                Instruction::From { image, alias } => {
+                    if let Some((k, img, _)) = current.take().filter(|_| runs) {
+                        out.push((k, img));
+                    }
+                    let k = aliases.len();
+                    let from_stage = aliases
+                        .iter()
+                        .flatten()
+                        .any(|a| a.eq_ignore_ascii_case(image))
+                        || image.parse::<usize>().is_ok_and(|n| n < k)
+                        || image == "scratch";
+                    aliases.push(alias.clone());
+                    runs = false;
+                    current = (!from_stage).then(|| (k, image.clone(), true));
+                }
+                Instruction::Copy { from: Some(_), .. } => {
+                    if let Some(c) = &mut current {
+                        c.2 = false;
+                    }
+                }
+                Instruction::Run { .. } => runs |= current.as_ref().is_some_and(|c| c.2),
+                _ => {}
+            }
+        }
+        if let Some((k, img, _)) = current.take().filter(|_| runs) {
+            out.push((k, img));
+        }
+        out.retain(|(k, _)| *k > 0 && needed.get(*k).copied().unwrap_or(false));
+        if args.warm.is_some() || args.no_cache {
+            out.clear();
+        }
+        out
+    };
+    /// The warming processes, stopped if the build ends without them.
+    struct Warmers(BTreeMap<usize, std::process::Child>);
+    impl Drop for Warmers {
+        fn drop(&mut self) {
+            for c in self.0.values_mut() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+    let mut warmers = Warmers(BTreeMap::new());
+    let mut warm_started = false;
     let mut stage_no = 0usize;
     let mut skipping = false;
 
@@ -4969,6 +5045,45 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 }
             }
             Instruction::From { image, alias } => {
+                // At the first FROM, because the ARGs above it have
+                // been read by now and a base image may be named with
+                // one. Each base is pulled here first: two processes
+                // pulling one image at once is not something the store
+                // is asked to survive.
+                if !std::mem::replace(&mut warm_started, true) {
+                    for (k, image) in &to_warm {
+                        let reference = build::expand(image, &arg_vars);
+                        if store.local(&reference).is_none()
+                            && store.pull(&reference, false).is_err()
+                        {
+                            continue;
+                        }
+                        let mut c = std::process::Command::new("/proc/self/exe");
+                        c.arg("--root").arg(paths_root(paths)).arg("build");
+                        c.arg("--warm").arg(k.to_string()).arg("-f").arg(&file);
+                        c.arg("--network").arg(&args.network);
+                        for a in &args.build_args {
+                            c.arg("--build-arg").arg(a);
+                        }
+                        for s in &args.secrets {
+                            c.arg("--secret").arg(s);
+                        }
+                        c.arg(&context)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null());
+                        if let Ok(child) = c.spawn() {
+                            warmers.0.insert(*k, child);
+                        }
+                    }
+                }
+                // This stage was being built elsewhere: wait for that,
+                // then walk it here and find its steps in the cache.
+                // Whether it worked does not matter - what it did not
+                // finish is simply done now.
+                if let Some(mut child) = warmers.0.remove(&stage_no) {
+                    let _ = child.wait();
+                }
                 if started {
                     stages.push(Stage {
                         alias: alias_now.take(),
@@ -5115,6 +5230,12 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 chmod,
                 unpack,
             } => {
+                if args.warm.is_some() && from.is_some() {
+                    // As far as a warming build goes: the rest needs a
+                    // stage only the real build has.
+                    cleanup_staging();
+                    return Ok((String::new(), 0, 0));
+                }
                 let owner = chown
                     .as_ref()
                     .map(|c| build::owner(&built.layers, &build::expand(c, &vars)))
@@ -5405,6 +5526,10 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 sealed.push((diff_id, layer_dir, tar));
             }
         }
+    }
+    if args.warm.is_some() {
+        cleanup_staging();
+        return Ok((String::new(), 0, 0));
     }
     if reused > 0 {
         println!("{reused} step(s) reused from an earlier build");

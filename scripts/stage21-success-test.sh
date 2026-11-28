@@ -371,6 +371,25 @@ check "a stage built on a stage has both" "$(mrun ms:tested sh -c 'cat /app/out/
 refuses "a --target the file does not have is refused" "has no stage" \
     timeout 60 "$B" build --network none --target nope -t ms:x "$M"
 
+# A stage that starts from an image is built at the same time as the
+# ones before it, as far as its first COPY --from. The build that asked
+# for it then finds those steps done - on a file it has never seen.
+NONCE=$RANDOM$RANDOM
+cat > "$M/Dockerfile" <<MSEND
+FROM $IMG AS build
+RUN echo "built $NONCE" > /artefact
+FROM $IMG
+RUN echo "installed $NONCE" > /installed
+COPY --from=build /artefact /artefact
+RUN cat /installed /artefact > /both
+MSEND
+OUT=$(timeout 600 "$B" build --network none -t ms:par "$M" 2>&1); RC=$?
+check "a file with a stage to build alongside builds" "$RC" "0"
+contains "the later stage's first steps were built alongside, not after" "$OUT" "1 step(s) reused"
+check "and the image is what the file says" "$(mrun ms:par cat /both | tr '\n' ' ')" "installed $NONCE built $NONCE "
+OUT=$(timeout 600 "$B" build --no-cache --network none -t ms:par2 "$M" 2>&1)
+case "$OUT" in *reused*) bad "--no-cache builds every step itself" ;; *) ok "--no-cache builds every step itself" ;; esac
+
 # No base at all: the image is exactly what was copied into it.
 cat > "$M/Dockerfile" <<MSEND
 FROM $IMG AS build
