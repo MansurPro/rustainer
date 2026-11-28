@@ -544,7 +544,7 @@ pub fn retouch(path: &Path, owner: Option<(u32, u32)>, mode: Option<u32>) -> Res
     let md = std::fs::symlink_metadata(path)?;
     if let Some((uid, gid)) = owner {
         std::os::unix::fs::lchown(path, Some(uid), Some(gid))
-            .with_context(|| format!("--chown on {} (it needs root)", path.display()))?;
+            .with_context(|| format!("--chown {uid}:{gid} on {} needs root", path.display()))?;
     }
     if let Some(mode) = mode
         && !md.file_type().is_symlink()
