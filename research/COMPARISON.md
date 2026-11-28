@@ -1264,23 +1264,47 @@ kernel driver, which has no Vulkan, and moving it to `amdgpu` needs
 root and a reboot of a shared machine. So the Model Runner comparison
 above stands as measured, CPU against GPU.
 
-**The driver problem is solved the way Docker and Podman solve it, and
-has not been run on the hardware it is for.** An NVIDIA container needs
-the userspace libraries that match the host's kernel module, and those
-cannot be in an image. The vendor's answer is a CDI spec - a file
-`nvidia-ctk cdi generate` writes, listing the device nodes, the
-libraries to mount, the environment and some hooks - which Docker (25
-and later) and Podman read. This engine reads them too: `--device
-nvidia.com/gpu=all`, and `--gpus all` uses the spec when there is one
-and falls back to bare device nodes when there is not. Nodes and
-libraries are binds. Hooks are not executed; the two every GPU spec has
-are done by what they are for - the links `create-symlinks` lists, and
-for `update-ldcache` a link from each mounted library's soname, read
-out of the ELF file. Stage 16 checks all of that with a made-up device
-and a real compiled library. **What has not happened is a run on a
-machine with an NVIDIA card**: none was available, so whether
-`nvidia-smi` works in a container here is a claim about the mechanism,
-not an observation.
+**On an NVIDIA machine it works, and a model runs on the GPU.** An
+NVIDIA container needs the userspace libraries that match the host's
+kernel module, and those cannot be in an image. The vendor's answer is
+a CDI spec - a file `nvidia-ctk cdi generate` writes, listing the
+device nodes, the libraries to mount, the environment and some hooks -
+which Docker (25 and later) and Podman read. This engine reads them
+too (`--device nvidia.com/gpu=all`), and where there is no spec
+`--gpus all` asks the driver's own `nvidia-container-cli list` for the
+same information. Nodes and libraries are binds. Hooks are not
+executed; the two every GPU spec has are done by what they are for -
+the links `create-symlinks` lists, and for `update-ldcache` a link
+from each mounted library's soname, read out of the ELF file.
+
+Checked on a shared DGX machine - four A100-SXM4-80GB, driver
+580.178.04, no CDI spec, no `nvidia-ctk` - as an ordinary user:
+
+- `rustainer run --gpus all ubuntu:22.04 nvidia-smi` lists the same
+  five devices, driver and memory the host's `nvidia-smi` does. The
+  image is stock Ubuntu: `nvidia-smi` and the 28 driver libraries are
+  the host's, bound in, and `libnvidia-ml.so.1` and `libcuda.so.1`
+  resolve to them. Without the flag the same image has neither the
+  program nor `/dev/nvidia0`.
+- llama.cpp's CUDA server in a container, `ai/smollm2:360M-Q4_K_M`,
+  400 tokens: **418-458 tokens/s on one A100** (1088 MiB of its memory
+  in use by the server, by the host's own accounting), against 84-85
+  tokens/s for the same image on 8 CPU threads. 5x, from a flag.
+
+Two things about that machine shaped how it was run, and neither is
+hidden. It forbids unprivileged user namespaces to ordinary programs
+(Ubuntu's AppArmor restriction), so rustainer could not create one; it
+was run inside the namespace `podman unshare` opens, which is allowed
+to. And it has no bridge for such a user, so the server was on the
+host's network. Docker is installed there and was not usable by this
+user, so there is no Docker figure from that machine beside these.
+
+That changes what the Model Runner comparison above says. On the Mac,
+Docker's runner is 3-6x faster because it has the Mac's GPU and a
+Linux container there has none; that is still true and will stay
+true. On a machine whose GPU a container *can* reach, this engine's
+model server runs on it, at twice the tokens per second Docker's
+runner reached on the Mac's.
 
 It loads GGUF only; the `-mlx` and `-safetensors`
 tags in the same catalogue are refused with a sentence saying why.

@@ -1021,6 +1021,8 @@ rustainer run --tmpfs /scratch:size=64m alpine df -h /scratch
 rustainer run --shm-size 1g --ulimit nofile=65536 postgres:16-alpine
 rustainer run --gpus all alpine ls /dev/dri            # the machine's GPU device nodes
 rustainer run --device nvidia.com/gpu=all ubuntu nvidia-smi   # a device as its vendor's CDI spec describes it
+rustainer run --gpus all ubuntu:22.04 nvidia-smi          # an NVIDIA host: driver libraries and nvidia-smi come from the host
+rustainer model run ai/smollm2:360M-Q4_K_M --gpus all --image ghcr.io/ggml-org/llama.cpp:server-cuda
 rustainer run --network container:web alpine wget -qO- localhost   # a sidecar: web's network, web's localhost
 rustainer run --sysctl net.core.somaxconn=4096 nginx    # the host's settings are refused
 

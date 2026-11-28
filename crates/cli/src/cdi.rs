@@ -153,14 +153,22 @@ fn link_sonames(edits: &mut Edits, folders: &[String]) {
 /// information `nvidia-ctk` writes into a CDI spec, without needing
 /// that tool or root to write the file.
 pub fn nvidia_from_host() -> Option<Edits> {
-    let out = std::process::Command::new("nvidia-container-cli")
-        .arg("list")
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let edits = from_paths(&String::from_utf8_lossy(&out.stdout));
-    (!edits.mounts.is_empty()).then_some(edits)
+    // As root it changes privilege to do its work, which a root that
+    // exists only inside a user namespace is not allowed to; `--user`
+    // is its own mode for a caller like that, and for a plain user.
+    for flags in [&[][..], &["--user"][..]] {
+        let out = std::process::Command::new("nvidia-container-cli")
+            .args(flags)
+            .arg("list")
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let edits = from_paths(&String::from_utf8_lossy(&out.stdout));
+        if out.status.success() && !edits.mounts.is_empty() {
+            return Some(edits);
+        }
+    }
+    None
 }
 
 fn from_paths(listing: &str) -> Edits {

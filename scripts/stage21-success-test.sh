@@ -709,6 +709,18 @@ if "$B" exec "$HC" true >/dev/null 2>&1; then
     for _ in $(seq 1 40); do [ "$(health "$HC")" = healthy ] && break; sleep 0.25; done
     check "--health-cmd gives any container one" "$(health "$HC")" "healthy"
     "$B" rm --force "$HC" >/dev/null 2>&1
+    # The process doing the checking goes when what it checks does, and
+    # not at its next check: that one is five minutes away.
+    HC=$("$B" run -d --network none --health-cmd true --health-interval 300 "$IMG" sleep 300 2>/dev/null | tail -1)
+    sleep 1
+    WATCHER=$(pgrep -f "health-watch $HC" | head -1)
+    "$B" rm --force "$HC" >/dev/null 2>&1
+    for _ in $(seq 1 16); do kill -0 "$WATCHER" 2>/dev/null || break; sleep 0.25; done
+    if [ -n "$WATCHER" ] && ! kill -0 "$WATCHER" 2>/dev/null; then
+        ok "the watcher leaves with its container, not at its next check"
+    else
+        bad "the watcher leaves with its container, not at its next check (pid '$WATCHER')"
+    fi
 else
     "$B" rm --force "$HC" >/dev/null 2>&1
     for _ in 1 2 3 4 5; do skip "healthchecks need exec, which this shell cannot do"; done
