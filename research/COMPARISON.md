@@ -345,9 +345,21 @@ found four defects, the first three of which are not about builds:
 - `exec` failed for any user without a delegated cgroup, and with it
   every healthcheck.
 
-These are public stand-ins of the same shape as two applications in the
-monorepo below, which were not built: they need more memory than the
-machine their source is on can spare.
+Those were public stand-ins. The two applications they stand in for
+were then built from their own source on the same machine, the same
+way: a Django API (`python:3.13-slim`, a compiler, libpq and ffmpeg
+from apt, its dependencies and `faster-whisper` from pip,
+`collectstatic`) in 124 s, and a three-stage Next.js application in an
+npm workspace (`npm ci`, `next build`, a standalone runtime copied with
+`--chown`) in 218 s. The API image imports Django 6.1 and its native
+dependencies; the Next image reports ready and answers its first
+request. Rebuilding the second with nothing changed takes 5.4 s, nearly
+all of it reading the 370 MB context to see that nothing changed. Two
+more things came out of it: a build secret asked for as a variable
+(`--mount=type=secret,...,env=`), now supported, and that an image
+declaring `USER node` could not be started at all by a user with one
+id - it now runs as that one and says so, while an explicit `--user`
+is still refused.
 
 Thirteen Dockerfiles from a production monorepo were then read with
 `build --check` and three built. All thirteen parse. The exercise found

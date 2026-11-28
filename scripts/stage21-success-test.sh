@@ -654,6 +654,23 @@ else
 fi
 check "and the image is left without the setting" "$(rrun rest:apt sh -c 'ls /etc/apt/apt.conf.d | wc -l' | tr -d ' ')" "0"
 
+# An image that names a user still runs for a caller who can only be
+# one: as that one, and saying so. Asking on the command line is refused.
+OUT=$(rfile rest:user <<'RSEND'
+RUN adduser -D -u 4321 app
+USER app
+CMD ["id", "-u"]
+RSEND
+)
+if [ "$MANY_IDS" = yes ]; then
+    check "an image's USER is who the container runs as" "$(rrun rest:user)" "4321"
+else
+    check "with one id, an image's USER runs as that one" "$(rrun rest:user)" "0"
+    contains "and says that it did" "$(timeout 60 "$B" run --network none rest:user 2>&1)" "has one id"
+    refuses "a --user that cannot be is still refused" "not mapped" \
+        timeout 60 "$B" run --network none --user 4321 rest:user
+fi
+
 # A secret is a file one step can read and no layer holds.
 echo "s3cr3t-from-a-file" > "$SCRATCH/tok.txt"
 { printf 'FROM %s\n' "$IMG"; cat <<'RSEND'
