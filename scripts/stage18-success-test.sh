@@ -791,8 +791,8 @@ contains "a job that fails stops the stack there, and says why" \
     "$(timeout 120 "$B" stack up -f "$C/failing.yml" 2>&1)" "had to complete"
 check "what depended on it was not started" "$("$B" ps -a | grep -c failing-web || true)" "0"
 timeout 60 "$B" stack down -t 0 -f "$C/failing.yml" >/dev/null 2>&1
-printf 'services:\n  a:\n    image: x\n    userns_mode: host\n' > "$C/bad.yml"
-refuses "a key that cannot be honoured is refused by name" '"userns_mode"' "$B" stack ps -f "$C/bad.yml"
+printf 'services:\n  a:\n    image: x\n    uts: host\n' > "$C/bad.yml"
+refuses "a key that cannot be honoured is refused by name" '"uts"' "$B" stack ps -f "$C/bad.yml"
 timeout 300 "$B" stack down -t 0 -f "$C/compose.yml" >/dev/null 2>&1
 check "down removes it" "$("$B" ps -a | grep -c shop- || true)" "0"
 "$B" volume rm shopshared >/dev/null 2>&1

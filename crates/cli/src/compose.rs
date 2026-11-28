@@ -18,6 +18,13 @@ use toml::Value as T;
 
 /// Dropped with a note rather than refused.
 const IGNORED: &[&str] = &[
+    // Where the container's cgroup sits and which user namespace it
+    // maps into are the engine's to decide here; neither changes what
+    // the service does.
+    "cgroup_parent",
+    "userns_mode",
+    "domainname",
+    "mac_address",
     "container_name",
     "hostname",
     "networks",
@@ -28,7 +35,6 @@ const IGNORED: &[&str] = &[
     "expose",
     "pull_policy",
     "stop_grace_period",
-    "stop_signal",
     "init",
     "attach",
     "annotations",
@@ -233,9 +239,8 @@ fn service(svc: &J, dir: &Path, notes: &mut Vec<String>) -> Result<Table> {
             Ok(())
         };
         match k {
-            "image" | "restart" | "user" | "platform" | "pid" | "ipc" | "shm_size" => {
-                put_str(&mut t, k)?
-            }
+            "image" | "restart" | "user" | "platform" | "pid" | "ipc" | "shm_size"
+            | "stop_signal" => put_str(&mut t, k)?,
             "sysctls" => {
                 t.insert(k.into(), pairs(v).context("sysctls")?);
             }
@@ -933,12 +938,12 @@ volumes:
     #[test]
     fn a_key_that_cannot_be_honoured_is_named() {
         let e = to_stack(
-            "services:\n  a:\n    image: x\n    userns_mode: host\n",
+            "services:\n  a:\n    image: x\n    uts: host\n",
             Path::new("/x"),
             &BTreeMap::new(),
         )
         .unwrap_err();
-        assert!(format!("{e:#}").contains("\"userns_mode\""), "{e:#}");
+        assert!(format!("{e:#}").contains("\"uts\""), "{e:#}");
     }
 
     #[test]

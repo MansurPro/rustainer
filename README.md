@@ -885,8 +885,8 @@ layer sharing entirely.
 **TOML-grade strictness about the file**, for the same reason as stacks:
 
 - An **unknown instruction is refused**, not skipped. An image built from
-  a file containing `ONBUILD` does not do what the file says, and
-  ignoring the line quietly is how that reaches production.
+  a file with a line this engine does not act on would not do what the
+  file says, and ignoring the line quietly is how that reaches production.
 - **A bracketed line that is not valid JSON is an error.** Docker falls
   back to the shell form there, which turns a misplaced quote into an
   instruction that runs something else entirely and still succeeds.
@@ -918,18 +918,24 @@ which gives the step a directory that outlives the build and never
 becomes part of a layer. `RUN --mount=type=secret,id=…` binds a file
 given with `--secret` (from a path, or from an environment variable) for
 that one step, read-only; no layer holds it, and one the build was not
-given is simply absent. `VOLUME` and `STOPSIGNAL` are recorded in the
-image and not acted on: a container's writes land in its own layer either
-way, and `stop` sends `SIGTERM`. `ONBUILD`, `ADD <url>` and the other
-`--mount` types (`bind`, `ssh`) are refused by name.
+given is simply absent. `RUN --mount=type=bind,source=…,target=…` lends
+the step a file from the context without copying it. `ADD <url>` fetches
+the file. `ONBUILD` is recorded and runs first in a build `FROM` the
+image, against that build's context, once. `STOPSIGNAL` is what `stop`
+sends before it kills (`run --stop-signal` overrides it). `VOLUME` is
+recorded and not acted on: a container's writes land in its own layer
+either way. `--mount=type=ssh` and a bind mount from another stage are
+refused by name.
 
 `HEALTHCHECK` is recorded and **acted on**: `run -d` on an image that has
 one starts checking it, and `ps` shows `running (healthy)`. `--health-cmd`,
 `--health-interval` and `--health-retries` set or retune it for any
 container; `--no-healthcheck` turns the image's off.
 
-What is deliberately absent: parallelism. Stages are built in file order,
-every one up to the target, whether or not the target uses it.
+What is deliberately absent: parallelism. Stages are built one at a
+time, in file order - but only the ones the image is actually built
+from. A `test` stage nothing copies from is skipped unless it is the
+`--target`.
 
 ### Pushing
 

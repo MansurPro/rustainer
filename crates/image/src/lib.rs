@@ -113,6 +113,10 @@ pub struct Materialised {
     pub user: Option<String>,
     /// The image's own healthcheck, if it has one.
     pub healthcheck: Option<Health>,
+    /// `STOPSIGNAL`, as the image wrote it: `SIGQUIT`, `QUIT` or `3`.
+    pub stop_signal: Option<String>,
+    /// `ONBUILD` instructions: what a build FROM this image runs first.
+    pub on_build: Vec<String>,
     pub report: extract::Report,
 }
 
@@ -819,6 +823,8 @@ impl Store {
             working_dir: c.working_dir.filter(|s| !s.is_empty()),
             user: c.user.filter(|s| !s.is_empty()),
             healthcheck: c.healthcheck.and_then(Health::from_config),
+            stop_signal: c.stop_signal.filter(|s| !s.is_empty()),
+            on_build: c.on_build.unwrap_or_default(),
             report,
         })
     }
@@ -914,6 +920,8 @@ mod tests {
             working_dir: None,
             user: None,
             healthcheck: None,
+            stop_signal: None,
+            on_build: vec![],
             report: extract::Report::default(),
         };
         assert_eq!(m.command(), vec!["/bin/sh", "-c", "echo hi"]);
@@ -947,6 +955,8 @@ mod tests {
             working_dir: None,
             user: None,
             healthcheck: None,
+            stop_signal: None,
+            on_build: vec![],
             report: extract::Report::default(),
         };
         assert_eq!(m.command(), vec!["/bin/sh"]);

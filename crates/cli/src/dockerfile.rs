@@ -38,6 +38,9 @@ pub enum Instruction {
         /// `--mount=type=secret`: `(id, target)`, a file the step can
         /// read and the image never holds.
         secrets: Vec<(String, String)>,
+        /// `--mount=type=bind`: `(source in the context, target)`, there
+        /// for the step to read and not copied into the image.
+        binds: Vec<(String, String)>,
     },
     Copy {
         sources: Vec<String>,
@@ -59,6 +62,9 @@ pub enum Instruction {
         retries: u64,
     },
     StopSignal(String),
+    /// An instruction for whoever builds FROM this image, kept as the
+    /// text it was written as.
+    OnBuild(String),
     Volume(Vec<String>),
     Env(String, String),
     Workdir(String),
@@ -260,6 +266,7 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
             "RUN" => {
                 let (flags, rest) = leading_flags(rest);
                 let (mut caches, mut secrets, mut network) = (Vec::new(), Vec::new(), None);
+                let mut binds = Vec::new();
                 for f in flags {
                     if let Some(n) = f.strip_prefix("--network=") {
                         network = Some(n.to_owned());
@@ -287,9 +294,18 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                                 let target = target.unwrap_or_else(|| format!("/run/secrets/{id}"));
                                 secrets.push((id, target));
                             }
+                            // A bind with no type is what `--mount=target=`
+                            // means. From the context only: one from a
+                            // stage would need that stage mounted.
+                            (Some("bind") | None, Some(t)) if opt(&["from"]).is_none() => {
+                                binds.push((
+                                    opt(&["source", "src"]).unwrap_or_else(|| ".".into()),
+                                    t,
+                                ));
+                            }
                             (kind, _) => bail!(
                                 "{}: RUN --mount of type {} is not implemented; \
-                                 type=cache and type=secret are",
+                                 type=cache, type=secret and type=bind from the context are",
                                 at(),
                                 kind.unwrap_or("bind")
                             ),
@@ -309,6 +325,7 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                     caches,
                     network,
                     secrets,
+                    binds,
                 }
             }
             "COPY" | "ADD" => {
@@ -338,14 +355,6 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                     );
                 }
                 let dest = words.pop().expect("checked above");
-                if keyword == "ADD" && words.iter().any(|w| w.starts_with("http")) {
-                    bail!(
-                        "{}: ADD from a URL is not implemented - it is a download \
-                         with no checksum, which is why Docker's own documentation \
-                         recommends RUN curl instead. Use that.",
-                        at()
-                    );
-                }
                 Instruction::Copy {
                     sources: words,
                     dest,
@@ -434,7 +443,25 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
             // Named rather than ignored. An image built from a Dockerfile
             // containing one of these does not do what the file says, and
             // skipping the line quietly is how that reaches production.
-            "ONBUILD" | "CROSS_BUILD" => {
+            "ONBUILD" => {
+                // Read now, so a mistake in it is found by whoever wrote
+                // it and not by whoever builds on the image later.
+                let trigger = parse(&format!("FROM scratch\n{rest}"))
+                    .map_err(|e| anyhow::anyhow!("{}: ONBUILD: {e}", at()))?;
+                if trigger.len() != 2
+                    || matches!(
+                        trigger[1],
+                        Instruction::OnBuild(_) | Instruction::From { .. }
+                    )
+                {
+                    bail!(
+                        "{}: ONBUILD takes one instruction, and not FROM or ONBUILD",
+                        at()
+                    );
+                }
+                Instruction::OnBuild(rest.to_owned())
+            }
+            "CROSS_BUILD" => {
                 bail!(
                     "{}: {keyword} is not implemented. It is skipped by no part of \
                      this engine - an image that silently ignored it would not be \
@@ -480,6 +507,7 @@ mod tests {
                 caches: vec![],
                 network: None,
                 secrets: vec![],
+                binds: vec![],
             }
         );
     }
@@ -494,6 +522,7 @@ mod tests {
                 caches: vec![],
                 network: None,
                 secrets: vec![],
+                binds: vec![],
             }
         );
         // No shell, so `&&` is just two words inside one argument.
@@ -504,6 +533,7 @@ mod tests {
                 caches: vec![],
                 network: None,
                 secrets: vec![],
+                binds: vec![],
             }
         );
     }
@@ -535,14 +565,19 @@ mod tests {
     fn instructions_we_do_not_implement_are_refused_by_name() {
         // Not skipped. An image that quietly ignored HEALTHCHECK is not
         // the image the file describes.
-        for line in ["ONBUILD RUN x", "RUN --mount=type=ssh git clone x"] {
+        for line in ["CROSS_BUILD x", "RUN --mount=type=ssh git clone x"] {
             let e = parse(&format!("FROM a\n{line}\n")).unwrap_err().to_string();
             assert!(e.contains("not implemented"), "{line}: {e}");
         }
-        let e = parse("FROM a\nADD https://x/y /y\n")
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("no checksum"), "{e}");
+        let d = parse(
+            "FROM a\nONBUILD COPY . /app\nRUN --mount=type=bind,source=req.txt,target=/r.txt true\n",
+        )
+        .unwrap();
+        assert_eq!(d[1], Instruction::OnBuild("COPY . /app".into()));
+        assert!(matches!(&d[2], Instruction::Run { binds, .. }
+            if binds == &[("req.txt".to_owned(), "/r.txt".to_owned())]));
+        assert!(parse("FROM a\nONBUILD FROM b\n").is_err());
+        assert!(parse("FROM a\nONBUILD FROB\n").is_err());
         let e = parse("FROM a\nFROB x\n").unwrap_err().to_string();
         assert!(e.contains("not a Dockerfile instruction"), "{e}");
     }
@@ -570,6 +605,7 @@ mod tests {
                 caches: vec![("/root/.cache".into(), "/root/.cache".into())],
                 network: Some("none".into()),
                 secrets: vec![],
+                binds: vec![],
             }
         );
         assert!(

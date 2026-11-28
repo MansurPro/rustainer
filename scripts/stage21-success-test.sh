@@ -104,7 +104,7 @@ echo "1. The file is read before anything is built"
 printf 'FROM %s\nFROB x\n' "$IMG" > "$CTX/Dockerfile"
 refuses "an unknown instruction is named" "not a Dockerfile instruction" \
     "$B" build --network none -t x:1 "$CTX"
-printf 'FROM %s\nONBUILD RUN true\n' "$IMG" > "$CTX/Dockerfile"
+printf 'FROM %s\nRUN --mount=type=ssh true\n' "$IMG" > "$CTX/Dockerfile"
 refuses "an instruction we do not implement is refused, not skipped" "not implemented" \
     "$B" build --network none -t x:1 "$CTX"
 printf 'RUN true\n' > "$CTX/Dockerfile"
@@ -348,6 +348,7 @@ check "--from takes a stage's number" "$(mrun ms:1 cat /srv/sub/package.json)" '
 check "and an image" "$(mrun ms:1 sh -c 'test -s /base-release && echo yes')" "yes"
 check "what the build stage held is not in the image" "$(mrun ms:1 sh -c 'ls /app 2>/dev/null | wc -l')" "0"
 check "nor is its environment" "$(mrun ms:1 cat /env-leak)" "0"
+contains "a stage the image does not need is not built" "$OUT" "skipped: nothing"
 check "a stage that nothing copies from leaves nothing" "$(mrun ms:1 sh -c 'test -e /srv/tested || echo absent')" "absent"
 
 timeout 600 "$B" build --network none --target build -t ms:build "$M" >/dev/null 2>&1
@@ -431,6 +432,71 @@ RSEND
 )
 check "and a later build finds what it left" "$(rrun rest:2 cat /cache-lines | tr -d ' ')" "2"
 
+# STOPSIGNAL is what `stop` sends, and the image's process decides
+# what that means.
+OUT=$(rfile rest:sig <<'RSEND'
+STOPSIGNAL SIGUSR1
+CMD ["/bin/sh", "-c", "trap 'exit 42' USR1; trap '' TERM; while :; do sleep 0.1; done"]
+RSEND
+)
+SG=$("$B" run -d --network none rest:sig 2>/dev/null | tail -1)
+sleep 1
+timeout 30 "$B" stop --time 5 "$SG" >/dev/null 2>&1
+check "stop sends the image's STOPSIGNAL" "$("$B" ps -a | awk -v id="$SG" '$1 == id {print $4}')" "42"
+"$B" rm --force "$SG" >/dev/null 2>&1
+SG=$("$B" run -d --network none --stop-signal TERM rest:sig 2>/dev/null | tail -1)
+sleep 1
+timeout 30 "$B" stop --time 1 "$SG" >/dev/null 2>&1
+if [ "$("$B" ps -a | awk -v id="$SG" '$1 == id {print $4}')" != 42 ]; then
+    ok "--stop-signal replaces it"
+else
+    bad "--stop-signal replaces it"
+fi
+"$B" rm --force "$SG" >/dev/null 2>&1
+
+# ONBUILD: an instruction a base image leaves for whoever builds on it.
+echo "from the child's context" > "$R/child.txt"
+OUT=$(rfile onbase:1 <<'RSEND'
+ONBUILD COPY child.txt /from-onbuild.txt
+ONBUILD RUN echo ran > /onbuild-ran
+RUN test ! -e /onbuild-ran
+RSEND
+); RC=$?
+check "ONBUILD does nothing in the image that declares it" "$RC" "0"
+printf 'FROM onbase:1\nRUN cat /onbuild-ran > /seen-by-next-step\n' > "$R/Dockerfile"
+timeout 600 "$B" build --network none -t onchild:1 "$R" >/dev/null 2>&1
+check "and runs first in a build on that image" "$(rrun onchild:1 cat /seen-by-next-step)" "ran"
+check "against that build's context" "$(rrun onchild:1 cat /from-onbuild.txt)" "from the child's context"
+printf 'FROM onchild:1\nRUN test ! -e /nothing\n' > "$R/Dockerfile"
+OUT=$(timeout 600 "$B" build --network none -t ongrand:1 "$R" 2>&1)
+case "$OUT" in *ONBUILD*|*"COPY child.txt"*) bad "and only once: not in a build on the child" ;;
+*) ok "and only once: not in a build on the child" ;; esac
+
+# A bind mount lends the step a file from the context without copying it.
+echo "lent" > "$R/lent.txt"
+OUT=$(rfile rest:bind <<'RSEND'
+RUN --mount=type=bind,source=lent.txt,target=/lent.txt cat /lent.txt > /read-it
+RSEND
+)
+check "a bind mount is readable by its step" "$(rrun rest:bind cat /read-it)" "lent"
+check "and its content is not in the image" "$(rrun rest:bind sh -c 'cat /lent.txt 2>/dev/null | wc -c' | tr -d ' ')" "0"
+
+# ADD <url> fetches. Served from this machine so the test needs no network.
+mkdir -p "$SCRATCH/www"; echo "fetched" > "$SCRATCH/www/file.txt"
+( cd "$SCRATCH/www" && exec python3 -m http.server 18765 --bind 127.0.0.1 >/dev/null 2>&1 ) &
+WWW=$!
+for _ in $(seq 1 40); do (exec 3<>/dev/tcp/127.0.0.1/18765) 2>/dev/null && break; sleep 0.25; done
+OUT=$(rfile rest:url <<'RSEND'
+ADD http://127.0.0.1:18765/file.txt /dl/
+ADD http://127.0.0.1:18765/file.txt /named.txt
+RSEND
+); RC=$?
+kill "$WWW" 2>/dev/null
+check "ADD of a URL builds" "$RC" "0"
+[ "$RC" -eq 0 ] || echo "$OUT" | tail -3
+check "the file is under the URL's name in a directory" "$(rrun rest:url cat /dl/file.txt)" "fetched"
+check "or under the name the destination gives" "$(rrun rest:url cat /named.txt)" "fetched"
+
 # A secret is a file one step can read and no layer holds.
 echo "s3cr3t-from-a-file" > "$SCRATCH/tok.txt"
 { printf 'FROM %s\n' "$IMG"; cat <<'RSEND'
@@ -458,7 +524,7 @@ check "one ENV sets several variables" "$(rrun rest:3 cat /env-pairs)" "1/two wo
 check "and each is in the image's environment" "$(rrun rest:3 sh -c 'echo "$B"')" "two words"
 contains "--check reads a file and builds nothing" \
     "$("$B" build --check "$R" 2>&1)" "nothing this engine refuses"
-printf 'FROM %s\nONBUILD RUN true\n' "$IMG" > "$R/Dockerfile"
+printf 'FROM %s\nRUN --mount=type=ssh true\n' "$IMG" > "$R/Dockerfile"
 refuses "and says what is wrong with one" "not implemented" "$B" build --check "$R"
 refuses "a build with no name is refused" "needs a name" "$B" build "$R"
 

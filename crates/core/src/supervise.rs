@@ -200,6 +200,10 @@ pub struct Config {
     /// host`.
     #[serde(default)]
     pub host_ipc: bool,
+    /// The signal `stop` sends first, when it is not SIGTERM: the
+    /// image's `STOPSIGNAL`, or `--stop-signal`.
+    #[serde(default)]
+    pub stop_signal: Option<i32>,
     /// `--sysctl`: `(name, value)`, the name dotted as `sysctl` prints it.
     #[serde(default)]
     pub sysctls: Vec<(String, String)>,
@@ -1590,7 +1594,14 @@ pub fn stop(paths: &Paths, id: &str, grace: std::time::Duration) -> Result<(), E
         return Ok(());
     }
     let rpid = rustix::process::Pid::from_raw(pid).ok_or(Error::DiedBeforeStart)?;
-    let _ = sys::kill_process(rpid, sys::Signal::TERM);
+    // What the image asked to be stopped with: nginx finishes its
+    // requests on QUIT, PostgreSQL shuts down fast on INT.
+    let first = Config::load(paths, id)
+        .ok()
+        .and_then(|c| c.stop_signal)
+        .and_then(sys::Signal::from_named_raw)
+        .unwrap_or(sys::Signal::TERM);
+    let _ = sys::kill_process(rpid, first);
 
     let deadline = std::time::Instant::now() + grace;
     while std::time::Instant::now() < deadline {
@@ -1713,6 +1724,7 @@ mod tests {
             private_net: false,
             host_pid: false,
             host_ipc: false,
+            stop_signal: None,
             sysctls: Vec::new(),
             rlimits: Vec::new(),
             bridge: false,

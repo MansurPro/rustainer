@@ -323,12 +323,13 @@ A benchmark that omits this is an advertisement. None of the following is
 implemented here, and several are deliberate permanent omissions rather than
 work not yet done — `research/pass-2/RND.md` §19 says which are which.
 
-- **BuildKit** — `build` reads the whole Dockerfile language except `ONBUILD`,
-  `ADD <url>` and `--mount=type=bind|ssh`: stages, `COPY --from`, `--target`,
-  `.dockerignore`, cache and secret mounts, and a layer cache are all there.
-  What it still is not is a DAG solver: stages build in file order, one at a
-  time, including ones the target never uses, and there is no remote cache
-  import or export.
+- **BuildKit** — `build` reads the whole Dockerfile language except
+  `--mount=type=ssh` and a bind mount from another stage: stages, `COPY
+  --from`, `--target`, `.dockerignore`, `ONBUILD`, `ADD <url>`, cache, secret
+  and context bind mounts, and a layer cache are all there, and a stage the
+  image is not built from is skipped. What it still is not is a parallel
+  solver: the stages that are needed build one at a time, and there is no
+  remote cache import or export.
 - **A real in-namespace resolver.** User-defined networks exist (stage 23) and
   containers on one find each other by name, but the mechanism is `/etc/hosts`,
   rewritten as containers come and go. Docker runs a resolver at 127.0.0.11
@@ -685,7 +686,7 @@ What is not, in two kinds. Keys that do not change whether the
 application works are dropped and **said to be** on stderr:
 `container_name`, `hostname`, `labels`, `logging`, `networks`,
 `stop_grace_period`, `init`, `oom_score_adj`, `cpu_shares` and a few
-more. Anything else - `userns_mode`, `cgroup_parent`, `ipc: service:x`
+more. Anything else - `uts`, `ipc: service:x`, `network_mode: service:x`
 - is refused by name before anything starts. Several `-f` Compose files are merged by Compose's rules - a list in a
 later file adds to the earlier one, and an entry naming the same
 variable or container path replaces it - where two stack files replace

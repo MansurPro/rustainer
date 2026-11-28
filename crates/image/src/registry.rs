@@ -298,6 +298,10 @@ pub struct ConfigSection {
     pub user: Option<String>,
     #[serde(default, rename = "Healthcheck")]
     pub healthcheck: Option<HealthConfig>,
+    #[serde(default, rename = "StopSignal")]
+    pub stop_signal: Option<String>,
+    #[serde(default, rename = "OnBuild")]
+    pub on_build: Option<Vec<String>>,
 }
 
 /// `HEALTHCHECK`, as an image config spells it: `Test` begins with

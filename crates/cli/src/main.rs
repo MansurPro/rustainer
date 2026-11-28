@@ -250,6 +250,11 @@ struct RunArgs {
     #[arg(long)]
     no_healthcheck: bool,
 
+    /// The signal `stop` sends before it gives up and kills: `SIGQUIT`,
+    /// `QUIT` or `3`. The image's `STOPSIGNAL` if it has one, else TERM.
+    #[arg(long, value_name = "SIGNAL")]
+    stop_signal: Option<String>,
+
     /// Root filesystem: a directory tree you extracted yourself. `/` keeps
     /// the host's filesystem view. Omit it and the first positional
     /// argument is an image reference instead.
@@ -1419,6 +1424,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
     //   no --rootfs      an image reference (stage 6)
     let mut image_env: Vec<String> = Vec::new();
     let mut image_health: Option<rustainer_image::Health> = None;
+    let mut image_stop_signal: Option<String> = None;
     let mut workdir: Option<String> = None;
     let mut image_user: Option<String> = None;
 
@@ -1495,6 +1501,7 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
 
             image_env = image.env.clone();
             image_health = image.healthcheck.clone();
+            image_stop_signal = image.stop_signal.clone();
             workdir = image.working_dir.clone();
             image_user = image.user.clone();
             layers = image
@@ -1765,6 +1772,12 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         private_net,
         host_pid: args.pid.is_some(),
         host_ipc: args.ipc.as_deref() == Some("host"),
+        stop_signal: args
+            .stop_signal
+            .as_ref()
+            .or(image_stop_signal.as_ref())
+            .map(|s| parse_signal(s))
+            .transpose()?,
         sysctls,
         rlimits,
         bridge,
@@ -2634,6 +2647,39 @@ fn parse_volume(spec: &str) -> Result<rustainer_core::mount::VolumeMount> {
     })
 }
 
+/// A signal by name, with or without `SIG`, or by number.
+fn parse_signal(s: &str) -> Result<i32> {
+    // Linux's numbers for the ones an image asks to be stopped with.
+    const NAMES: [(&str, i32); 10] = [
+        ("HUP", 1),
+        ("INT", 2),
+        ("QUIT", 3),
+        ("KILL", 9),
+        ("USR1", 10),
+        ("USR2", 12),
+        ("TERM", 15),
+        ("CONT", 18),
+        ("STOP", 19),
+        ("WINCH", 28),
+    ];
+    let upper = s.trim().to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    if let Some(n) = name
+        .strip_prefix("RTMIN+")
+        .and_then(|n| n.parse::<i32>().ok())
+    {
+        return Ok(34 + n);
+    }
+    NAMES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, v)| *v)
+        .or_else(|| name.parse().ok().filter(|n| (1..=64).contains(n)))
+        .with_context(|| {
+            format!("{s:?} is not a signal this knows: SIGTERM, SIGQUIT, SIGINT, or a number")
+        })
+}
+
 /// `--ulimit name=soft[:hard]` as `(resource number, soft, hard)`.
 fn parse_ulimit(spec: &str) -> Result<(u32, u64, u64)> {
     // Linux's numbers, the same on every architecture this runs on.
@@ -3212,6 +3258,7 @@ fn stack_run(paths: &Paths, st: &stack::Stack, args: &StackRunArgs) -> Result<Ex
         privileged: svc.privileged,
         pid: svc.pid.clone(),
         tmpfs: svc.tmpfs.clone(),
+        stop_signal: svc.stop_signal.clone(),
         ipc: svc.ipc.clone(),
         shm_size: svc.shm_size.clone(),
         ulimits: svc.ulimits.clone(),
@@ -3452,6 +3499,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 privileged: svc.privileged,
                 pid: svc.pid.clone(),
                 tmpfs: svc.tmpfs.clone(),
+                stop_signal: svc.stop_signal.clone(),
                 ipc: svc.ipc.clone(),
                 shm_size: svc.shm_size.clone(),
                 ulimits: svc.ulimits.clone(),
@@ -4854,8 +4902,57 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
     let mut chain = String::new();
     let mut reused = 0usize;
 
-    let total = instructions.len();
-    for (n, ins) in instructions.iter().enumerate() {
+    // Which stages the last one needs, directly or through another: a
+    // stage nothing reads from is not built. A reference that is only
+    // known once variables are expanded keeps every stage, since any
+    // of them might be the one it names.
+    let needed: Vec<bool> = {
+        let mut stage_refs: Vec<(Option<String>, Vec<String>)> = Vec::new();
+        for ins in &instructions {
+            match ins {
+                Instruction::From { image, alias } => {
+                    stage_refs.push((alias.clone(), vec![image.clone()]));
+                }
+                Instruction::Copy { from: Some(f), .. } => {
+                    if let Some(s) = stage_refs.last_mut() {
+                        s.1.push(f.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut needed = vec![false; stage_refs.len()];
+        let mut todo: Vec<usize> = stage_refs.len().checked_sub(1).into_iter().collect();
+        while let Some(i) = todo.pop() {
+            if std::mem::replace(&mut needed[i], true) {
+                continue;
+            }
+            for r in &stage_refs[i].1 {
+                if r.contains('$') {
+                    todo.extend(0..i);
+                }
+                let by_name = stage_refs[..i]
+                    .iter()
+                    .position(|(a, _)| a.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(r)));
+                todo.extend(by_name.or_else(|| r.parse().ok().filter(|n| *n < i)));
+            }
+        }
+        needed
+    };
+    let mut stage_no = 0usize;
+    let mut skipping = false;
+
+    // By index, not by iterator: a base image's ONBUILD instructions are
+    // inserted after its FROM while the list is being walked.
+    let mut next = 0usize;
+    while next < instructions.len() {
+        let n = next;
+        next += 1;
+        let total = instructions.len();
+        let ins = &instructions[n].clone();
+        if skipping && !matches!(ins, Instruction::From { .. }) {
+            continue;
+        }
         println!("[{}/{}] {}", n + 1, total, build::describe(ins));
         match ins {
             Instruction::Arg(k, default) => {
@@ -4885,6 +4982,12 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 started = true;
                 alias_now = alias.clone();
                 vars = arg_vars.clone();
+                skipping = !needed.get(stage_no).copied().unwrap_or(true);
+                stage_no += 1;
+                if skipping {
+                    println!("        skipped: nothing the image is built from uses this stage");
+                    continue;
+                }
                 let reference = build::expand(image, &vars);
                 if let Some(i) = find_stage(&stages, &reference) {
                     // A stage built on an earlier one carries on exactly
@@ -4920,6 +5023,18 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                     );
                 }
                 built.env = base.env.clone();
+                built.stop_signal = base.stop_signal.clone();
+                // What the base image left for whoever builds on it,
+                // run as if written straight after this FROM. Not
+                // inherited further: an ONBUILD fires once.
+                if !base.on_build.is_empty() {
+                    let triggers = crate::dockerfile::parse(&format!(
+                        "FROM scratch\n{}\n",
+                        base.on_build.join("\n")
+                    ))
+                    .with_context(|| format!("the ONBUILD instructions of {reference}"))?;
+                    instructions.splice(next..next, triggers.into_iter().skip(1));
+                }
                 built.healthcheck = base
                     .healthcheck
                     .as_ref()
@@ -4986,6 +5101,7 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 built.healthcheck = Some((test, *interval, *retries));
             }
             Instruction::StopSignal(s) => built.stop_signal = Some(build::expand(s, &vars)),
+            Instruction::OnBuild(s) => built.on_build.push(s.clone()),
             Instruction::Volume(v) => {
                 built
                     .volumes
@@ -5047,6 +5163,19 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 let mut found: Vec<PathBuf> = Vec::new();
                 for src in sources {
                     let src = build::expand(src, &vars);
+                    if from_layers.is_none()
+                        && (src.starts_with("http://") || src.starts_with("https://"))
+                    {
+                        // ADD <url>: the file, under the name the URL
+                        // ends in unless the destination names one.
+                        let name = src.rsplit('/').next().filter(|n| !n.is_empty());
+                        let to = match name {
+                            Some(n) if dest.ends_with('/') => layer_dir.join(&rel).join(n),
+                            _ => layer_dir.join(&rel),
+                        };
+                        build::download(&src, &to)?;
+                        continue;
+                    }
                     match &from_layers {
                         Some(layers) => found.extend(build::sources_in(layers, &src)?),
                         None => found.extend(build::sources(&context, &src)?),
@@ -5105,6 +5234,7 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 caches,
                 network,
                 secrets,
+                binds,
             } => {
                 let network = network.as_ref().unwrap_or(&args.network);
                 let expanded: Vec<String> = argv.iter().map(|a| build::expand(a, &vars)).collect();
@@ -5171,6 +5301,10 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                         // the empty file it was mounted on. One the
                         // build was not given is simply absent, as in
                         // Docker, and the step decides if that matters.
+                        .chain(binds.iter().map(|(source, target)| {
+                            let src = build::resolve_source(&context, source)?;
+                            Ok(format!("{}:{target}:ro", src.display()))
+                        }))
                         .chain(secrets.iter().filter_map(|(id, target)| {
                             let src = given_secrets.get(id)?;
                             Some(Ok(format!("{}:{target}:ro", src.display())))
@@ -5254,6 +5388,7 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
             "User": built.user,
             "Labels": built.labels,
             "StopSignal": built.stop_signal,
+            "OnBuild": built.on_build,
             "Volumes": built.volumes.iter()
                 .map(|v| (v.clone(), serde_json::json!({})))
                 .collect::<serde_json::Map<_, _>>(),
@@ -5280,5 +5415,5 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
 
     println!("{digest}");
     println!("tagged {}", args.tag);
-    Ok((digest, total, reused))
+    Ok((digest, instructions.len(), reused))
 }
