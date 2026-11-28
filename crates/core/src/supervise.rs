@@ -200,6 +200,14 @@ pub struct Config {
     /// host`.
     #[serde(default)]
     pub host_ipc: bool,
+    /// Another container whose network this one shares instead of
+    /// having its own: `--network container:<id>`. Same interfaces,
+    /// same ports, same `localhost`.
+    #[serde(default)]
+    pub join_net: Option<String>,
+    /// The same for System V IPC and POSIX queues: `--ipc container:<id>`.
+    #[serde(default)]
+    pub join_ipc: Option<String>,
     /// The signal `stop` sends first, when it is not SIGTERM: the
     /// image's `STOPSIGNAL`, or `--stop-signal`.
     #[serde(default)]
@@ -344,7 +352,7 @@ impl Config {
                 mount: self.rootfs.is_some(),
                 net: self.private_net || self.bridge,
                 pid: !self.host_pid,
-                ipc: !self.host_ipc,
+                ipc: !self.host_ipc && self.join_ipc.is_none(),
                 user: self.userns,
                 ..Namespaces::STAGE1
             },
@@ -508,11 +516,15 @@ impl Config {
             // the files themselves: an image usually has neither, and
             // without them nothing in a `--network host` container can
             // resolve a name.
-            for (host, name, target) in [
-                ("/etc/resolv.conf", "resolv.conf", "etc/resolv.conf"),
-                ("/etc/hosts", "hosts", "etc/hosts"),
-            ] {
-                if let Ok(text) = std::fs::read(host) {
+            //
+            // Sharing another container's network means sharing how
+            // it resolves names too: its files, not the host's.
+            let from = match (&self.join_net, state_dir.parent()) {
+                (Some(other), Some(all)) => all.join(other),
+                _ => PathBuf::from("/etc"),
+            };
+            for (name, target) in [("resolv.conf", "etc/resolv.conf"), ("hosts", "etc/hosts")] {
+                if let Ok(text) = std::fs::read(from.join(name)) {
                     let copy = state_dir.join(name);
                     std::fs::write(&copy, text)?;
                     binds.push((copy, target));
@@ -612,6 +624,12 @@ pub enum Error {
          it never ran the command"
     )]
     DiedBeforeStart,
+
+    #[error(
+        "the container {0} is not running, so there is no network or IPC namespace of \
+         its to share. Start it first"
+    )]
+    ShareWith(String),
 
     #[error("container {id} is {status}, not running")]
     NotRunning { id: String, status: &'static str },
@@ -800,6 +818,22 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
             &spec,
             mounts,
             crate::Attach {
+                // Opened each attempt: the container being shared with
+                // may itself have been restarted since the last one.
+                join: [(&config.join_net, "net"), (&config.join_ipc, "ipc")]
+                    .into_iter()
+                    .filter_map(|(id, ns)| Some((id.as_ref()?, ns)))
+                    .map(|(other, ns)| {
+                        let pid = State::load(paths, other)
+                            .ok()
+                            .filter(|s| s.observed_status() == Status::Running)
+                            .and_then(|s| s.init_pid)
+                            .ok_or_else(|| Error::ShareWith(other.clone()))?;
+                        let path = std::ffi::CString::new(format!("/proc/{pid}/ns/{ns}"))
+                            .map_err(|_| Error::ShareWith(other.clone()))?;
+                        sys::open_namespace(&path).map_err(|_| Error::ShareWith(other.clone()))
+                    })
+                    .collect::<Result<_, _>>()?,
                 security: Some(config.security()?),
                 stdio: Some(stdio),
                 tty: config.tty,
@@ -807,7 +841,6 @@ pub fn supervise(paths: &Paths, id: &str) -> Result<Exit, Error> {
                 // is not a `create`, and there is nobody to send the byte.
                 exec_fifo: fifo_once.take(),
                 cgroup_fd: cg.as_ref().map(|c| c.fd()),
-                ..Default::default()
             },
         )?;
 
@@ -1741,6 +1774,8 @@ mod tests {
             private_net: false,
             host_pid: false,
             host_ipc: false,
+            join_net: None,
+            join_ipc: None,
             stop_signal: None,
             sysctls: Vec::new(),
             rlimits: Vec::new(),

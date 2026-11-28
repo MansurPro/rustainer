@@ -722,6 +722,10 @@ services:
       test: ["CMD-SHELL", "test -f /ready"]
       interval: 1s
       retries: 20
+  sidecar:
+    image: $IMG
+    network_mode: "service:db"
+    command: sleep 400
   job:
     image: $IMG
     command: sh -c "sleep 1; echo done > /shared/flag"
@@ -752,8 +756,8 @@ EOF
 UPC=$(timeout 300 "$B" stack up -f "$C/compose.yml" 2>&1)
 contains "it comes up, named after its directory" "$UPC" "shop-web"
 contains "a key that changes nothing is dropped, and said to be" "$UPC" "hostname: ignored"
-check "both services run" \
-    "$("$B" stack ps -f "$C/compose.yml" 2>/dev/null | tail -n +2 | awk '$2 == "running"' | grep -c .)" "2"
+check "the three services that stay up run" \
+    "$("$B" stack ps -f "$C/compose.yml" 2>/dev/null | tail -n +2 | awk '$2 == "running"' | grep -c .)" "3"
 check "environment from the mapping, with the default substituted" \
     "$(timeout 60 "$B" exec shop-db /bin/sh -c 'echo $GREETING' 2>&1 | tail -1)" "hello there"
 check "and from the file it extends" \
@@ -770,10 +774,12 @@ check "tmpfs is a tmpfs" \
     "$(timeout 60 "$B" exec shop-web /bin/sh -c 'grep -c " /scratch tmpfs " /proc/mounts' 2>&1 | tail -1)" "1"
 check "shm_size, ulimits and sysctls reach the container" \
     "$(timeout 60 "$B" exec shop-web /bin/sh -c 'echo $(grep -c " /dev/shm tmpfs .*size=16384k" /proc/mounts) $(ulimit -Sn) $(ulimit -Hn) $(cat /proc/sys/net/core/somaxconn)' 2>&1 | tail -1)" "1 777 888 321"
+nsof() { timeout 60 "$B" exec "$1" /bin/sh -c 'readlink /proc/self/ns/net' 2>/dev/null | tail -1; }
+check "network_mode: service:db is db's network" "$(nsof shop-sidecar)" "$(nsof shop-db)"
 contains "extra_hosts reaches /etc/hosts" \
     "$(timeout 60 "$B" exec shop-web /bin/cat /etc/hosts 2>&1)" "partner"
 check "with no -f, a compose.yml in the directory is found" \
-    "$(cd "$C" && "$B" stack ps 2>/dev/null | grep -c shop-)" "3"
+    "$(cd "$C" && "$B" stack ps 2>/dev/null | grep -c shop-)" "4"
 cat > "$C/failing.yml" <<EOF
 name: failing
 services:

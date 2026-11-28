@@ -129,9 +129,13 @@ pub fn exec(paths: &Paths, id: &str, req: &mut Request) -> Result<Exit, Error> {
     let child_fds = open_namespaces(
         init,
         [
-            ("ipc", ns.ipc),
+            // One the container made, or one it was let into: either
+            // way it is where the container's processes are, and a
+            // command run "in the container" that stayed in the
+            // host's network would not be.
+            ("ipc", ns.ipc || config.join_ipc.is_some()),
             ("uts", ns.uts),
-            ("net", ns.net),
+            ("net", ns.net || config.join_net.is_some()),
             // Last. See the module comment.
             ("mnt", ns.mount),
         ],

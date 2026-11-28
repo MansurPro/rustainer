@@ -277,5 +277,31 @@ check "and the host's names" \
     "$(grep -c "" /etc/hosts)"
 
 echo
+echo "11. Sharing another container's network and IPC"
+# What a sidecar is: a second container in the first one's network, so
+# `localhost` is the same place for both.
+if [ "$(awk '{print $1, $2, $3}' /proc/self/uid_map 2>/dev/null)" = "0 0 4294967295" ]; then
+    FIRST=$("$B" run -d --network none --layer "$BASE" /bin/sleep 300 2>/dev/null | tail -1)
+    sleep 0.5
+    NS() { timeout 30 "$B" exec "$FIRST" /bin/sh -c "readlink /proc/self/ns/$1" 2>/dev/null | tail -1; }
+    check "--network container:<id> is that container's network" \
+        "$(R2() { timeout 60 "$B" run --network "container:$FIRST" --layer "$BASE" "$@" 2>&1 | tail -1; }; R2 /bin/sh -c 'readlink /proc/self/ns/net')" "$(NS net)"
+    check "--ipc container:<id> is that container's IPC namespace" \
+        "$(R --ipc "container:$FIRST" /bin/sh -c 'readlink /proc/self/ns/ipc')" "$(NS ipc)"
+    if [ "$(R /bin/sh -c 'readlink /proc/self/ns/net')" != "$(NS net)" ]; then
+        ok "and a container that does not ask has its own"
+    else
+        bad "and a container that does not ask has its own"
+    fi
+    "$B" rm --force "$FIRST" >/dev/null 2>&1
+    case "$(timeout 60 "$B" run --network "container:$FIRST" --layer "$BASE" /bin/true 2>&1)" in
+    *"is not running"*) ok "sharing with a container that is gone says so" ;;
+    *) bad "sharing with a container that is gone says so" ;;
+    esac
+else
+    for _ in 1 2 3 4; do skip "joining another container's namespace needs the initial user namespace"; done
+fi
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

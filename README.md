@@ -997,6 +997,7 @@ rustainer run --pid host alpine ps            # the host's processes
 rustainer run --tmpfs /scratch:size=64m alpine df -h /scratch
 rustainer run --shm-size 1g --ulimit nofile=65536 postgres:16-alpine
 rustainer run --gpus all alpine ls /dev/dri            # the machine's GPU device nodes
+rustainer run --network container:web alpine wget -qO- localhost   # a sidecar: web's network, web's localhost
 rustainer run --sysctl net.core.somaxconn=4096 nginx    # the host's settings are refused
 
 **The test is a round trip**: build, push, pull into a *clean* store, run.
