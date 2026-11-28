@@ -277,6 +277,49 @@ check "and the host's names" \
     "$(grep -c "" /etc/hosts)"
 
 echo
+echo "10b. A device as its vendor describes it (CDI)"
+# What makes a GPU usable is not its node but the driver libraries that
+# match this host's kernel module, and the vendor's CDI spec is where
+# those are listed. A made-up device with a real shared library stands
+# in for one here.
+if command -v cc >/dev/null 2>&1; then
+    mkdir -p "$SCRATCH/cdi" "$SCRATCH/drv"
+    echo 'int fake_gpu(void) { return 1; }' > "$SCRATCH/drv/f.c"
+    cc -shared -fPIC -Wl,-soname,libfakegpu.so.1 -o "$SCRATCH/drv/libfakegpu.so.550.1" "$SCRATCH/drv/f.c" 2>/dev/null
+    cat > "$SCRATCH/cdi/fake.json" <<CDIEND
+{"cdiVersion": "0.6.0", "kind": "example.com/gpu",
+ "devices": [{"name": "all", "containerEdits": {"deviceNodes": [{"path": "/dev/fakegpu0", "hostPath": "/dev/zero"}]}}],
+ "containerEdits": {
+   "env": ["FAKE_GPU=present", "OVERRIDDEN=by-the-spec"],
+   "mounts": [{"hostPath": "$SCRATCH/drv/libfakegpu.so.550.1", "containerPath": "/usr/lib/libfakegpu.so.550.1", "options": ["ro", "nosuid", "nodev", "bind"]}],
+   "hooks": [
+     {"hookName": "createContainer", "path": "/usr/bin/vendor-hook", "args": ["vendor-hook", "update-ldcache", "--folder", "/usr/lib"]},
+     {"hookName": "createContainer", "path": "/usr/bin/vendor-hook", "args": ["vendor-hook", "create-symlinks", "--link", "libfakegpu.so.1::/usr/lib/libfakegpu.so"]},
+     {"hookName": "createContainer", "path": "/usr/bin/vendor-hook", "args": ["vendor-hook", "something-else"]}]}}
+CDIEND
+    C() { RUSTAINER_CDI_DIRS="$SCRATCH/cdi" timeout 60 "$B" run --network none --layer "$BASE" "$@" 2>&1; }
+    check "the device's node is there" "$(C --device example.com/gpu=all /bin/sh -c 'test -c /dev/fakegpu0 && echo node' | tail -1)" "node"
+    check "its driver library is mounted, read-only" \
+        "$(C --device example.com/gpu=all /bin/sh -c 'test -s /usr/lib/libfakegpu.so.550.1 && grep -c " /usr/lib/libfakegpu.so.550.1 ro" /proc/self/mountinfo' | tail -1)" "1"
+    check "under the name programs are linked against" \
+        "$(C --device example.com/gpu=all /bin/sh -c 'readlink /usr/lib/libfakegpu.so.1' | tail -1)" "libfakegpu.so.550.1"
+    check "and the link the spec asked for" \
+        "$(C --device example.com/gpu=all /bin/sh -c 'readlink /usr/lib/libfakegpu.so' | tail -1)" "libfakegpu.so.1"
+    check "its environment is set, and -e still wins" \
+        "$(C --device example.com/gpu=all -e OVERRIDDEN=by-the-user /bin/sh -c 'echo $FAKE_GPU $OVERRIDDEN' | tail -1)" "present by-the-user"
+    contains "a hook it does not know is named, and not run" \
+        "$(C --device example.com/gpu=all /bin/true)" 'hook "something-else" is not run'
+    contains "a device nobody described is refused" \
+        "$(C --device example.com/gpu=7 /bin/true)" "has no device"
+    contains "as is a kind with no spec" \
+        "$(C --device other.com/fpga=0 /bin/true)" "no CDI spec"
+    check "an ordinary --device still works beside it" \
+        "$(C --device /dev/zero:/dev/myzero --device example.com/gpu=all /bin/sh -c 'test -c /dev/myzero && test -c /dev/fakegpu0 && echo both' | tail -1)" "both"
+else
+    for _ in 1 2 3 4 5 6 7 8 9; do skip "no C compiler to make a library with"; done
+fi
+
+echo
 echo "11. Sharing another container's network and IPC"
 # What a sidecar is: a second container in the first one's network, so
 # `localhost` is the same place for both.

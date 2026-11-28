@@ -1227,11 +1227,26 @@ daemon, nothing installed on the host.
 What that does not show is a model running on a GPU. llama.cpp's GPU
 backends want Vulkan or CUDA; this card is bound to the `radeon`
 kernel driver, which has no Vulkan, and moving it to `amdgpu` needs
-root and a reboot of a shared machine. `--gpus` also hands over the
-device nodes only: an NVIDIA container still needs the userspace
-driver matching the host's kernel module inside its image, which
-Docker's NVIDIA runtime injects and this does not. So the Model Runner
-comparison above stands as measured, CPU against GPU.
+root and a reboot of a shared machine. So the Model Runner comparison
+above stands as measured, CPU against GPU.
+
+**The driver problem is solved the way Docker and Podman solve it, and
+has not been run on the hardware it is for.** An NVIDIA container needs
+the userspace libraries that match the host's kernel module, and those
+cannot be in an image. The vendor's answer is a CDI spec - a file
+`nvidia-ctk cdi generate` writes, listing the device nodes, the
+libraries to mount, the environment and some hooks - which Docker (25
+and later) and Podman read. This engine reads them too: `--device
+nvidia.com/gpu=all`, and `--gpus all` uses the spec when there is one
+and falls back to bare device nodes when there is not. Nodes and
+libraries are binds. Hooks are not executed; the two every GPU spec has
+are done by what they are for - the links `create-symlinks` lists, and
+for `update-ldcache` a link from each mounted library's soname, read
+out of the ELF file. Stage 16 checks all of that with a made-up device
+and a real compiled library. **What has not happened is a run on a
+machine with an NVIDIA card**: none was available, so whether
+`nvidia-smi` works in a container here is a claim about the mechanism,
+not an observation.
 
 It loads GGUF only; the `-mlx` and `-safetensors`
 tags in the same catalogue are refused with a sentence saying why.
