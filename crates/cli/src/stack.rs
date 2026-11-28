@@ -188,6 +188,9 @@ pub struct Service {
     /// `/path` or `/path:size=64m`, as `run --tmpfs`.
     #[serde(default)]
     pub tmpfs: Vec<String>,
+    /// The signal `stop` sends first, as `run --stop-signal`.
+    #[serde(default)]
+    pub stop_signal: Option<String>,
     /// `host`, or `private`: as `run --ipc`.
     #[serde(default)]
     pub ipc: Option<String>,

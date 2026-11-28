@@ -44,6 +44,7 @@ pub struct Built {
     pub healthcheck: Option<(Vec<String>, u64, u64)>,
     pub stop_signal: Option<String>,
     pub volumes: Vec<String>,
+    pub on_build: Vec<String>,
 }
 
 /// Substitute `$VAR` and `${VAR}` from the build arguments.
@@ -559,6 +560,28 @@ pub fn retouch(path: &Path, owner: Option<(u32, u32)>, mode: Option<u32>) -> Res
     Ok(())
 }
 
+/// `ADD <url>`: fetch it into `dest`, mode 0600 as Docker leaves it.
+// ponytail: held in memory, capped at 1 GiB. Stream to the file if
+// somebody ADDs something larger.
+pub fn download(url: &str, dest: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut response = ureq::get(url)
+        .call()
+        .with_context(|| format!("fetching {url}"))?;
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(1 << 30)
+        .read_to_vec()
+        .with_context(|| format!("reading {url}"))?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(dest, bytes)?;
+    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
 /// Whether `ADD` unpacks this rather than copying it.
 // ponytail: decided by the name and limited to tar and tar.gz, where
 // Docker sniffs the content and also takes bzip2 and xz.
@@ -674,6 +697,7 @@ pub fn describe(i: &Instruction) -> String {
         Instruction::Healthcheck { test, .. } if test.is_empty() => "HEALTHCHECK NONE".into(),
         Instruction::Healthcheck { test, .. } => format!("HEALTHCHECK CMD {}", test.join(" ")),
         Instruction::StopSignal(s) => format!("STOPSIGNAL {s}"),
+        Instruction::OnBuild(s) => format!("ONBUILD {s}"),
         Instruction::Volume(v) => format!("VOLUME {}", v.join(" ")),
     }
 }
