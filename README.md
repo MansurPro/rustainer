@@ -247,11 +247,33 @@ line to the child's `uid_map`:
 ```
 
 One extent, the caller's own id, which is the whole of what an unprivileged
-process may map for itself. The three-process topology rootless is assumed
-to require applies to `subuid`-based multi-extent maps, which are
-deliberately not implemented and say so. `setgroups` is denied before
+process may map for itself. `setgroups` is denied before
 `gid_map` is written, in that order, because the reverse fails and leaves
 the container holding the caller's supplementary groups.
+
+**Where the system offers more than one id, it is used.** One id means
+every file in an image is owned by that id, `chown` to anyone else is
+impossible and a process cannot become a service account. `/etc/subuid`
+grants a user a range of ids nobody else has, and the setuid helpers
+`newuidmap` and `newgidmap` will write a map that includes it - what
+rootless Docker and Podman both require. If the helpers are installed
+and the user has a range, the map is
+
+```
+0 1000 1
+1 100000 65536
+```
+
+and then an image's files keep their owners, `USER app` and `--user
+1234` work, and `chown` is the real call. No flag: it is found, or it is
+not and the single id above is what you get. The namespace is one per
+user, held open by a single small process (`rustainer-ns`) that every
+later command joins, because a container's namespaces can only be
+entered from the user namespace that owns them: one per command would
+leave `exec` and `stop` unable to reach anything. `RUSTAINER_SUBIDS=0`
+turns it off. Files a container leaves owned by a sub-id are not the
+user's to delete from outside; `rustainer unshare rm -rf <path>` runs a
+command from inside.
 
 That this is a one-flag change is the actual result, not a convenience.
 Rootless was last on the ladder precisely so it could find out whether

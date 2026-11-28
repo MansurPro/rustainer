@@ -423,6 +423,11 @@ timeout 600 "$B" build --network none -t ms:scratch "$M" >/dev/null 2>&1
 check "FROM scratch builds" "$?" "0"
 check "and runs with only what was copied in" "$(mrun ms:scratch ls / | grep -c -x -e bin -e lib)" "2"
 
+# Whether the engine runs with more than one id: real root, or a user
+# with a sub-id range. With one id, owners cannot really change.
+MANY_IDS=no
+[ "$("$B" unshare awk '{s += $3} END {print (s > 1) ? "yes" : "no"}' /proc/self/uid_map 2>/dev/null)" = yes ] && MANY_IDS=yes
+
 echo
 echo "7e. The rest of the language"
 R="$SCRATCH/restctx"; mkdir -p "$R/payload/dir"
@@ -461,7 +466,7 @@ RSEND
 check "a file using the rest of the language builds" "$RC" "0"
 [ "$RC" -eq 0 ] || echo "$OUT" | tail -5
 rrun() { timeout 60 "$B" run --network none "$@" 2>/dev/null; }
-if [ "$(awk '{print $1, $2, $3}' /proc/self/uid_map 2>/dev/null)" = "0 0 4294967295" ]; then
+if [ "$MANY_IDS" = yes ]; then
     check "--chown takes names from the image" "$(rrun rest:1 stat -c %u:%g /usr/local/bin/run.sh)" "1234:1234"
     check "and a number alone is both" "$(rrun rest:1 stat -c %u:%g /numeric.sh)" "4321:4321"
 else
@@ -622,13 +627,13 @@ RSEND
 check "a step that changes owners builds, root or not" "$RC" "0"
 [ "$RC" -eq 0 ] || echo "$OUT" | tail -3
 check "and ran to its end" "$(rrun rest:own cat /finished)" "done"
-if [ "$(id -u)" = 0 ] && [ "$(awk '{print $1, $2, $3}' /proc/self/uid_map 2>/dev/null)" = "0 0 4294967295" ]; then
+if [ "$MANY_IDS" = yes ]; then
     check "as root the owner really changed" "$(rrun rest:own stat -c %u /owned)" "1234"
 else
     check "without privilege the file is the builder's" "$(rrun rest:own stat -c %u /owned)" "0"
 fi
 case "$(rrun rest:own sh -c 'chown 1234 /tmp 2>&1; echo rc=$?')" in
-*"rc=0"*) [ "$(id -u)" = 0 ] && [ "$(awk '{print $1, $2, $3}' /proc/self/uid_map 2>/dev/null)" = "0 0 4294967295" ] \
+*"rc=0"*) [ "$MANY_IDS" = yes ] \
     && ok "outside a build, changing owner is the real call" \
     || bad "outside a build, a chown that cannot work must say so, not pretend" ;;
 *) ok "outside a build, a chown that cannot work says so" ;;
@@ -642,7 +647,7 @@ RUN mkdir -p /etc/apt/apt.conf.d
 RUN cat /etc/apt/apt.conf.d/* 2>/dev/null > /apt-saw; true
 RSEND
 )
-if [ "$(id -u)" = 0 ] && [ "$(awk '{print $1, $2, $3}' /proc/self/uid_map 2>/dev/null)" = "0 0 4294967295" ]; then
+if [ "$MANY_IDS" = yes ]; then
     check "root is not told to run apt as root" "$(rrun rest:apt cat /apt-saw)" ""
 else
     contains "a builder with one id has apt told to stay root" "$(rrun rest:apt cat /apt-saw)" 'Sandbox::User "root"'

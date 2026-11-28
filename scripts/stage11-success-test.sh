@@ -69,6 +69,11 @@ cleanup() {
     rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
+# Everything down to the last section is about being ONE id: the path a
+# machine without the sub-id helpers takes, and the one this stage was
+# written for. Where the helpers exist the engine would use them, so it
+# is told not to until the section that is about them.
+export RUSTAINER_SUBIDS=0
 MYUID=$(id -u)
 MYGID=$(id -g)
 echo "kernel $(uname -r) $(uname -m), uid $MYUID (NOT root, by design)"
@@ -250,6 +255,34 @@ check "the binary is not setuid" \
     "$([ -u "$B" ] && echo setuid || echo plain)" "plain"
 check "ps works without root, like every other stage" \
     "$("$B" ps -a >/dev/null 2>&1 && echo yes || echo no)" "yes"
+
+echo
+echo "Sub-ids: more than one user, still without root"
+# Where /etc/subuid grants this user a range and newuidmap exists - which
+# is what rootless Docker requires as well - the engine uses them: the
+# container has a range of real ids, so files keep their owners, `chown`
+# works and a process can be someone other than root.
+unset RUSTAINER_SUBIDS
+if command -v newuidmap >/dev/null 2>&1 && grep -q "^$(id -un):" /etc/subuid /etc/subgid 2>/dev/null; then
+    check "the user's namespace maps their own id and a range" \
+        "$("$B" unshare awk 'END {print NR}' /proc/self/uid_map 2>/dev/null)" "2"
+    mkdir -p "$SCRATCH/sub"
+    check "a file can be given to another user" \
+        "$("$B" unshare sh -c "touch '$SCRATCH/sub/f' && chown 1234:4321 '$SCRATCH/sub/f' && stat -c %u:%g '$SCRATCH/sub/f'" 2>&1)" "1234:4321"
+    if [ "$(stat -c %u "$SCRATCH/sub/f")" != "$MYUID" ] && [ "$(stat -c %u "$SCRATCH/sub/f")" != 0 ]; then
+        ok "which from outside is an id in the user's own range"
+    else
+        bad "which from outside is an id in the user's own range (got $(stat -c %u "$SCRATCH/sub/f"))"
+    fi
+    FIRST=$("$B" unshare readlink /proc/self/ns/user 2>/dev/null)
+    check "every invocation is in the same namespace" "$("$B" unshare readlink /proc/self/ns/user 2>/dev/null)" "$FIRST"
+    check "held open by one process, not one per command" "$(pgrep -u "$MYUID" -x rustainer-ns | wc -l | tr -d ' ')" "1"
+    check "RUSTAINER_SUBIDS=0 turns it off" \
+        "$(RUSTAINER_SUBIDS=0 "$B" unshare awk 'END {print NR}' /proc/self/uid_map 2>/dev/null)" "1"
+    "$B" unshare rm -rf "$SCRATCH/sub"
+else
+    SKIP=$((SKIP + 6)); echo "  SKIP  no newuidmap, or no sub-id range for this user (6 checks)"
+fi
 
 echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"

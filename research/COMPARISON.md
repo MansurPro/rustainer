@@ -296,6 +296,11 @@ found four defects, the first three of which are not about builds:
   solves this with sub-id ranges and a setuid helper; this needs
   neither, and the price is that every file is owned by the one user
   there is, which is already true of every layer that user pulls.
+  Where the helper *is* installed and the user has a range, the engine
+  now does what Docker does - one user namespace per user with the
+  range mapped, held open and joined by every command - and then owners
+  are real: an unprivileged `alpine` shows `/etc/shadow` in group 42,
+  as under Docker, and a build with `USER app` works.
 - A container on the host's network had no `resolv.conf`.
 - **A seccomp profile naming a syscall the architecture lacks was
   applied with no rules at all.** On arm64, a profile denying `chmod`
