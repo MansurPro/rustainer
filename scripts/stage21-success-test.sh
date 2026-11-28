@@ -390,6 +390,26 @@ check "and the image is what the file says" "$(mrun ms:par cat /both | tr '\n' '
 OUT=$(timeout 600 "$B" build --no-cache --network none -t ms:par2 "$M" 2>&1)
 case "$OUT" in *reused*) bad "--no-cache builds every step itself" ;; *) ok "--no-cache builds every step itself" ;; esac
 
+# Two stages that both continue a third do not take turns either: the
+# second is started when the one they share is done.
+NONCE=$RANDOM$RANDOM
+cat > "$M/Dockerfile" <<MSEND
+FROM $IMG AS base
+RUN echo "base $NONCE" > /base
+FROM base AS one
+RUN echo "one $NONCE" > /one
+FROM base AS two
+RUN echo "two $NONCE" > /two
+FROM $IMG
+COPY --from=one /one /base /
+COPY --from=two /two /
+MSEND
+OUT=$(timeout 600 "$B" build --network none -t ms:sib "$M" 2>&1); RC=$?
+check "a file with two stages on one base builds" "$RC" "0"
+contains "the second of them was built alongside the first" "$OUT" "1 step(s) reused"
+check "and the image has what both made" "$(mrun ms:sib sh -c 'cat /base /one /two' | tr '\n' ' ')" \
+    "base $NONCE one $NONCE two $NONCE "
+
 # No base at all: the image is exactly what was copied into it.
 cat > "$M/Dockerfile" <<MSEND
 FROM $IMG AS build
@@ -653,10 +673,10 @@ echo "8. The built image is an ordinary image"
 contains "images lists it" "$("$B" images)" "demo_1"
 timeout 60 "$B" rmi demo:3 >/dev/null 2>&1 \
     && ok "rmi removes it" || bad "rmi failed on a built image"
-contains "the build is in the event log" "$("$B" events --since 900 --limit 400)" "build"
+contains "the build is in the event log" "$("$B" events --since 1800 --limit 4000)" "build"
 # A build history is opened to find out what went wrong, so the builds
 # that failed have to be in it, with why.
-EV=$("$B" events --since 900 --limit 400)
+EV=$("$B" events --since 1800 --limit 4000)
 contains "with how long it took and what it reused" "$EV" '"reused":2'
 contains "a failed build is recorded too" "$EV" "build-failed"
 contains "with the reason" "$EV" "failed with exit status 7"

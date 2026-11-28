@@ -949,8 +949,9 @@ Only the stages the image is actually built from are built: a `test`
 stage nothing copies from is skipped unless it is the `--target`. A
 stage that starts from an image - the usual `runtime` stage installing
 its packages - is built at the same time as the stages before it, as far
-as its first `COPY --from`. Two stages that both continue another stage
-still take turns.
+as its first `COPY --from`. So is a stage that continues another one,
+from the moment that one is finished: two stages on the same `base` do
+not take turns.
 
 ### Pushing
 
