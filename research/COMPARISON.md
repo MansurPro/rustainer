@@ -98,6 +98,35 @@ document reported `0 ms` across the board because busybox's `date` has no
 | binaries installed | 5.1 MiB | 200 MiB | **39.8×** |
 | pull a cold image (network) | 0.9–1.0 s | 2.6–2.7 s | 2.7–3.0× |
 
+### Measured again, eighty changes later
+
+The table above is from when the engine was much smaller. It was run
+again on the same machine after the build, Compose, volume, healthcheck,
+sub-id and device work (Docker 28.5.2, 20 iterations, two runs):
+
+| measurement | rustainer | Docker | ratio |
+|---|---:|---:|---:|
+| run a container to exit (median) | 13 ms | 78 ms | 6.0× |
+| run a container to exit (p90) | 14–15 ms | 80–82 ms | 5.3–5.9× |
+| start detached, stop, remove | 51–53 ms | 100–101 ms | 1.9–2.0× |
+| exec a command in a live container | 9 ms | 27 ms | 3.0× |
+| resident per running container | 2 MiB | 18 MiB | 9× |
+| resident with nothing running | **0 MiB** | 119–121 MiB | — |
+| binaries installed | 5.1 MiB | 200 MiB | 39× |
+| pull a cold image (network) | 0.44–0.47 s | 1.1 s | 2.3–2.5× |
+
+Docker's figures have not moved. Rustainer's had: the first re-run read
+16 ms, 59 ms and 12 ms for the first three rows, and 3 MiB per
+container. The cause was not any one feature. The binary had grown from
+5.1 to 8.5 MiB, and it is copied into a sealed memory file every time it
+starts - which a single `run` does more than once - so its size is paid
+for on every command. The workspace had never had a release profile;
+whole-program optimisation and no symbol table put the binary back at
+5.1 MiB and took 3 ms off each row. What is left of the gap to the
+first table (13 ms against 11-12, 9 against 7-8, 52 against 45) is what
+the added features cost, and start-stop-remove at 2.0× is now the
+closest row to Docker.
+
 ### The same script on a second host
 
 Everything above is one machine: an arm64 laptop's VM, both engines
