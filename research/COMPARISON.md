@@ -357,10 +357,11 @@ work not yet done — `research/pass-2/RND.md` §19 says which are which.
 - **BuildKit** — `build` reads the whole Dockerfile language: stages, `COPY
   --from`, `--target`, `.dockerignore`, `ONBUILD`, `ADD <url>`, cache, secret,
   bind and ssh mounts, and a layer cache are all there, and a stage the
-  image is not built from is skipped. What it still is not is a full
-  solver: a stage that starts from an image is built alongside the ones
-  before it, but two stages that both start from another stage still take
-  turns, and there is no remote cache import or export.
+  image is not built from is skipped. Stages build side by side: one that starts
+  from an image alongside the stages before it, one that continues another
+  from the moment that one is done. It is still not BuildKit's solver - a
+  stage is only run ahead as far as its first `COPY --from` - and there is
+  no remote cache import or export.
 - **A real in-namespace resolver.** User-defined networks exist (stage 23) and
   containers on one find each other by name, but the mechanism is `/etc/hosts`,
   rewritten as containers come and go. Docker runs a resolver at 127.0.0.11

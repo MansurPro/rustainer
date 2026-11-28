@@ -5096,9 +5096,25 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 todo.extend(by_name.or_else(|| r.parse().ok().filter(|n| *n < i)));
             }
         }
-        // Warming one stage: that stage and nothing else.
+        // Warming one stage: that stage and the ones it continues,
+        // which the build that asked has already finished and which
+        // are therefore walked straight out of the cache.
         match args.warm {
-            Some(k) => (0..needed.len()).map(|i| i == k).collect(),
+            Some(k) => {
+                let mut chain = vec![false; needed.len()];
+                let mut at = Some(k).filter(|k| *k < chain.len());
+                while let Some(i) = at {
+                    chain[i] = true;
+                    let from = &stage_refs[i].1[0];
+                    at = stage_refs[..i]
+                        .iter()
+                        .position(|(a, _)| {
+                            a.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(from))
+                        })
+                        .or_else(|| from.parse().ok().filter(|n| *n < i));
+                }
+                chain
+            }
             None => needed,
         }
     };
@@ -5114,48 +5130,51 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
     // such a stage needs nothing this build has yet to make.
     // ponytail: the stages BEFORE the first `COPY --from` only. A full
     // solver would also run two builder stages side by side.
-    let to_warm: Vec<(usize, String)> = {
+    // `(stage, the stage it continues if it continues one, its image)`.
+    // A stage that continues another is started the moment that one is
+    // finished, unless it is simply the next in the file: two stages
+    // that both build on `base` do not have to take turns.
+    let to_warm: Vec<(usize, Option<usize>, String)> = {
         let mut out = Vec::new();
         let mut aliases: Vec<Option<String>> = Vec::new();
-        let mut current: Option<(usize, String, bool)> = None; // stage, image, still before a COPY --from
+        // stage, parent stage, image, still before anything from elsewhere
+        let mut current: Option<(usize, Option<usize>, String, bool)> = None;
         let mut runs = false;
         for ins in &instructions {
             match ins {
                 Instruction::From { image, alias } => {
-                    if let Some((k, img, _)) = current.take().filter(|_| runs) {
-                        out.push((k, img));
+                    if let Some((k, parent, img, _)) = current.take().filter(|_| runs) {
+                        out.push((k, parent, img));
                     }
                     let k = aliases.len();
-                    let from_stage = aliases
+                    let parent = aliases
                         .iter()
-                        .flatten()
-                        .any(|a| a.eq_ignore_ascii_case(image))
-                        || image.parse::<usize>().is_ok_and(|n| n < k)
-                        || image == "scratch";
+                        .position(|a| a.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(image)))
+                        .or_else(|| image.parse().ok().filter(|n| *n < k));
                     aliases.push(alias.clone());
                     runs = false;
-                    current = (!from_stage).then(|| (k, image.clone(), true));
+                    current = (image != "scratch").then(|| (k, parent, image.clone(), true));
                 }
                 Instruction::Copy { from: Some(_), .. } => {
                     if let Some(c) = &mut current {
-                        c.2 = false;
+                        c.3 = false;
                     }
                 }
                 // A step that binds from somewhere else ends the part
                 // of a stage that needs nothing, as a COPY --from does.
                 Instruction::Run { binds, .. } if binds.iter().any(|b| b.0.is_some()) => {
                     if let Some(c) = &mut current {
-                        c.2 = false;
+                        c.3 = false;
                     }
                 }
-                Instruction::Run { .. } => runs |= current.as_ref().is_some_and(|c| c.2),
+                Instruction::Run { .. } => runs |= current.as_ref().is_some_and(|c| c.3),
                 _ => {}
             }
         }
-        if let Some((k, img, _)) = current.take().filter(|_| runs) {
-            out.push((k, img));
+        if let Some((k, parent, img, _)) = current.take().filter(|_| runs) {
+            out.push((k, parent, img));
         }
-        out.retain(|(k, _)| *k > 0 && needed.get(*k).copied().unwrap_or(false));
+        out.retain(|(k, ..)| *k > 0 && needed.get(*k).copied().unwrap_or(false));
         if args.warm.is_some() || args.no_cache {
             out.clear();
         }
@@ -5208,34 +5227,54 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 // one. Each base is pulled here first: two processes
                 // pulling one image at once is not something the store
                 // is asked to survive.
+                let spawn_warmer = |k: usize| {
+                    let mut c = std::process::Command::new("/proc/self/exe");
+                    c.arg("--root").arg(paths_root(paths)).arg("build");
+                    c.arg("--warm").arg(k.to_string()).arg("-f").arg(&file);
+                    c.arg("--network").arg(&args.network);
+                    for a in &args.build_args {
+                        c.arg("--build-arg").arg(a);
+                    }
+                    for s in &args.secrets {
+                        c.arg("--secret").arg(s);
+                    }
+                    if let Some(s) = &args.ssh {
+                        c.arg("--ssh").arg(s);
+                    }
+                    c.arg(&context)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .ok()
+                };
                 if !std::mem::replace(&mut warm_started, true) {
-                    for (k, image) in &to_warm {
+                    for (k, parent, image) in &to_warm {
+                        if parent.is_some() {
+                            continue;
+                        }
                         let reference = build::expand(image, &arg_vars);
                         if store.local(&reference).is_none()
                             && store.pull(&reference, false).is_err()
                         {
                             continue;
                         }
-                        let mut c = std::process::Command::new("/proc/self/exe");
-                        c.arg("--root").arg(paths_root(paths)).arg("build");
-                        c.arg("--warm").arg(k.to_string()).arg("-f").arg(&file);
-                        c.arg("--network").arg(&args.network);
-                        for a in &args.build_args {
-                            c.arg("--build-arg").arg(a);
-                        }
-                        for s in &args.secrets {
-                            c.arg("--secret").arg(s);
-                        }
-                        if let Some(s) = &args.ssh {
-                            c.arg("--ssh").arg(s);
-                        }
-                        c.arg(&context)
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null());
-                        if let Ok(child) = c.spawn() {
+                        if let Some(child) = spawn_warmer(*k) {
                             warmers.0.insert(*k, child);
                         }
+                    }
+                }
+                // The stage before this one has just finished. Anything
+                // further down the file that continues it can start now,
+                // beside the stage this build is about to do itself.
+                for (k, parent, _) in &to_warm {
+                    if stage_no > 0
+                        && *parent == Some(stage_no - 1)
+                        && *k > stage_no
+                        && !skipping
+                        && let Some(child) = spawn_warmer(*k)
+                    {
+                        warmers.0.insert(*k, child);
                     }
                 }
                 // This stage was being built elsewhere: wait for that,
