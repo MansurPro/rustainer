@@ -225,6 +225,10 @@ case "$(R --device "$SCRATCH/single.txt" /bin/true 2>&1)" in
 *"is not a device"*) ok "--device refuses something that is not a device" ;;
 *) bad "--device refuses something that is not a device" ;;
 esac
+# An image may list one layer several times (an empty one per
+# metadata-only instruction is the usual case), the store keeps a layer
+# once, and the kernel refuses a directory twice in one overlay.
+check "a layer listed twice still mounts" "$(R --layer "$BASE" /bin/echo twice)" "twice"
 
 echo
 echo "10. /dev/shm, resource limits, and the kernel settings a container owns"

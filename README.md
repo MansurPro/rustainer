@@ -849,6 +849,8 @@ rustainer build -t myapp:1 .
 rustainer build -t myapp:1 --build-arg VERSION=3.21 -f ./Dockerfile .
 rustainer build -t myapp:1 --network none .      # hermetic, and rootless
 rustainer build -t myapp:test --target test .    # stop at a stage
+rustainer build -t myapp:1 --secret id=npm,src=$HOME/.npmrc .   # for RUN --mount=type=secret
+rustainer build --check .                        # read the Dockerfile, build nothing
 ```
 
 **A build step that changes the filesystem is a container run on the
@@ -913,10 +915,13 @@ The rest of the language: `COPY --chown=app:app --chmod=755` (names are
 looked up in the image being built), `ADD` of a local `.tar`/`.tar.gz`
 unpacks it, `SHELL`, `MAINTAINER`, and `RUN --mount=type=cache,target=…`,
 which gives the step a directory that outlives the build and never
-becomes part of a layer. `VOLUME` and `STOPSIGNAL` are recorded in the
+becomes part of a layer. `RUN --mount=type=secret,id=…` binds a file
+given with `--secret` (from a path, or from an environment variable) for
+that one step, read-only; no layer holds it, and one the build was not
+given is simply absent. `VOLUME` and `STOPSIGNAL` are recorded in the
 image and not acted on: a container's writes land in its own layer either
 way, and `stop` sends `SIGTERM`. `ONBUILD`, `ADD <url>` and the other
-`--mount` types are refused by name.
+`--mount` types (`bind`, `ssh`) are refused by name.
 
 `HEALTHCHECK` is recorded and **acted on**: `run -d` on an image that has
 one starts checking it, and `ps` shows `running (healthy)`. `--health-cmd`,

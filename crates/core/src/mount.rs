@@ -624,7 +624,17 @@ pub fn plan(
                 });
             }
             let mut layers = Vec::with_capacity(o.layers.len());
-            for l in &o.layers {
+            for (i, l) in o.layers.iter().enumerate() {
+                // An image may list the same layer twice - the usual
+                // case is one empty layer per metadata-only instruction -
+                // and the store keeps a layer once, by its content. The
+                // kernel refuses a directory that appears twice in one
+                // overlay (ELOOP, "overlapping lowerdir"). Only the
+                // uppermost copy can ever be seen, since it covers every
+                // path the lower one has, so that is the one kept.
+                if o.layers[i + 1..].contains(l) {
+                    continue;
+                }
                 // Colons and commas are the legacy option separators. The
                 // `lowerdir+` form escapes them, but a path containing one
                 // is a sign something is wrong and the failure it produces
@@ -1417,6 +1427,35 @@ mod tests {
             !labels.iter().any(|l| l.contains("onto itself")),
             "an overlay IS a mount point; binding over it would hide it"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_layer_listed_twice_is_mounted_once_at_its_upper_position() {
+        let dir = std::env::temp_dir().join("rustainer-overlay-twice");
+        std::fs::create_dir_all(&dir).unwrap();
+        let privs = Privileges {
+            sys_admin: true,
+            mknod_devices: true,
+            initial_user_ns: true,
+        };
+        let o = Overlay {
+            layers: ["/a", "/b", "/a", "/c", "/b"].map(PathBuf::from).to_vec(),
+            upper: None,
+            work: None,
+            read_only: true,
+        };
+        let p = plan(&dir, privs, None, Some(&o), &[], &[]).unwrap();
+        let mounted = p
+            .ops
+            .iter()
+            .find_map(|o| match &o.op {
+                Op::Overlay { layers, .. } => Some(layers.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let mounted: Vec<_> = mounted.iter().map(|c| c.to_str().unwrap()).collect();
+        assert_eq!(mounted, ["/a", "/c", "/b"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

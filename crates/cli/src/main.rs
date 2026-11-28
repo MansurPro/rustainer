@@ -1060,8 +1060,9 @@ struct PushArgs {
 
 #[derive(Args)]
 struct BuildArgs {
-    /// Name for the built image, e.g. `-t myapp:1`.
-    #[arg(short = 't', long = "tag")]
+    /// Name for the built image, e.g. `-t myapp:1`. Needed unless
+    /// `--check`.
+    #[arg(short = 't', long = "tag", default_value = "")]
     tag: String,
 
     /// The Dockerfile. `<context>/Dockerfile` by default.
@@ -1094,6 +1095,18 @@ struct BuildArgs {
     /// name after `AS`, or the stage's number counting from 0.
     #[arg(long)]
     target: Option<String>,
+
+    /// A file a step may read with `RUN --mount=type=secret,id=<id>`,
+    /// and that no layer ever holds: `id=npm,src=$HOME/.npmrc`, or
+    /// `id=token,env=TOKEN` to take it from this command's environment.
+    /// Repeatable.
+    #[arg(long = "secret", value_name = "id=ID,src=FILE")]
+    secrets: Vec<String>,
+
+    /// Read the Dockerfile, say what is wrong with it, and build
+    /// nothing.
+    #[arg(long)]
+    check: bool,
 
     /// The build context: the directory COPY may read from.
     #[arg(default_value = ".")]
@@ -3273,6 +3286,8 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
                 no_cache: false,
                 target: svc.target.clone(),
+                secrets: Vec::new(),
+                check: false,
                 context,
             },
         )
@@ -4639,6 +4654,13 @@ fn new_id() -> Result<String> {
 /// history that only lists the builds that worked cannot answer the
 /// question it is opened for, which is what went wrong.
 fn cmd_build(paths: &Paths, args: BuildArgs) -> Result<ExitCode> {
+    if args.check {
+        // Nothing is built, so there is nothing for the history.
+        return build_image(paths, args).map(|_| ExitCode::SUCCESS);
+    }
+    if args.tag.is_empty() {
+        bail!("build needs a name for the image: -t myapp:1");
+    }
     let started = std::time::Instant::now();
     let tag = args.tag.clone();
     let about = serde_json::json!({
@@ -4701,6 +4723,18 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
             instructions.truncate(*end);
         }
     }
+    if args.check {
+        let stages = instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::From { .. }))
+            .count();
+        println!(
+            "{}: {} instruction(s) in {stages} stage(s), nothing this engine refuses",
+            file.display(),
+            instructions.len()
+        );
+        return Ok((String::new(), instructions.len(), 0));
+    }
     let ignore = build::Ignore::load(&context);
 
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
@@ -4753,6 +4787,42 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
     let cleanup_staging = || {
         let _ = std::fs::remove_dir_all(&staging);
     };
+    // `--secret id=..,src=FILE` names a file; `id=..,env=VAR` is written
+    // to one in the staging directory, private to this user and deleted
+    // with it.
+    let mut given_secrets: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for spec in &args.secrets {
+        let opt = |key: &str| {
+            spec.split(',')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_owned())
+        };
+        let id = opt("id").with_context(|| format!("--secret {spec:?} needs id=<name>"))?;
+        let path = match (opt("src").or_else(|| opt("source")), opt("env")) {
+            (Some(src), _) => PathBuf::from(&src)
+                .canonicalize()
+                .with_context(|| format!("--secret {id}: reading {src}"))?,
+            (None, env) => {
+                let var = env.unwrap_or_else(|| id.clone());
+                let value = std::env::var(&var)
+                    .with_context(|| format!("--secret {id}: ${var} is not set"))?;
+                let path = staging.join(format!("secret-{}", given_secrets.len()));
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::File::options()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&path)?
+                        .write_all(value.as_bytes())?;
+                }
+                path
+            }
+        };
+        given_secrets.insert(id, path);
+    }
 
     // The cache. A RUN step's result depends on the filesystem it ran
     // over and on how it was run, so its key is a hash of both: `chain`
@@ -5020,6 +5090,7 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                 argv,
                 caches,
                 network,
+                secrets,
             } => {
                 let network = network.as_ref().unwrap_or(&args.network);
                 let expanded: Vec<String> = argv.iter().map(|a| build::expand(a, &vars)).collect();
@@ -5081,6 +5152,15 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                             std::fs::create_dir_all(&dir)?;
                             Ok(format!("{}:{target}", dir.display()))
                         })
+                        // A secret is a read-only bind for this one step.
+                        // A mount, so nothing of it is in the layer but
+                        // the empty file it was mounted on. One the
+                        // build was not given is simply absent, as in
+                        // Docker, and the step decides if that matters.
+                        .chain(secrets.iter().filter_map(|(id, target)| {
+                            let src = given_secrets.get(id)?;
+                            Some(Ok(format!("{}:{target}:ro", src.display())))
+                        }))
                         .collect::<Result<_>>()?,
                     no_healthcheck: true,
                     hostname: "build".into(),
