@@ -611,6 +611,44 @@ check "ARG and ENV reach the step as environment" "$(rrun rest:shell cat /vars)"
 check "a CMD's variables are the container's, read when it runs" \
     "$(rrun --hostname box rest:shell)" "box-world-arg-is-not-in-the-image"
 
+# A package manager changes owners and switches user as it goes. Root
+# does both for real. A user with one id can do neither, so in a build
+# those calls are answered "done": the step succeeds, and the files are
+# owned by the one user there is - as every pulled layer already is.
+OUT=$(rfile rest:own <<'RSEND'
+RUN adduser -D -u 1234 app && touch /owned && chown 1234:1234 /owned && chown -R app /home/app && echo done > /finished
+RSEND
+); RC=$?
+check "a step that changes owners builds, root or not" "$RC" "0"
+[ "$RC" -eq 0 ] || echo "$OUT" | tail -3
+check "and ran to its end" "$(rrun rest:own cat /finished)" "done"
+if [ "$(id -u)" = 0 ] && [ "$(awk '{print $1, $2, $3}' /proc/self/uid_map 2>/dev/null)" = "0 0 4294967295" ]; then
+    check "as root the owner really changed" "$(rrun rest:own stat -c %u /owned)" "1234"
+else
+    check "without privilege the file is the builder's" "$(rrun rest:own stat -c %u /owned)" "0"
+fi
+case "$(rrun rest:own sh -c 'chown 1234 /tmp 2>&1; echo rc=$?')" in
+*"rc=0"*) [ "$(id -u)" = 0 ] && [ "$(awk '{print $1, $2, $3}' /proc/self/uid_map 2>/dev/null)" = "0 0 4294967295" ] \
+    && ok "outside a build, changing owner is the real call" \
+    || bad "outside a build, a chown that cannot work must say so, not pretend" ;;
+*) ok "outside a build, a chown that cannot work says so" ;;
+esac
+
+# apt checks that it really became its own user, so for a builder with
+# one id it is lent its "run as root" setting for the step. Lent: the
+# image does not keep it.
+OUT=$(rfile rest:apt <<'RSEND'
+RUN mkdir -p /etc/apt/apt.conf.d
+RUN cat /etc/apt/apt.conf.d/* 2>/dev/null > /apt-saw; true
+RSEND
+)
+if [ "$(id -u)" = 0 ] && [ "$(awk '{print $1, $2, $3}' /proc/self/uid_map 2>/dev/null)" = "0 0 4294967295" ]; then
+    check "root is not told to run apt as root" "$(rrun rest:apt cat /apt-saw)" ""
+else
+    contains "a builder with one id has apt told to stay root" "$(rrun rest:apt cat /apt-saw)" 'Sandbox::User "root"'
+fi
+check "and the image is left without the setting" "$(rrun rest:apt sh -c 'ls /etc/apt/apt.conf.d | wc -l' | tr -d ' ')" "0"
+
 # A secret is a file one step can read and no layer holds.
 echo "s3cr3t-from-a-file" > "$SCRATCH/tok.txt"
 { printf 'FROM %s\n' "$IMG"; cat <<'RSEND'

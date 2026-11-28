@@ -200,6 +200,11 @@ pub struct Config {
     /// host`.
     #[serde(default)]
     pub host_ipc: bool,
+    /// Tell the container that changing identity or ownership worked,
+    /// without doing it. For a build step run by a user who has one id
+    /// and so cannot do either: see `security()`.
+    #[serde(default)]
+    pub fake_ids: bool,
     /// Another container whose network this one shares instead of
     /// having its own: `--network container:<id>`. Same interfaces,
     /// same ports, same `localhost`.
@@ -399,6 +404,42 @@ impl Config {
                 ),
             }
         };
+        // A package manager run as root changes owners and drops to a
+        // user of its own as a matter of course: dpkg gives files to
+        // `man` and `messagebus`, apt fetches as `_apt`. A user with a
+        // single id mapped can do neither, and every `apt-get install`
+        // in a build fails on the first of them. So those calls are
+        // answered "done" and nothing is done - which is what fakeroot
+        // does for the same tools, and the files end up owned by the one
+        // user there is, exactly as the layers pulled for this build
+        // already are. Only when asked, and it is only asked for a build.
+        let profile = profile.map(|mut p| {
+            if self.fake_ids && p.default_action == security::Action::Allow {
+                p.syscalls.push(security::SyscallRule {
+                    names: [
+                        "setgroups",
+                        "setuid",
+                        "setgid",
+                        "setreuid",
+                        "setregid",
+                        "setresuid",
+                        "setresgid",
+                        "setfsuid",
+                        "setfsgid",
+                        "chown",
+                        "fchown",
+                        "fchownat",
+                        "lchown",
+                    ]
+                    .map(String::from)
+                    .to_vec(),
+                    action: security::Action::Errno,
+                    errno: Some(0),
+                    args: None,
+                });
+            }
+            p
+        });
         let filter = match profile {
             None => Vec::new(),
             Some(p) => security::compile(&p)?,
@@ -1774,6 +1815,7 @@ mod tests {
             private_net: false,
             host_pid: false,
             host_ipc: false,
+            fake_ids: false,
             join_net: None,
             join_ipc: None,
             stop_signal: None,
