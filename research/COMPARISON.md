@@ -717,7 +717,7 @@ What is not, in two kinds. Keys that do not change whether the
 application works are dropped and **said to be** on stderr:
 `container_name`, `hostname`, `labels`, `logging`, `networks`,
 `stop_grace_period`, `init`, `oom_score_adj`, `cpu_shares` and a few
-more. Anything else - `uts`, `ipc: service:x`, `network_mode: service:x`
+more. Anything else - `uts`, `userns` remapping, swarm-only `deploy` keys
 - is refused by name before anything starts. Several `-f` Compose files are merged by Compose's rules - a list in a
 later file adds to the earlier one, and an entry naming the same
 variable or container path replaces it - where two stack files replace

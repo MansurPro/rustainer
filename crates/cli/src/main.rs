@@ -301,7 +301,8 @@ struct RunArgs {
 
     /// `host` shares the host's shared memory, semaphores and message
     /// queues, `/dev/shm` included. `private`, the default, is its own.
-    #[arg(long, value_parser = ["host", "private", "shareable"])]
+    /// `container:<id>` shares another container's.
+    #[arg(long)]
     ipc: Option<String>,
 
     /// How big `/dev/shm` is: `256m`, `1g`. 64m unless said. What
@@ -1419,6 +1420,8 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             );
             (false, false)
         }
+        // Another container's network, shared: no stack of its own.
+        other if other.starts_with("container:") => (false, false),
         other => {
             if networks_dir().join(format!("{other}.json")).exists() {
                 (true, true)
@@ -1432,8 +1435,15 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             }
         }
     };
+    let join_net = args.network.strip_prefix("container:").map(str::to_owned);
+    let join_ipc = args
+        .ipc
+        .as_deref()
+        .and_then(|i| i.strip_prefix("container:"))
+        .map(str::to_owned);
     let network_def = match args.network.as_str() {
         "bridge" | "none" | "host" => None,
+        other if other.starts_with("container:") => None,
         other => Some(load_network(other)?),
     };
 
@@ -1712,8 +1722,9 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
     // `service:db` would otherwise quietly mean "private".
     if let Some(ipc) = &args.ipc
         && !["host", "private", "shareable"].contains(&ipc.as_str())
+        && join_ipc.is_none()
     {
-        bail!("ipc {ipc:?} is not supported; it is `host` or `private`");
+        bail!("ipc {ipc:?} is not supported; it is `host`, `private` or `container:<id>`");
     }
     let rlimits = args
         .ulimits
@@ -1795,6 +1806,8 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         private_net,
         host_pid: args.pid.is_some(),
         host_ipc: args.ipc.as_deref() == Some("host"),
+        join_net,
+        join_ipc,
         stop_signal: args
             .stop_signal
             .as_ref()
@@ -2944,6 +2957,16 @@ fn default_stack_file() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(NAMES[0]))
 }
 
+/// `service:<name>` in a stack's `network` or `ipc` is the container of
+/// that service; everything else is passed on as written.
+fn shared_with(st: &stack::Stack, value: Option<&String>) -> Option<String> {
+    let v = value?;
+    Some(match v.strip_prefix("service:") {
+        Some(service) => format!("container:{}", st.container_name(service)),
+        None => v.clone(),
+    })
+}
+
 fn read_stack(files: &[PathBuf], profiles: &[String]) -> Result<stack::Stack> {
     let fallback = PathBuf::from("rustainer.toml");
     let first = files.first().unwrap_or(&fallback);
@@ -3371,7 +3394,7 @@ fn stack_run(paths: &Paths, st: &stack::Stack, args: &StackRunArgs) -> Result<Ex
     let run = RunArgs {
         name: Some(id.clone()),
         detach: false,
-        network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
+        network: shared_with(st, svc.network.as_ref()).unwrap_or_else(|| "bridge".into()),
         hostname: args.service.clone(),
         workdir: svc.workdir.clone(),
         platform: svc.platform.clone(),
@@ -3380,7 +3403,7 @@ fn stack_run(paths: &Paths, st: &stack::Stack, args: &StackRunArgs) -> Result<Ex
         pid: svc.pid.clone(),
         tmpfs: svc.tmpfs.clone(),
         stop_signal: svc.stop_signal.clone(),
-        ipc: svc.ipc.clone(),
+        ipc: shared_with(st, svc.ipc.as_ref()),
         shm_size: svc.shm_size.clone(),
         ulimits: svc.ulimits.clone(),
         sysctls: svc.sysctls.clone(),
@@ -3465,7 +3488,13 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 tag: tag.clone(),
                 file: svc.dockerfile.as_ref().map(|d| context.join(d)),
                 build_args: svc.build_args.clone(),
-                network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
+                // A build's steps are not the service: one that will
+                // share another's network builds on the bridge.
+                network: svc
+                    .network
+                    .clone()
+                    .filter(|n| !n.starts_with("service:"))
+                    .unwrap_or_else(|| "bridge".into()),
                 no_cache: false,
                 target: svc.target.clone(),
                 secrets: Vec::new(),
@@ -3614,7 +3643,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 pull: false,
                 detach: true,
                 name: Some(id.clone()),
-                network: svc.network.clone().unwrap_or_else(|| "bridge".into()),
+                network: shared_with(st, svc.network.as_ref()).unwrap_or_else(|| "bridge".into()),
                 hostname: name.clone(),
                 workdir: svc.workdir.clone(),
                 platform: svc.platform.clone(),
@@ -3623,7 +3652,7 @@ fn stack_up(paths: &Paths, st: &stack::Stack, files: &[PathBuf]) -> Result<ExitC
                 pid: svc.pid.clone(),
                 tmpfs: svc.tmpfs.clone(),
                 stop_signal: svc.stop_signal.clone(),
-                ipc: svc.ipc.clone(),
+                ipc: shared_with(st, svc.ipc.as_ref()),
                 shm_size: svc.shm_size.clone(),
                 ulimits: svc.ulimits.clone(),
                 sysctls: svc.sysctls.clone(),

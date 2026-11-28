@@ -906,7 +906,16 @@ impl Stack {
                 .services
                 .iter()
                 .filter(|(n, s)| {
-                    !placed.contains(*n) && s.depends_on.names().iter().all(|d| placed.contains(*d))
+                    // A service that shares another's network or IPC
+                    // needs that one running first, said or not.
+                    let shares = [&s.network, &s.ipc]
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.strip_prefix("service:"))
+                        .all(|d| placed.contains(d) || !self.services.contains_key(d));
+                    !placed.contains(*n)
+                        && shares
+                        && s.depends_on.names().iter().all(|d| placed.contains(*d))
                 })
                 .map(|(n, _)| n.clone())
                 .collect();
@@ -943,7 +952,16 @@ impl Stack {
                 .services
                 .iter()
                 .filter(|(n, s)| {
-                    !placed.contains(*n) && s.depends_on.names().iter().all(|d| placed.contains(*d))
+                    // A service that shares another's network or IPC
+                    // needs that one running first, said or not.
+                    let shares = [&s.network, &s.ipc]
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.strip_prefix("service:"))
+                        .all(|d| placed.contains(d) || !self.services.contains_key(d));
+                    !placed.contains(*n)
+                        && shares
+                        && s.depends_on.names().iter().all(|d| placed.contains(*d))
                 })
                 .map(|(n, _)| n.clone())
                 .collect();
