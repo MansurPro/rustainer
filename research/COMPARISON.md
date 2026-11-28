@@ -229,6 +229,29 @@ when the image is tagged, so a build that fails at step nine starts the
 next attempt at step nine. Stage 21 checks this with steps that write a
 random value: a reused step is one whose value did not change.
 
+**A build shaped like a real one.** The rows above are five trivial
+steps. A four-stage Node application - `apk add nodejs npm`, `npm
+install` under a cache mount, a build step, then a runtime stage that
+takes `node_modules` and `dist` with `COPY --from --chown` and runs as a
+non-root user with a `HEALTHCHECK` - builds in 9-12 s from nothing (the
+network is most of it), **0.73 s** when nothing changed and **1.5 s**
+after a source edit, where three of the cached steps are reused. The
+last two were 2.6 s and 3.4 s until this was measured: every build
+compressed every layer of the final image again to describe it for a
+registry. What a layer compresses to is now written down once, beside
+the blob. **Docker was not timed on this build**: the machine's Docker
+disk was 97% full and a build would have added cache that could not be
+removed without touching the owner's, so this is a figure for
+rustainer and not a ratio.
+
+Thirteen Dockerfiles from a production monorepo were then read with
+`build --check` and three built. All thirteen parse. The exercise found
+three defects, all fixed: an image that lists the same layer more than
+once could not be mounted at all (`overlayfs: conflicting lowerdir
+path`; one base image repeats an empty layer seven times), `ENV A=1
+B=2` set one variable to `1 B=2`, and `RUN --mount=type=secret` was
+refused.
+
 Two limits. A hit re-hashes the layer it is about to reuse, so that a
 damaged layer is never built upon - which makes a hit cost time
 proportional to the layer's size, where Docker's costs nothing. And the
@@ -300,10 +323,12 @@ A benchmark that omits this is an advertisement. None of the following is
 implemented here, and several are deliberate permanent omissions rather than
 work not yet done — `research/pass-2/RND.md` §19 says which are which.
 
-- **BuildKit** — `build` exists (stage 21), but it is a sequential interpreter
-  for a Dockerfile, not a DAG solver: no parallel stages, no cache mounts, no
-  `--mount=type=secret`, no remote cache import/export. Layer reuse across
-  builds is not implemented either; every build runs every step.
+- **BuildKit** — `build` reads the whole Dockerfile language except `ONBUILD`,
+  `ADD <url>` and `--mount=type=bind|ssh`: stages, `COPY --from`, `--target`,
+  `.dockerignore`, cache and secret mounts, and a layer cache are all there.
+  What it still is not is a DAG solver: stages build in file order, one at a
+  time, including ones the target never uses, and there is no remote cache
+  import or export.
 - **A real in-namespace resolver.** User-defined networks exist (stage 23) and
   containers on one find each other by name, but the mechanism is `/etc/hosts`,
   rewritten as containers come and go. Docker runs a resolver at 127.0.0.11

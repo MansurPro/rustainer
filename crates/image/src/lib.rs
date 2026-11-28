@@ -474,28 +474,59 @@ impl Store {
             }
             // Gzipped, because that is what a registry accepts and the
             // digest in the manifest is of the compressed bytes.
-            let gz = {
-                use std::io::Write;
-                let mut e =
-                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-                e.write_all(tar_bytes)
-                    .map_err(io("compressing a layer", &dest))?;
-                e.finish().map_err(io("compressing a layer", &dest))?
-            };
-            // `sha256_hex` already returns a prefixed digest, and the
-            // blob store is keyed by the hex alone.
-            let d = registry::sha256_hex(&gz);
-            let blob = self
+            //
+            // Once per layer, not once per build: compressing is the
+            // slowest thing a rebuild that changed nothing would do, so
+            // what it came to is written down beside the blobs, keyed by
+            // the layer's own identity. The note is only believed while
+            // the blob it names is still there at the size it says.
+            let note = self
                 .root
-                .join("blobs/sha256")
-                .join(d.trim_start_matches("sha256:"));
-            if !blob.exists() {
-                std::fs::write(&blob, &gz).map_err(io("writing a layer blob", &blob))?;
-            }
+                .join("blobs/by-layer")
+                .join(diff_id.trim_start_matches("sha256:"));
+            let known = std::fs::read_to_string(&note).ok().and_then(|n| {
+                let (d, size) = n.trim().split_once(' ')?;
+                let size: u64 = size.parse().ok()?;
+                let blob = self
+                    .root
+                    .join("blobs/sha256")
+                    .join(d.trim_start_matches("sha256:"));
+                (std::fs::metadata(blob).ok()?.len() == size).then(|| (d.to_owned(), size))
+            });
+            let (d, size) = match known {
+                Some(k) => k,
+                None => {
+                    let gz = {
+                        use std::io::Write;
+                        let mut e = flate2::write::GzEncoder::new(
+                            Vec::new(),
+                            flate2::Compression::default(),
+                        );
+                        e.write_all(tar_bytes)
+                            .map_err(io("compressing a layer", &dest))?;
+                        e.finish().map_err(io("compressing a layer", &dest))?
+                    };
+                    // `sha256_hex` already returns a prefixed digest, and
+                    // the blob store is keyed by the hex alone.
+                    let d = registry::sha256_hex(&gz);
+                    let blob = self
+                        .root
+                        .join("blobs/sha256")
+                        .join(d.trim_start_matches("sha256:"));
+                    if !blob.exists() {
+                        std::fs::write(&blob, &gz).map_err(io("writing a layer blob", &blob))?;
+                    }
+                    if let Some(parent) = note.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&note, format!("{d} {}", gz.len()));
+                    (d, gz.len() as u64)
+                }
+            };
             layer_descriptors.push(registry::Descriptor {
                 media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
                 digest: d,
-                size: gz.len() as u64,
+                size,
                 platform: None,
             });
         }
