@@ -1783,7 +1783,18 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
     if gpus_by_spec {
         cdi_names.push("nvidia.com/gpu=all".into());
     }
-    let cdi = cdi::resolve(&cdi_names)?;
+    let mut cdi = cdi::resolve(&cdi_names)?;
+    // No spec for the GPU, but the driver's own tool is here and will
+    // say what a container needs: the same thing, asked directly.
+    let mut gpus_by_spec = gpus_by_spec;
+    if args.gpus.is_some()
+        && !gpus_by_spec
+        && let Some(from_driver) = cdi::nvidia_from_host()
+    {
+        cdi.mounts.extend(from_driver.mounts);
+        cdi.links.extend(from_driver.links);
+        gpus_by_spec = true;
+    }
     for note in &cdi.notes {
         eprintln!("rustainer: {note}");
     }
@@ -5897,7 +5908,9 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                         )
                         .chain(secrets.iter().filter_map(|(id, target)| {
                             let src = given_secrets.get(id)?;
-                            Some(Ok(format!("{}:{target}:ro", src.display())))
+                            target
+                                .starts_with('/')
+                                .then(|| Ok(format!("{}:{target}:ro", src.display())))
                         }))
                         .collect::<Result<_>>()?,
                     no_healthcheck: true,
@@ -5909,6 +5922,13 @@ fn build_image(paths: &Paths, args: BuildArgs) -> Result<(String, usize, usize)>
                         .iter()
                         .cloned()
                         .chain(agent.iter().map(|_| format!("SSH_AUTH_SOCK={AGENT_AT}")))
+                        // A secret asked for as a variable: in this
+                        // step's environment, and nowhere in the image.
+                        .chain(secrets.iter().filter_map(|(id, target)| {
+                            let var = target.strip_prefix("env:")?;
+                            let value = std::fs::read_to_string(given_secrets.get(id)?).ok()?;
+                            Some(format!("{var}={value}"))
+                        }))
                         .collect(),
                     command: expanded.iter().map(OsString::from).collect(),
                     ..Default::default()

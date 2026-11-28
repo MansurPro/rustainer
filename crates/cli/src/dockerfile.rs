@@ -36,7 +36,9 @@ pub enum Instruction {
         /// `--network=<name>`, for this step only.
         network: Option<String>,
         /// `--mount=type=secret`: `(id, target)`, a file the step can
-        /// read and the image never holds.
+        /// read and the image never holds. A target of `env:NAME` is
+        /// the other way a file asks for one: as that variable, in the
+        /// step's environment only.
         secrets: Vec<(String, String)>,
         /// `--mount=type=bind`: `(from, source, target)`, there for the
         /// step to read and not copied into the image. From the
@@ -295,8 +297,16 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                                     .ok_or_else(|| {
                                         anyhow::anyhow!("{}: a secret mount needs an id", at())
                                     })?;
-                                let target = target.unwrap_or_else(|| format!("/run/secrets/{id}"));
-                                secrets.push((id, target));
+                                // `env=NAME` instead of, or as well as, a file.
+                                let as_env = opt(&["env"]);
+                                if let Some(var) = &as_env {
+                                    secrets.push((id.clone(), format!("env:{var}")));
+                                }
+                                if target.is_some() || as_env.is_none() {
+                                    let target =
+                                        target.unwrap_or_else(|| format!("/run/secrets/{id}"));
+                                    secrets.push((id, target));
+                                }
                             }
                             // A bind with no type is what `--mount=target=`
                             // means. From the context only: one from a
@@ -651,7 +661,8 @@ mod tests {
         let d = parse(
             "FROM a\nENV A=1 \\\n    B=\"two words\" \\\n    PATH=/x:$PATH\n\
              LABEL org.x=y  z=w\n\
-             RUN --mount=type=secret,id=npm,target=/root/.npmrc --mount=type=secret,id=tok npm ci\n",
+             RUN --mount=type=secret,id=npm,target=/root/.npmrc --mount=type=secret,id=tok npm ci\n\
+             RUN --mount=type=secret,id=sentry,env=SENTRY_AUTH_TOKEN npm run build\n",
         )
         .unwrap();
         assert_eq!(d[1], Instruction::Env("A".into(), "1".into()));
@@ -661,6 +672,8 @@ mod tests {
         assert!(matches!(&d[6], Instruction::Run { secrets, .. }
             if secrets == &[("npm".to_owned(), "/root/.npmrc".to_owned()),
                             ("tok".to_owned(), "/run/secrets/tok".to_owned())]));
+        assert!(matches!(&d[7], Instruction::Run { secrets, .. }
+            if secrets == &[("sentry".to_owned(), "env:SENTRY_AUTH_TOKEN".to_owned())]));
     }
 
     #[test]
