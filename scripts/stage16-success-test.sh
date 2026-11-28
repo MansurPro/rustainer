@@ -267,6 +267,15 @@ else
     bad "and without it the container has its own"
 fi
 
+# A container on the host's network resolves names the way the host
+# does. It used to have no resolv.conf at all.
+check "--network host has the host's resolv.conf" \
+    "$(timeout 60 "$B" run --network host --layer "$BASE" /bin/sh -c 'grep -c "" /etc/resolv.conf' 2>/dev/null | tail -1)" \
+    "$(grep -c "" /etc/resolv.conf)"
+check "and the host's names" \
+    "$(timeout 60 "$B" run --network host --layer "$BASE" /bin/sh -c 'grep -c "" /etc/hosts' 2>/dev/null | tail -1)" \
+    "$(grep -c "" /etc/hosts)"
+
 echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
