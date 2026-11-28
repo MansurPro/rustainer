@@ -1176,12 +1176,23 @@ one engine wider than any gap between them, with the server answering
 `/health` 0.40-0.62 s after `run` here against 0.61-0.71 s under Docker.
 A model is a CPU-bound process and a container engine is not in its way.
 
-A GPU inside a container was not measured anywhere. `run --device /dev/dri/renderD128`
-hands a container the host's node (a bind of it; there is no `--gpus`
-and no per-device permission filter), but the one Linux machine available
-with a graphics card has a 2014 FirePro W5100 bound to the `radeon`
-kernel driver, which has no Vulkan; moving it to `amdgpu` needs root
-and a reboot of a shared machine.
+**A GPU inside a container works, and was checked on real hardware.**
+`run --gpus all` binds the machine's GPU device nodes (`/dev/dri`, and
+NVIDIA's and AMD's compute nodes where they exist). On the one Linux
+machine available with a graphics card - a 2014 FirePro W5100 - an
+unprivileged container built from `alpine` with Mesa reports its
+OpenGL renderer as `llvmpipe` (software) without the flag and as
+`BONAIRE (radeonsi, ... DRM 2.50)` with it: the card. No root, no
+daemon, nothing installed on the host.
+
+What that does not show is a model running on a GPU. llama.cpp's GPU
+backends want Vulkan or CUDA; this card is bound to the `radeon`
+kernel driver, which has no Vulkan, and moving it to `amdgpu` needs
+root and a reboot of a shared machine. `--gpus` also hands over the
+device nodes only: an NVIDIA container still needs the userspace
+driver matching the host's kernel module inside its image, which
+Docker's NVIDIA runtime injects and this does not. So the Model Runner
+comparison above stands as measured, CPU against GPU.
 
 It loads GGUF only; the `-mlx` and `-safetensors`
 tags in the same catalogue are refused with a sentence saying why.
