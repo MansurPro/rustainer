@@ -233,7 +233,36 @@ fn service(svc: &J, dir: &Path, notes: &mut Vec<String>) -> Result<Table> {
             Ok(())
         };
         match k {
-            "image" | "restart" | "user" | "platform" | "pid" => put_str(&mut t, k)?,
+            "image" | "restart" | "user" | "platform" | "pid" | "ipc" | "shm_size" => {
+                put_str(&mut t, k)?
+            }
+            "sysctls" => {
+                t.insert(k.into(), pairs(v).context("sysctls")?);
+            }
+            // `nofile: 1024`, or `nofile: {soft: 1024, hard: 2048}`.
+            "ulimits" => {
+                let J::Object(o) = v else {
+                    bail!("ulimits is a mapping of a limit to a number, or to soft and hard");
+                };
+                let list = o
+                    .iter()
+                    .map(|(name, lim)| {
+                        let value = match lim {
+                            J::Object(l) => {
+                                let part = |k: &str| {
+                                    l.get(k).map(scalar).transpose()?.with_context(|| {
+                                        format!("ulimits.{name} needs both soft and hard")
+                                    })
+                                };
+                                format!("{}:{}", part("soft")?, part("hard")?)
+                            }
+                            other => scalar(other)?,
+                        };
+                        Ok(T::String(format!("{name}={value}")))
+                    })
+                    .collect::<Result<_>>()?;
+                t.insert(k.into(), T::Array(list));
+            }
             "working_dir" => put_str(&mut t, "workdir")?,
             "mem_limit" => put_str(&mut t, "memory")?,
             "network_mode" => put_str(&mut t, "network")?,
@@ -760,6 +789,14 @@ services:
       - target: 443
         published: 8443
     tmpfs: /run
+    shm_size: 256m
+    ulimits:
+      nproc: 512
+      nofile:
+        soft: 1024
+        hard: 2048
+    sysctls:
+      net.core.somaxconn: 1024
     extra_hosts:
       - "host.docker.internal=10.0.0.1"
     depends_on:
@@ -800,6 +837,15 @@ volumes:
         assert_eq!(s["web"]["depends_on"]["db"].as_str(), Some("healthy"));
         assert_eq!(s["web"]["replicas"].as_integer(), Some(2));
         assert_eq!(s["web"]["tmpfs"][0].as_str(), Some("/run"));
+        assert_eq!(s["web"]["shm_size"].as_str(), Some("256m"));
+        assert_eq!(
+            s["web"]["ulimits"].as_array().unwrap(),
+            &[T::from("nofile=1024:2048"), T::from("nproc=512")]
+        );
+        assert_eq!(
+            s["web"]["sysctls"][0].as_str(),
+            Some("net.core.somaxconn=1024")
+        );
         assert_eq!(
             s["web"]["extra_hosts"][0].as_str(),
             Some("host.docker.internal:10.0.0.1")
@@ -810,12 +856,12 @@ volumes:
     #[test]
     fn a_key_that_cannot_be_honoured_is_named() {
         let e = to_stack(
-            "services:\n  a:\n    image: x\n    ipc: host\n",
+            "services:\n  a:\n    image: x\n    userns_mode: host\n",
             Path::new("/x"),
             &BTreeMap::new(),
         )
         .unwrap_err();
-        assert!(format!("{e:#}").contains("\"ipc\""), "{e:#}");
+        assert!(format!("{e:#}").contains("\"userns_mode\""), "{e:#}");
     }
 
     #[test]

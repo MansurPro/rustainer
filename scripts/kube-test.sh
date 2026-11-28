@@ -26,6 +26,13 @@ contains "the cluster starts and its node is Ready" "$(timeout 600 "$B" kube up 
 "$B" kube kubectl expose deployment web --port=80 >/dev/null 2>&1
 contains "a two-replica deployment rolls out" \
     "$("$B" kube kubectl rollout status deployment/web --timeout=240s 2>&1 | tail -1)" "successfully rolled out"
+# A rollout that timed out says only that it timed out. Why - an image
+# that would not pull, a sandbox that would not start - is in the pods'
+# events, and the cluster is gone by the time anyone can ask it.
+if [ "$FAIL" -gt 0 ]; then
+    "$B" kube kubectl get pods -A -o wide 2>&1 | head -20
+    "$B" kube kubectl get events -A --sort-by=.lastTimestamp 2>&1 | tail -25
+fi
 check "both pods are Running" "$("$B" kube kubectl get pods -l app=web --no-headers 2>/dev/null | grep -c Running)" "2"
 IP=$("$B" kube kubectl get svc web -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
 contains "the service answers on its cluster address" \

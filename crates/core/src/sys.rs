@@ -434,6 +434,29 @@ pub fn mkfifo(path: &CStr, mode: u32) -> Result<(), Errno> {
     mkfifoat(CWD, path, Mode::from_bits_truncate(mode))
 }
 
+/// Write `data` to an existing file: how a sysctl is set.
+pub fn write_file(path: &CStr, data: &[u8]) -> Result<(), Errno> {
+    let fd = open_write_blocking(path)?;
+    rustix::io::write(&fd, data).map(|_| ())
+}
+
+/// `setrlimit(2)` on the calling process. A raw resource number, because
+/// the caller parsed it from a name and the kernel is the one to say
+/// whether it exists.
+pub fn setrlimit(resource: u32, soft: u64, hard: u64) -> Result<(), Errno> {
+    let lim = libc::rlimit {
+        rlim_cur: soft as libc::rlim_t,
+        rlim_max: hard as libc::rlim_t,
+    };
+    // SAFETY: `lim` is a valid rlimit for the duration of the call.
+    match unsafe { libc::setrlimit(resource as _, &lim) } {
+        0 => Ok(()),
+        _ => Err(Errno::from_raw_os_error(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        )),
+    }
+}
+
 /// `open(path, O_WRONLY)` — blocks on a FIFO until a reader is present.
 pub fn open_write_blocking(path: &CStr) -> Result<OwnedFd, Errno> {
     use rustix::fs::{Mode, OFlags, open};

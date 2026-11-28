@@ -227,5 +227,41 @@ case "$(R --device "$SCRATCH/single.txt" /bin/true 2>&1)" in
 esac
 
 echo
+echo "10. /dev/shm, resource limits, and the kernel settings a container owns"
+check "--shm-size is how big /dev/shm is" \
+    "$(R --shm-size 128m /bin/sh -c 'grep -c " /dev/shm tmpfs .*size=131072k" /proc/mounts')" "1"
+check "and it is still everyone's to write to" \
+    "$(R --shm-size 8m /bin/sh -c 'stat -c %a /dev/shm')" "1777"
+check "--ulimit sets the soft and the hard limit" \
+    "$(R --ulimit nofile=1234:2345 /bin/sh -c 'echo $(ulimit -Sn) $(ulimit -Hn)')" "1234 2345"
+check "one number is both" \
+    "$(R --ulimit nofile=999 /bin/sh -c 'echo $(ulimit -Sn) $(ulimit -Hn)')" "999 999"
+case "$(R --ulimit files=1 /bin/true 2>&1)" in
+*"is not a limit"*) ok "a limit that does not exist is refused by name" ;;
+*) bad "a limit that does not exist is refused by name" ;;
+esac
+check "--sysctl sets a network setting in the container's own network" \
+    "$(R --sysctl net.core.somaxconn=1234 /bin/cat /proc/sys/net/core/somaxconn)" "1234"
+check "and an IPC one in its own IPC namespace" \
+    "$(R --sysctl kernel.msgmax=16384 /bin/cat /proc/sys/kernel/msgmax)" "16384"
+HOST_SWAP=$(cat /proc/sys/vm/swappiness)
+case "$(timeout 60 "$B" run --network none --layer "$BASE" --sysctl vm.swappiness=1 /bin/true 2>&1)" in
+*"the host's"*) ok "a setting that is the host's is refused" ;;
+*) bad "a setting that is the host's is refused" ;;
+esac
+check "and the host's value is untouched" "$(cat /proc/sys/vm/swappiness)" "$HOST_SWAP"
+case "$(timeout 60 "$B" run --network none --layer "$BASE" --ipc host --sysctl kernel.msgmax=1 /bin/true 2>&1)" in
+*"the host's"*) ok "as is an IPC setting when the IPC namespace is the host's" ;;
+*) bad "as is an IPC setting when the IPC namespace is the host's" ;;
+esac
+check "--ipc host is the host's IPC namespace" \
+    "$(R --ipc host /bin/sh -c 'readlink /proc/self/ns/ipc')" "$(readlink /proc/self/ns/ipc)"
+if [ "$(R /bin/sh -c 'readlink /proc/self/ns/ipc')" != "$(readlink /proc/self/ns/ipc)" ]; then
+    ok "and without it the container has its own"
+else
+    bad "and without it the container has its own"
+fi
+
+echo
 echo "$PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

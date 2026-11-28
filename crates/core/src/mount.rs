@@ -134,6 +134,22 @@ pub enum Op {
         /// other, so a store must be partitioned by it.
         userxattr: bool,
     },
+    /// Write a value into a file under the new `/proc`: a sysctl, set
+    /// by the container's own first process because that is the only
+    /// one inside the namespaces the value belongs to.
+    WriteFile {
+        target: CString,
+        data: Vec<u8>,
+    },
+    /// `setrlimit` on the process that will become the container's
+    /// first, which every process in it then inherits. Not a mount, but
+    /// this list is "what the child does before it becomes the
+    /// container", and it has to be done there while it is still root.
+    Rlimit {
+        resource: u32,
+        soft: u64,
+        hard: u64,
+    },
     /// Bind a path onto itself and make it read-only.
     ///
     /// Two calls, not one: `MS_RDONLY` is **ignored** in the initial
@@ -243,6 +259,57 @@ pub struct MountPlan {
 impl MountPlan {
     pub fn labels(&self) -> Vec<&'static str> {
         self.ops.iter().map(|o| o.label).collect()
+    }
+
+    /// The same plan, with kernel settings and resource limits for the
+    /// container to give itself: `--sysctl` and `--ulimit`.
+    ///
+    /// Straight after `/proc` is mounted, which is the first moment a
+    /// sysctl can be written and well before `/proc/sys` is made
+    /// read-only. `sysctls` are `(path under /proc/sys, value)` and the
+    /// caller has already decided each one is the container's to set.
+    pub fn with_settings(
+        mut self,
+        sysctls: &[(String, String)],
+        rlimits: &[(u32, u64, u64)],
+    ) -> Result<Self, PlanError> {
+        let rootfs = PathBuf::from(std::ffi::OsStr::from_bytes(self.rootfs.as_bytes()));
+        let mut at = self
+            .ops
+            .iter()
+            .position(|o| o.label == "mounting /proc")
+            .map_or(self.ops.len(), |i| i + 1);
+        let mut add = |op, label| {
+            self.ops.insert(
+                at,
+                PlannedOp {
+                    op,
+                    optional: false,
+                    label,
+                },
+            );
+            at += 1;
+        };
+        for (path, value) in sysctls {
+            add(
+                Op::WriteFile {
+                    target: cstr(&join(&rootfs, &format!("proc/sys/{path}")))?,
+                    data: value.clone().into_bytes(),
+                },
+                "setting a sysctl",
+            );
+        }
+        for &(resource, soft, hard) in rlimits {
+            add(
+                Op::Rlimit {
+                    resource,
+                    soft,
+                    hard,
+                },
+                "setting a resource limit (--ulimit)",
+            );
+        }
+        Ok(self)
     }
 
     /// The same plan with its confinement taken out, for `--privileged`.
@@ -1089,6 +1156,12 @@ fn run_one(op: &Op, detail: &mut [u8; DETAIL_LEN], detail_len: &mut usize) -> Re
         Op::Symlink { contents, link } => sys::symlink(contents.as_c_str(), link.as_c_str()),
         Op::Mkdir { target, mode } => sys::mkdir(target.as_c_str(), *mode),
         Op::Touch { target } => sys::touch(target.as_c_str()),
+        Op::WriteFile { target, data } => sys::write_file(target.as_c_str(), data),
+        Op::Rlimit {
+            resource,
+            soft,
+            hard,
+        } => sys::setrlimit(*resource, *soft, *hard),
         Op::Mask { target } => match sys::mount_bind(c"/dev/null", target.as_c_str()) {
             // A directory cannot have /dev/null bound over it; cover it
             // with an empty read-only tmpfs instead. Masking rather than

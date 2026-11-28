@@ -734,6 +734,13 @@ services:
     volumes:
       - shopshared:/shared
     tmpfs: /scratch:size=1m
+    shm_size: 16m
+    ulimits:
+      nofile:
+        soft: 777
+        hard: 888
+    sysctls:
+      net.core.somaxconn: 321
     extra_hosts:
       - "partner=10.9.8.7"
     depends_on:
@@ -761,6 +768,8 @@ check "a service waits for a job it depends on to complete" \
     "$(timeout 60 "$B" exec shop-web /bin/cat /scratch/seen 2>&1 | tail -1)" "done"
 check "tmpfs is a tmpfs" \
     "$(timeout 60 "$B" exec shop-web /bin/sh -c 'grep -c " /scratch tmpfs " /proc/mounts' 2>&1 | tail -1)" "1"
+check "shm_size, ulimits and sysctls reach the container" \
+    "$(timeout 60 "$B" exec shop-web /bin/sh -c 'echo $(grep -c " /dev/shm tmpfs .*size=16384k" /proc/mounts) $(ulimit -Sn) $(ulimit -Hn) $(cat /proc/sys/net/core/somaxconn)' 2>&1 | tail -1)" "1 777 888 321"
 contains "extra_hosts reaches /etc/hosts" \
     "$(timeout 60 "$B" exec shop-web /bin/cat /etc/hosts 2>&1)" "partner"
 check "with no -f, a compose.yml in the directory is found" \
@@ -782,8 +791,8 @@ contains "a job that fails stops the stack there, and says why" \
     "$(timeout 120 "$B" stack up -f "$C/failing.yml" 2>&1)" "had to complete"
 check "what depended on it was not started" "$("$B" ps -a | grep -c failing-web || true)" "0"
 timeout 60 "$B" stack down -t 0 -f "$C/failing.yml" >/dev/null 2>&1
-printf 'services:\n  a:\n    image: x\n    ipc: host\n' > "$C/bad.yml"
-refuses "a key that cannot be honoured is refused by name" '"ipc"' "$B" stack ps -f "$C/bad.yml"
+printf 'services:\n  a:\n    image: x\n    userns_mode: host\n' > "$C/bad.yml"
+refuses "a key that cannot be honoured is refused by name" '"userns_mode"' "$B" stack ps -f "$C/bad.yml"
 timeout 300 "$B" stack down -t 0 -f "$C/compose.yml" >/dev/null 2>&1
 check "down removes it" "$("$B" ps -a | grep -c shop- || true)" "0"
 "$B" volume rm shopshared >/dev/null 2>&1
