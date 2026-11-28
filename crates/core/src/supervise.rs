@@ -501,6 +501,23 @@ impl Config {
         if self.bridge {
             binds.push((self.write_resolv_conf(state_dir)?, "etc/resolv.conf"));
             binds.push((self.write_hosts(state_dir)?, "etc/hosts"));
+        } else if !self.private_net {
+            // The host's network is the container's, so the host's
+            // resolvers are reachable exactly as written - a stub on
+            // 127.0.0.53 included - and so are its names. Copies, not
+            // the files themselves: an image usually has neither, and
+            // without them nothing in a `--network host` container can
+            // resolve a name.
+            for (host, name, target) in [
+                ("/etc/resolv.conf", "resolv.conf", "etc/resolv.conf"),
+                ("/etc/hosts", "hosts", "etc/hosts"),
+            ] {
+                if let Ok(text) = std::fs::read(host) {
+                    let copy = state_dir.join(name);
+                    std::fs::write(&copy, text)?;
+                    binds.push((copy, target));
+                }
+            }
         }
 
         // Built against the CHILD's privileges, not ours: when we are

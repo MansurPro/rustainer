@@ -150,6 +150,13 @@ check "the filesystem is read-only when asked" \
     "$(nohang "$B" run --network host --read-only --layer "$BASE" /bin/sh -c \
         'echo x > /nope 2>/dev/null && echo writable || echo readonly' 2>/dev/null | tail -1)" \
     "readonly"
+# A read-only root still gets what has to be put INTO it: a mount point
+# the image does not have. The root used to be read-only from the moment
+# it was mounted, and this failed.
+check "a volume at a path the image lacks works under --read-only" \
+    "$(nohang "$B" run --network host --read-only --tmpfs /not/in/the/image --layer "$BASE" /bin/sh -c \
+        'echo x > /not/in/the/image/f && echo x > /nope 2>/dev/null; cat /not/in/the/image/f; test -e /nope || echo root-still-readonly' 2>/dev/null | tr '\n' ' ')" \
+    "x root-still-readonly "
 check "and writable when not" \
     "$(L /bin/sh -c 'echo x > /yes 2>/dev/null && echo writable || echo readonly' 2>/dev/null | tail -1)" \
     "writable"
