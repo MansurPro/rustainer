@@ -1258,7 +1258,17 @@ fn main() -> ExitCode {
     // can write to `/proc/self/exe` overwrites the runtime binary itself -
     // CVE-2019-5736. Re-executing from a sealed memfd makes the path refer
     // to a copy nothing can modify.
-    if let Err(e) = pentacle::ensure_sealed() {
+    //
+    // It costs a copy of the whole binary and a second exec - about
+    // three milliseconds - so it is not done for a command that cannot
+    // be reached that way: one that only reads state, removes files or
+    // sends a signal, and never enters a container's namespaces. A
+    // process such a command starts seals itself when it starts, so
+    // nothing unsealed ever goes inside. The list is of commands known
+    // to be like that; anything not on it is sealed.
+    if !never_enters_a_container()
+        && let Err(e) = pentacle::ensure_sealed()
+    {
         eprintln!("rustainer: could not seal /proc/self/exe: {e}");
         return ExitCode::FAILURE;
     }
@@ -1273,6 +1283,40 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Whether the command line names a subcommand that only looks at or
+/// tidies the engine's own records. Read off the raw arguments, before
+/// the parser, because the answer decides how this process starts.
+fn never_enters_a_container() -> bool {
+    const SAFE: [&str; 15] = [
+        "ps",
+        "stop",
+        "rm",
+        "logs",
+        "images",
+        "rmi",
+        "events",
+        "pull",
+        "push",
+        "tags",
+        "repos",
+        "network",
+        "--version",
+        "-V",
+        "help",
+    ];
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--root" {
+            // The one global option that takes a value.
+            args.next();
+        } else if !a.starts_with("--root=") {
+            return SAFE.contains(&a.as_str());
+        }
+    }
+    // No subcommand at all: the parser will print the usage and exit.
+    true
 }
 
 fn real_main() -> Result<ExitCode> {

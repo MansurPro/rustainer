@@ -108,7 +108,7 @@ sub-id and device work (Docker 28.5.2, 20 iterations, two runs):
 |---|---:|---:|---:|
 | run a container to exit (median) | 13 ms | 78 ms | 6.0× |
 | run a container to exit (p90) | 14–15 ms | 80–82 ms | 5.3–5.9× |
-| start detached, stop, remove | 51–53 ms | 100–101 ms | 1.9–2.0× |
+| start detached, stop, remove | 40 ms | 101 ms | 2.5× |
 | exec a command in a live container | 9 ms | 27 ms | 3.0× |
 | resident per running container | 2 MiB | 18 MiB | 9× |
 | resident with nothing running | **0 MiB** | 119–121 MiB | — |
@@ -122,10 +122,15 @@ container. The cause was not any one feature. The binary had grown from
 starts - which a single `run` does more than once - so its size is paid
 for on every command. The workspace had never had a release profile;
 whole-program optimisation and no symbol table put the binary back at
-5.1 MiB and took 3 ms off each row. What is left of the gap to the
-first table (13 ms against 11-12, 9 against 7-8, 52 against 45) is what
-the added features cost, and start-stop-remove at 2.0× is now the
-closest row to Docker.
+5.1 MiB and took 3 ms off each row. Start-stop-remove was then still
+52 ms against the first table's 45, and the reason was the same copy:
+`stop` and `rm` each sealed themselves too, though neither goes near a
+container's namespaces. A command that only reads the engine's records,
+removes files or sends a signal no longer does - anything it starts
+seals itself - which takes a bare `ps` from 5.2 ms to 1.6 and that row
+to 40 ms. What is left of the gap to the first table is 13 ms against
+11-12 for a run and 9 against 7-8 for an exec, both of which do have
+to seal, and is what the added features cost.
 
 ### The same script on a second host
 
