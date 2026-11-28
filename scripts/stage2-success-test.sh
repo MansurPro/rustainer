@@ -133,8 +133,10 @@ echo "  host has $HOST_MOUNTS mounts, container has $CT_MOUNTS"
 # than the host, because masked paths are mounts and the rootless path binds
 # each device node separately. What must hold is that every mount point in
 # the container is one we put there - nothing of the host's tree survived.
+# The two files under /etc are ours as well: copies of the host's, which a
+# container on the host's network needs in order to resolve anything.
 STRAY=$(R /bin/sh -c 'awk "{print \$5}" /proc/self/mountinfo' 2>/dev/null \
-    | grep -vE '^/$|^/proc|^/dev|^/sys' | tr '\n' ' ')
+    | grep -vE '^/$|^/proc|^/dev|^/sys|^/etc/(resolv\.conf|hosts)$' | tr '\n' ' ')
 if [ -z "$STRAY" ]; then
     ok "every mount in the container is one we created"
 else

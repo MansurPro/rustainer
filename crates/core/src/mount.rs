@@ -83,6 +83,17 @@ pub enum Op {
     SetAttrRecursiveReadonly {
         target: CString,
     },
+    /// `--read-only`: the root, and only the root, made read-only as the
+    /// last thing done to it.
+    ///
+    /// Last, because everything before it writes there: the mount
+    /// points for `/proc` and for every volume, and the files that
+    /// `/etc/resolv.conf` and `/etc/hosts` are bound over. Mounting the
+    /// overlay read-only from the start made each of those fail on any
+    /// image that did not already have the path.
+    RootReadOnly {
+        target: CString,
+    },
     /// A volume's `:ro`. Its own op rather than the one above for two
     /// reasons that were both bugs: that one also sets noexec, and
     /// `--privileged` removes every one of them - which is right for
@@ -651,7 +662,9 @@ pub fn plan(
                     upper: o.upper.as_deref().map(cstr).transpose()?,
                     work: o.work.as_deref().map(cstr).transpose()?,
                     target: cstr(&rootfs)?,
-                    read_only: o.read_only,
+                    // Writable until the plan has finished with it; see
+                    // `Op::RootReadOnly`.
+                    read_only: false,
                     // Outside the initial user namespace the kernel cannot
                     // read `trusted.overlay.*`, so whiteouts recorded that
                     // way are invisible and deleted files reappear.
@@ -1093,6 +1106,16 @@ pub fn plan(
         );
     }
 
+    if overlay.is_some_and(|o| o.read_only) {
+        push(
+            Op::RootReadOnly {
+                target: cstr(&rootfs)?,
+            },
+            false,
+            "making the root filesystem read-only",
+        );
+    }
+
     Ok(MountPlan {
         ops,
         rootfs: cstr(&rootfs)?,
@@ -1166,6 +1189,7 @@ fn run_one(op: &Op, detail: &mut [u8; DETAIL_LEN], detail_len: &mut usize) -> Re
         Op::Symlink { contents, link } => sys::symlink(contents.as_c_str(), link.as_c_str()),
         Op::Mkdir { target, mode } => sys::mkdir(target.as_c_str(), *mode),
         Op::Touch { target } => sys::touch(target.as_c_str()),
+        Op::RootReadOnly { target } => sys::mount_setattr_rdonly_this_mount(target.as_c_str()),
         Op::WriteFile { target, data } => sys::write_file(target.as_c_str(), data),
         Op::Rlimit {
             resource,

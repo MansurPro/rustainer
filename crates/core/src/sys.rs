@@ -315,7 +315,17 @@ pub fn mount_setattr_recursive_rdonly_only(path: &CStr) -> Result<(), Errno> {
     mount_setattr_recursive(path, MOUNT_ATTR_RDONLY)
 }
 
+/// Read-only for this one mount and not the ones beneath it: a
+/// read-only root, whose volumes and `/dev` stay as they were made.
+pub fn mount_setattr_rdonly_this_mount(path: &CStr) -> Result<(), Errno> {
+    mount_setattr(path, MOUNT_ATTR_RDONLY, 0)
+}
+
 fn mount_setattr_recursive(path: &CStr, attr_set: u64) -> Result<(), Errno> {
+    mount_setattr(path, attr_set, AT_RECURSIVE)
+}
+
+fn mount_setattr(path: &CStr, attr_set: u64, flags: i32) -> Result<(), Errno> {
     let attr = MountAttr {
         attr_set,
         ..Default::default()
@@ -325,7 +335,7 @@ fn mount_setattr_recursive(path: &CStr, attr_set: u64) -> Result<(), Errno> {
             libc::SYS_mount_setattr,
             libc::AT_FDCWD,
             path.as_ptr(),
-            AT_RECURSIVE,
+            flags,
             &attr as *const MountAttr,
             core::mem::size_of::<MountAttr>(),
         )
