@@ -369,7 +369,12 @@ impl Server {
     // --- reads ----------------------------------------------------------
 
     fn system(&self) -> Value {
-        let uid = rustix::process::geteuid().as_raw();
+        // Who is running this, not who they appear as: a user who was
+        // let into their sub-id namespace reads as root from inside it.
+        let uid = std::env::var("RUSTAINER_REAL_UID")
+            .ok()
+            .and_then(|u| u.parse().ok())
+            .unwrap_or_else(|| rustix::process::geteuid().as_raw());
         json!({
             "version": env!("CARGO_PKG_VERSION"),
             "kernel": read_trimmed("/proc/sys/kernel/osrelease"),

@@ -23,6 +23,7 @@ mod build;
 mod compose;
 mod dockerfile;
 mod stack;
+mod subids;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -154,6 +155,14 @@ enum Command {
     },
     /// Remove an image from the local store.
     Rmi(RmiArgs),
+    /// Run a command as this user appears inside their containers: as
+    /// root over their own id and their sub-id range. What an
+    /// unprivileged user needs in order to look at, or delete, files a
+    /// container left owned by another of those ids.
+    Unshare {
+        #[arg(trailing_var_arg = true, required = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
     /// List or remove named volumes.
     #[command(subcommand)]
     Volume(VolumeCmd),
@@ -1253,6 +1262,9 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Before anything asks who the caller is.
+    subids::enter();
+
     match real_main() {
         Ok(code) => code,
         Err(e) => {
@@ -1373,6 +1385,15 @@ fn real_main() -> Result<ExitCode> {
                 println!("{t}");
             }
             Ok(ExitCode::SUCCESS)
+        }
+        Command::Unshare { command } => {
+            // Already inside, if there is an inside to be in: `main`
+            // joined the namespace before reading the command line.
+            use std::os::unix::process::CommandExt;
+            let e = std::process::Command::new(&command[0])
+                .args(&command[1..])
+                .exec();
+            Err(e).with_context(|| format!("running {}", command[0].to_string_lossy()))
         }
         Command::Volume(a) => cmd_volume(&paths, a),
         Command::Network(a) => cmd_network(&paths, a),
@@ -2794,9 +2815,17 @@ fn with_image_data(
 /// file's owner or become anyone else, which is most of what a package
 /// manager does.
 fn one_id_only() -> bool {
+    // The third number of each line of the map is how many ids it
+    // covers: one line of one id is a single user, and a range granted
+    // through /etc/subuid is not.
     !rustix::process::geteuid().is_root()
         || std::fs::read_to_string("/proc/self/uid_map")
-            .map(|m| m.split_whitespace().collect::<Vec<_>>() != ["0", "0", "4294967295"])
+            .map(|m| {
+                m.lines()
+                    .filter_map(|l| l.split_whitespace().nth(2)?.parse::<u64>().ok())
+                    .sum::<u64>()
+                    <= 1
+            })
             .unwrap_or(true)
 }
 
