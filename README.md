@@ -932,10 +932,12 @@ one starts checking it, and `ps` shows `running (healthy)`. `--health-cmd`,
 `--health-interval` and `--health-retries` set or retune it for any
 container; `--no-healthcheck` turns the image's off.
 
-What is deliberately absent: parallelism. Stages are built one at a
-time, in file order - but only the ones the image is actually built
-from. A `test` stage nothing copies from is skipped unless it is the
-`--target`.
+Only the stages the image is actually built from are built: a `test`
+stage nothing copies from is skipped unless it is the `--target`. A
+stage that starts from an image - the usual `runtime` stage installing
+its packages - is built at the same time as the stages before it, as far
+as its first `COPY --from`. Two stages that both continue another stage
+still take turns.
 
 ### Pushing
 

@@ -29,12 +29,12 @@ away.** Twelve speed ratios were measured against Docker, on two hosts:
 - The one that is not is network throughput, which is the same as
   Docker's and will stay the same: both hand packets to the same kernel
   bridge, and there is nothing in between to make faster.
-- **Docker wins one that is not in the table: a multi-stage build from
+- **One that is not in the table is a tie: a multi-stage build from
   nothing.** The two build rows above are five trivial steps. A real
-  four-stage Node build takes rustainer 9.0 s and Docker 5.5 s, because
-  BuildKit builds independent stages at the same time and this engine
-  builds them in turn. Rebuilding the same image after a source edit
-  goes the other way, 0.86 s to 1.37 s (section 3, Build).
+  four-stage Node build takes rustainer 5.4-5.5 s and Docker 5.5 s; it
+  was 9.0 s before this was measured, and what closed it is in section
+  3. Rebuilding the same image after a source edit is 0.85 s to
+  Docker's 1.37 s.
 - Memory is a separate axis and a larger one: 7× to 18× less per running
   container, and nothing resident when nothing runs (Docker: 120-170 MiB).
 - Compatibility: **29 of 29** Docker Hub images behave identically to
@@ -246,26 +246,36 @@ privileged container in that VM). Three runs of each rebuild:
 
 | | rustainer | Docker | |
 |---|---|---|---|
-| build from nothing | 8.9-9.0 s | 5.5 s | **Docker 1.6×** |
+| build from nothing, base image present | 5.40-5.53 s | 5.49 s (one run) | the same |
 | rebuild, nothing changed | 0.01 s | 0.20-0.22 s | rustainer ~20× |
-| rebuild after a source edit | 0.85-0.88 s | 1.29-1.45 s | rustainer 1.6× |
+| rebuild after a source edit | 0.83-0.88 s | 1.29-1.45 s | rustainer 1.6× |
 
-Read the three rows separately. **From nothing, Docker is faster**, and
-for a reason that will not go away by tuning: BuildKit builds the
-`runtime` stage's `apk add` while the `base` stage's is still running,
-and this engine builds the stages it needs one after another. Docker
-also had the base image on disk and rustainer pulled it (about a
-second). The unchanged-rebuild ratio flatters rustainer: Docker's
-0.2 s includes its CLI on macOS talking to the VM, and nobody waits on
-either figure. The row that matters day to day is the third, and it was
-not always a win - the first measurement of this build had rustainer at
-2.6 s unchanged and 3.4 s after an edit, behind Docker on both. Three
-things were wrong: every build compressed every layer of the final image
-again to describe it for a registry; every cache hit read its whole
-layer back to check it still hashed to its name; and every `COPY --from`
-was done again. What a layer compresses to is now noted once beside the
-blob, a hit trusts the store as a `run` of a pulled image already does,
-and a `COPY --from` is keyed on the chain of the stage it reads.
+Read the three rows separately. **From nothing they are level**, and
+only since this was measured: the first figure was 9.0 s. A second of
+that was pulling a base image Docker already had, which is not the
+build. The rest was two things. BuildKit builds the `runtime` stage's
+`apk add` while the `base` stage's is still running; this engine built
+its stages in turn (7.9 s). It now starts a stage that begins from an
+image alongside the ones before it, as far as that stage's first `COPY
+--from` - a second process of the same program whose steps land in the
+cache, where the main build finds them (6.8 s). And every build
+compressed the final image's layers at gzip's default level, which
+Docker leaves until a push; the fastest level costs about a tenth more
+to upload, once (5.4 s). Docker's cold figure is a single run - each
+one leaves build cache on a disk that had 2 GB free - so "the same"
+means within the spread of rustainer's three, not a measured tie.
+
+The unchanged-rebuild ratio flatters rustainer: Docker's 0.2 s includes
+its CLI on macOS talking to the VM, and nobody waits on either figure.
+The row that matters day to day is the third, and it was not always a
+win - the first measurement had rustainer at 2.6 s unchanged and 3.4 s
+after an edit, behind Docker on both. Three things were wrong: every
+build compressed every layer of the final image again; every cache hit
+read its whole layer back to check it still hashed to its name; and
+every `COPY --from` was done again. What a layer compresses to is now
+noted once beside the blob, a hit trusts the store as a `run` of a
+pulled image already does, and a `COPY --from` is keyed on the chain of
+the stage it reads.
 
 Thirteen Dockerfiles from a production monorepo were then read with
 `build --check` and three built. All thirteen parse. The exercise found
@@ -348,9 +358,10 @@ work not yet done — `research/pass-2/RND.md` §19 says which are which.
   `--mount=type=ssh` and a bind mount from another stage: stages, `COPY
   --from`, `--target`, `.dockerignore`, `ONBUILD`, `ADD <url>`, cache, secret
   and context bind mounts, and a layer cache are all there, and a stage the
-  image is not built from is skipped. What it still is not is a parallel
-  solver: the stages that are needed build one at a time, and there is no
-  remote cache import or export.
+  image is not built from is skipped. What it still is not is a full
+  solver: a stage that starts from an image is built alongside the ones
+  before it, but two stages that both start from another stage still take
+  turns, and there is no remote cache import or export.
 - **A real in-namespace resolver.** User-defined networks exist (stage 23) and
   containers on one find each other by name, but the mechanism is `/etc/hosts`,
   rewritten as containers come and go. Docker runs a resolver at 127.0.0.11

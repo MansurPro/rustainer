@@ -511,10 +511,12 @@ impl Store {
                 None => {
                     let gz = {
                         use std::io::Write;
-                        let mut e = flate2::write::GzEncoder::new(
-                            Vec::new(),
-                            flate2::Compression::default(),
-                        );
+                        // The fastest level. This runs in every build
+                        // and the blob is only read by a push, so the
+                        // trade is the build's seconds against a tenth
+                        // more to upload, once, later.
+                        let mut e =
+                            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
                         e.write_all(tar_bytes)
                             .map_err(io("compressing a layer", &dest))?;
                         e.finish().map_err(io("compressing a layer", &dest))?
