@@ -35,6 +35,9 @@ pub enum Instruction {
         caches: Vec<(String, String)>,
         /// `--network=<name>`, for this step only.
         network: Option<String>,
+        /// `--mount=type=secret`: `(id, target)`, a file the step can
+        /// read and the image never holds.
+        secrets: Vec<(String, String)>,
     },
     Copy {
         sources: Vec<String>,
@@ -199,6 +202,25 @@ fn leading_flags(rest: &str) -> (Vec<&str>, &str) {
     (flags, rest)
 }
 
+/// Every pair of an `ENV` or `LABEL`: `A=1 B="two words"` is two, and
+/// the legacy `KEY rest of the line` is one.
+fn key_values(rest: &str) -> Result<Vec<(String, String)>> {
+    let first = rest.split_whitespace().next().unwrap_or("");
+    if !first.contains('=') {
+        return key_value(rest)
+            .map(|kv| vec![kv])
+            .ok_or_else(|| anyhow::anyhow!("needs KEY=value"));
+    }
+    crate::compose::words(rest)?
+        .into_iter()
+        .map(|w| {
+            w.split_once('=')
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .ok_or_else(|| anyhow::anyhow!("{w:?} is not KEY=value"))
+        })
+        .collect()
+}
+
 pub fn parse(text: &str) -> Result<Vec<Instruction>> {
     let mut out = Vec::new();
     // What the shell form is wrapped in: `SHELL` changes it, for the
@@ -237,7 +259,7 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
             }
             "RUN" => {
                 let (flags, rest) = leading_flags(rest);
-                let (mut caches, mut network) = (Vec::new(), None);
+                let (mut caches, mut secrets, mut network) = (Vec::new(), Vec::new(), None);
                 for f in flags {
                     if let Some(n) = f.strip_prefix("--network=") {
                         network = Some(n.to_owned());
@@ -253,9 +275,21 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                             (Some("cache"), Some(t)) => {
                                 caches.push((opt(&["id"]).unwrap_or_else(|| t.clone()), t));
                             }
+                            (Some("secret"), target) => {
+                                let id = opt(&["id"])
+                                    .or_else(|| {
+                                        let t = target.as_ref()?;
+                                        Some(t.rsplit('/').next()?.to_owned())
+                                    })
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("{}: a secret mount needs an id", at())
+                                    })?;
+                                let target = target.unwrap_or_else(|| format!("/run/secrets/{id}"));
+                                secrets.push((id, target));
+                            }
                             (kind, _) => bail!(
-                                "{}: RUN --mount of type {} is not implemented; only \
-                                 type=cache,target=<path> is",
+                                "{}: RUN --mount of type {} is not implemented; \
+                                 type=cache and type=secret are",
                                 at(),
                                 kind.unwrap_or("bind")
                             ),
@@ -274,6 +308,7 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                     argv: exec_form(rest)?.unwrap_or_else(|| wrap(rest)),
                     caches,
                     network,
+                    secrets,
                 }
             }
             "COPY" | "ADD" => {
@@ -320,15 +355,14 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                     unpack: keyword == "ADD",
                 }
             }
-            "ENV" => {
-                let (k, v) = key_value(rest)
-                    .ok_or_else(|| anyhow::anyhow!("{}: ENV needs KEY=value", at()))?;
-                Instruction::Env(k, v)
-            }
-            "LABEL" => {
-                let (k, v) = key_value(rest)
-                    .ok_or_else(|| anyhow::anyhow!("{}: LABEL needs key=value", at()))?;
-                Instruction::Label(k, v)
+            "ENV" | "LABEL" => {
+                let pairs =
+                    key_values(rest).map_err(|e| anyhow::anyhow!("{}: {keyword} {e}", at()))?;
+                out.extend(pairs.into_iter().map(|(k, v)| match keyword.as_str() {
+                    "ENV" => Instruction::Env(k, v),
+                    _ => Instruction::Label(k, v),
+                }));
+                continue;
             }
             "ARG" => match rest.split_once('=') {
                 Some((k, v)) => Instruction::Arg(k.trim().to_owned(), Some(v.trim().to_owned())),
@@ -445,6 +479,7 @@ mod tests {
                 ],
                 caches: vec![],
                 network: None,
+                secrets: vec![],
             }
         );
     }
@@ -458,6 +493,7 @@ mod tests {
                 argv: vec!["/bin/sh".into(), "-c".into(), "echo hi && echo bye".into()],
                 caches: vec![],
                 network: None,
+                secrets: vec![],
             }
         );
         // No shell, so `&&` is just two words inside one argument.
@@ -467,6 +503,7 @@ mod tests {
                 argv: vec!["echo".into(), "hi && bye".into()],
                 caches: vec![],
                 network: None,
+                secrets: vec![],
             }
         );
     }
@@ -498,10 +535,7 @@ mod tests {
     fn instructions_we_do_not_implement_are_refused_by_name() {
         // Not skipped. An image that quietly ignored HEALTHCHECK is not
         // the image the file describes.
-        for line in [
-            "ONBUILD RUN x",
-            "RUN --mount=type=secret,id=k cat /run/secrets/k",
-        ] {
+        for line in ["ONBUILD RUN x", "RUN --mount=type=ssh git clone x"] {
             let e = parse(&format!("FROM a\n{line}\n")).unwrap_err().to_string();
             assert!(e.contains("not implemented"), "{line}: {e}");
         }
@@ -535,6 +569,7 @@ mod tests {
                 argv: vec!["/bin/bash".into(), "-c".into(), "pip install x".into()],
                 caches: vec![("/root/.cache".into(), "/root/.cache".into())],
                 network: Some("none".into()),
+                secrets: vec![],
             }
         );
         assert!(
@@ -563,6 +598,25 @@ mod tests {
         assert_eq!(seconds("500ms"), Some(1));
         assert_eq!(seconds("2h"), Some(7200));
         assert_eq!(seconds("soon"), None);
+    }
+
+    #[test]
+    fn one_env_may_set_several_variables() {
+        // The form most real files use, and one that used to give a
+        // single variable whose value was the rest of the line.
+        let d = parse(
+            "FROM a\nENV A=1 \\\n    B=\"two words\" \\\n    PATH=/x:$PATH\n\
+             LABEL org.x=y  z=w\n\
+             RUN --mount=type=secret,id=npm,target=/root/.npmrc --mount=type=secret,id=tok npm ci\n",
+        )
+        .unwrap();
+        assert_eq!(d[1], Instruction::Env("A".into(), "1".into()));
+        assert_eq!(d[2], Instruction::Env("B".into(), "two words".into()));
+        assert_eq!(d[3], Instruction::Env("PATH".into(), "/x:$PATH".into()));
+        assert_eq!(d[5], Instruction::Label("z".into(), "w".into()));
+        assert!(matches!(&d[6], Instruction::Run { secrets, .. }
+            if secrets == &[("npm".to_owned(), "/root/.npmrc".to_owned()),
+                            ("tok".to_owned(), "/run/secrets/tok".to_owned())]));
     }
 
     #[test]

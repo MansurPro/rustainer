@@ -692,7 +692,7 @@ fn words_or_list(v: &J) -> Result<Vec<String>> {
     }
 }
 
-fn words(s: &str) -> Result<Vec<String>> {
+pub(crate) fn words(s: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut cur: Option<String> = None;
     let mut quote: Option<char> = None;

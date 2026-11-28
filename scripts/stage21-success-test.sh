@@ -431,6 +431,37 @@ RSEND
 )
 check "and a later build finds what it left" "$(rrun rest:2 cat /cache-lines | tr -d ' ')" "2"
 
+# A secret is a file one step can read and no layer holds.
+echo "s3cr3t-from-a-file" > "$SCRATCH/tok.txt"
+{ printf 'FROM %s\n' "$IMG"; cat <<'RSEND'
+ENV A=1 B="two words" \
+    C=3
+RUN --mount=type=secret,id=tok --mount=type=secret,id=envtok,target=/etc/envtok \
+    sh -c 'cat /run/secrets/tok /etc/envtok | grep -c s3cr3t > /secret-lines; echo "$A/$B/$C" > /env-pairs'
+RUN --mount=type=secret,id=absent sh -c 'test -e /run/secrets/absent || echo none > /absent'
+RSEND
+} > "$R/Dockerfile"
+OUT=$(MY_TOKEN="s3cr3t-from-the-environment" timeout 600 "$B" build --network none \
+    --secret "id=tok,src=$SCRATCH/tok.txt" --secret id=envtok,env=MY_TOKEN -t rest:3 "$R" 2>&1); RC=$?
+check "a build given secrets builds" "$RC" "0"
+[ "$RC" -eq 0 ] || echo "$OUT" | tail -5
+check "the step could read both, from a file and from the environment" "$(rrun rest:3 cat /secret-lines | tr -d ' ')" "2"
+check "and the image holds neither" \
+    "$(rrun rest:3 sh -c 'cat /run/secrets/tok /etc/envtok 2>/dev/null | wc -c' | tr -d ' ')" "0"
+if grep -rqs -e s3cr3t-from "$RUSTAINER_IMAGE_ROOT" 2>/dev/null; then
+    bad "nor does anything in the image store"
+else
+    ok "nor does anything in the image store"
+fi
+check "a secret the build was not given is simply absent" "$(rrun rest:3 cat /absent)" "none"
+check "one ENV sets several variables" "$(rrun rest:3 cat /env-pairs)" "1/two words/3"
+check "and each is in the image's environment" "$(rrun rest:3 sh -c 'echo "$B"')" "two words"
+contains "--check reads a file and builds nothing" \
+    "$("$B" build --check "$R" 2>&1)" "nothing this engine refuses"
+printf 'FROM %s\nONBUILD RUN true\n' "$IMG" > "$R/Dockerfile"
+refuses "and says what is wrong with one" "not implemented" "$B" build --check "$R"
+refuses "a build with no name is refused" "needs a name" "$B" build "$R"
+
 # The image's own healthcheck runs without being asked for.
 HC=$("$B" run -d --network none rest:1 2>/dev/null | tail -1)
 health() { cat "$RUSTAINER_ROOT/containers/$1/health" 2>/dev/null || cat "$RUSTAINER_ROOT/$1/health" 2>/dev/null; }
