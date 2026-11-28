@@ -15,7 +15,7 @@
 //!   and so does no globbing, no `&&`, no variable expansion. They are
 //!   different instructions that look alike.
 //! - **Unknown instructions are refused, not skipped.** A Dockerfile with
-//!   `HEALTHCHECK` in it does not do what it says here, and silently
+//!   `ONBUILD` in it does not do what it says here, and silently
 //!   ignoring the line produces an image that is wrong in a way nobody
 //!   will notice until production.
 
@@ -27,14 +27,36 @@ pub enum Instruction {
         image: String,
         alias: Option<String>,
     },
-    /// Already resolved to an argv: shell form has been wrapped.
-    Run(Vec<String>),
+    Run {
+        /// Already resolved to an argv: shell form has been wrapped.
+        argv: Vec<String>,
+        /// `--mount=type=cache`: `(id, target)`, a directory that
+        /// outlives the step and is not part of the layer.
+        caches: Vec<(String, String)>,
+        /// `--network=<name>`, for this step only.
+        network: Option<String>,
+    },
     Copy {
         sources: Vec<String>,
         dest: String,
         /// `--from=<stage or image>`: read from there, not the context.
         from: Option<String>,
+        /// `--chown=<user>[:<group>]`, names or numbers.
+        chown: Option<String>,
+        /// `--chmod=<octal>`.
+        chmod: Option<String>,
+        /// `ADD`, which unpacks a local tar archive where COPY copies it.
+        unpack: bool,
     },
+    /// The command that says whether the container is well, as an argv;
+    /// empty for `HEALTHCHECK NONE`. Times in seconds.
+    Healthcheck {
+        test: Vec<String>,
+        interval: u64,
+        retries: u64,
+    },
+    StopSignal(String),
+    Volume(Vec<String>),
     Env(String, String),
     Workdir(String),
     Cmd(Vec<String>),
@@ -136,8 +158,53 @@ fn key_value(rest: &str) -> Option<(String, String)> {
     Some((k.to_owned(), unquote(v)))
 }
 
+/// `1m30s`, `500ms`, `45` - whole seconds, rounded up so that a
+/// sub-second interval is not "never wait".
+fn seconds(s: &str) -> Option<u64> {
+    let (mut total_ms, mut digits) = (0u64, String::new());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        let n: u64 = digits.parse().ok()?;
+        digits.clear();
+        total_ms += match c {
+            'h' => n * 3_600_000,
+            'm' if chars.peek() == Some(&'s') => {
+                chars.next();
+                n
+            }
+            'm' => n * 60_000,
+            's' => n * 1000,
+            _ => return None,
+        };
+    }
+    if !digits.is_empty() {
+        total_ms += digits.parse::<u64>().ok()? * 1000;
+    }
+    Some(total_ms.div_ceil(1000))
+}
+
+/// Split the `--flag=value` words off the front of an instruction.
+fn leading_flags(rest: &str) -> (Vec<&str>, &str) {
+    let mut flags = Vec::new();
+    let mut rest = rest.trim_start();
+    while rest.starts_with("--") {
+        let (flag, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        flags.push(flag);
+        rest = after.trim_start();
+    }
+    (flags, rest)
+}
+
 pub fn parse(text: &str) -> Result<Vec<Instruction>> {
     let mut out = Vec::new();
+    // What the shell form is wrapped in: `SHELL` changes it, for the
+    // rest of the stage.
+    let default_shell = || vec!["/bin/sh".to_owned(), "-c".to_owned()];
+    let mut shell = default_shell();
     for (line_no, line) in logical_lines(text) {
         let (word, rest) = match line.split_once(char::is_whitespace) {
             Some((w, r)) => (w, r.trim()),
@@ -145,6 +212,11 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
         };
         let keyword = word.to_ascii_uppercase();
         let at = || format!("line {line_no}");
+        let wrap = |rest: &str| -> Vec<String> {
+            let mut v = shell.clone();
+            v.push(rest.to_owned());
+            v
+        };
 
         let instruction = match keyword.as_str() {
             "FROM" => {
@@ -160,40 +232,70 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                     (None, _) => None,
                     _ => bail!("{}: FROM takes an image, optionally `AS <name>`", at()),
                 };
+                shell = default_shell();
                 Instruction::From { image, alias }
             }
             "RUN" => {
+                let (flags, rest) = leading_flags(rest);
+                let (mut caches, mut network) = (Vec::new(), None);
+                for f in flags {
+                    if let Some(n) = f.strip_prefix("--network=") {
+                        network = Some(n.to_owned());
+                    } else if let Some(m) = f.strip_prefix("--mount=") {
+                        let opt = |keys: &[&str]| {
+                            m.split(',')
+                                .filter_map(|kv| kv.split_once('='))
+                                .find(|(k, _)| keys.contains(k))
+                                .map(|(_, v)| v.to_owned())
+                        };
+                        let target = opt(&["target", "dst", "destination"]);
+                        match (opt(&["type"]).as_deref(), target) {
+                            (Some("cache"), Some(t)) => {
+                                caches.push((opt(&["id"]).unwrap_or_else(|| t.clone()), t));
+                            }
+                            (kind, _) => bail!(
+                                "{}: RUN --mount of type {} is not implemented; only \
+                                 type=cache,target=<path> is",
+                                at(),
+                                kind.unwrap_or("bind")
+                            ),
+                        }
+                    } else {
+                        bail!("{}: {f} is not a RUN option this engine knows", at());
+                    }
+                }
                 if rest.is_empty() {
                     bail!("{}: RUN needs a command", at());
                 }
-                Instruction::Run(exec_form(rest)?.unwrap_or_else(|| {
-                    // Shell form. The wrapping is the whole difference:
-                    // `&&`, globs and redirection only work because a
-                    // shell is there to do them.
-                    vec!["/bin/sh".into(), "-c".into(), rest.to_owned()]
-                }))
+                // Shell form unless it is a list. The wrapping is the
+                // whole difference: `&&`, globs and redirection only work
+                // because a shell is there to do them.
+                Instruction::Run {
+                    argv: exec_form(rest)?.unwrap_or_else(|| wrap(rest)),
+                    caches,
+                    network,
+                }
             }
             "COPY" | "ADD" => {
-                let mut from = None;
-                let mut words: Vec<String> = Vec::new();
-                for w in rest.split_whitespace() {
-                    if let Some(v) = w.strip_prefix("--from=") {
+                let (flags, rest) = leading_flags(rest);
+                let (mut from, mut chown, mut chmod) = (None, None, None);
+                for f in flags {
+                    if let Some(v) = f.strip_prefix("--from=") {
                         from = Some(v.to_owned());
-                    } else if w.starts_with("--chown=") || w.starts_with("--chmod=") {
-                        bail!(
-                            "{}: {w} is not implemented. The file's ownership is \
-                             whatever the build produced; set it with a RUN chown.",
-                            at()
-                        );
-                    } else if w.starts_with("--") {
-                        bail!("{}: {w} is not a {keyword} option this engine knows", at());
-                    } else {
-                        words.push(w.to_owned());
+                    } else if let Some(v) = f.strip_prefix("--chown=") {
+                        chown = Some(v.to_owned());
+                    } else if let Some(v) = f.strip_prefix("--chmod=") {
+                        chmod = Some(v.to_owned());
+                    } else if f != "--link" {
+                        // --link only changes how BuildKit stores the
+                        // layer, not what is in it.
+                        bail!("{}: {f} is not a {keyword} option this engine knows", at());
                     }
                 }
-                if let Some(list) = exec_form(rest)? {
-                    words = list;
-                }
+                let mut words = match exec_form(rest)? {
+                    Some(list) => list,
+                    None => rest.split_whitespace().map(str::to_owned).collect(),
+                };
                 if words.len() < 2 {
                     bail!(
                         "{}: {keyword} needs at least a source and a destination",
@@ -213,6 +315,9 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                     sources: words,
                     dest,
                     from,
+                    chown,
+                    chmod,
+                    unpack: keyword == "ADD",
                 }
             }
             "ENV" => {
@@ -243,19 +348,59 @@ pub fn parse(text: &str) -> Result<Vec<Instruction>> {
                 Instruction::User(rest.to_owned())
             }
             "EXPOSE" => Instruction::Expose(rest.to_owned()),
-            "CMD" => Instruction::Cmd(
-                exec_form(rest)?
-                    .unwrap_or_else(|| vec!["/bin/sh".into(), "-c".into(), rest.to_owned()]),
-            ),
-            "ENTRYPOINT" => Instruction::Entrypoint(
-                exec_form(rest)?
-                    .unwrap_or_else(|| vec!["/bin/sh".into(), "-c".into(), rest.to_owned()]),
-            ),
+            "CMD" => Instruction::Cmd(exec_form(rest)?.unwrap_or_else(|| wrap(rest))),
+            "ENTRYPOINT" => Instruction::Entrypoint(exec_form(rest)?.unwrap_or_else(|| wrap(rest))),
+            "SHELL" => {
+                shell = exec_form(rest)?.filter(|l| !l.is_empty()).ok_or_else(|| {
+                    anyhow::anyhow!("{}: SHELL takes a list: [\"/bin/bash\", \"-c\"]", at())
+                })?;
+                continue;
+            }
+            "MAINTAINER" => Instruction::Label("maintainer".into(), rest.to_owned()),
+            "STOPSIGNAL" => {
+                if rest.is_empty() {
+                    bail!("{}: STOPSIGNAL needs a signal", at());
+                }
+                Instruction::StopSignal(rest.to_owned())
+            }
+            "VOLUME" => Instruction::Volume(match exec_form(rest)? {
+                Some(list) => list,
+                None => rest.split_whitespace().map(str::to_owned).collect(),
+            }),
+            "HEALTHCHECK" => {
+                let (flags, rest) = leading_flags(rest);
+                let (mut interval, mut retries) = (30, 3);
+                for f in flags {
+                    let (k, v) = f.split_once('=').unwrap_or((f, ""));
+                    let bad = || anyhow::anyhow!("{}: {f} is not a time or a count", at());
+                    match k {
+                        "--interval" => interval = seconds(v).ok_or_else(bad)?,
+                        "--retries" => retries = v.parse().map_err(|_| bad())?,
+                        // ponytail: a probe runs until it answers and a
+                        // new container is `starting` until its retries
+                        // run out, so these two have nothing to set.
+                        "--timeout" | "--start-period" | "--start-interval" => {}
+                        _ => bail!("{}: {f} is not a HEALTHCHECK option", at()),
+                    }
+                }
+                let (word, cmd) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                let test = match word.to_ascii_uppercase().as_str() {
+                    "NONE" => Vec::new(),
+                    "CMD" if !cmd.trim().is_empty() => {
+                        exec_form(cmd)?.unwrap_or_else(|| wrap(cmd.trim()))
+                    }
+                    _ => bail!("{}: HEALTHCHECK takes `CMD <command>` or `NONE`", at()),
+                };
+                Instruction::Healthcheck {
+                    test,
+                    interval,
+                    retries,
+                }
+            }
             // Named rather than ignored. An image built from a Dockerfile
             // containing one of these does not do what the file says, and
             // skipping the line quietly is how that reaches production.
-            "HEALTHCHECK" | "ONBUILD" | "SHELL" | "STOPSIGNAL" | "VOLUME" | "MAINTAINER"
-            | "CROSS_BUILD" => {
+            "ONBUILD" | "CROSS_BUILD" => {
                 bail!(
                     "{}: {keyword} is not implemented. It is skipped by no part of \
                      this engine - an image that silently ignored it would not be \
@@ -292,11 +437,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             d[1],
-            Instruction::Run(vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "apk add curl && apk add jq".into()
-            ])
+            Instruction::Run {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "apk add curl && apk add jq".into()
+                ],
+                caches: vec![],
+                network: None,
+            }
         );
     }
 
@@ -305,16 +454,20 @@ mod tests {
         let d = parse("FROM a\nRUN echo hi && echo bye\nRUN [\"echo\", \"hi && bye\"]\n").unwrap();
         assert_eq!(
             d[1],
-            Instruction::Run(vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "echo hi && echo bye".into()
-            ])
+            Instruction::Run {
+                argv: vec!["/bin/sh".into(), "-c".into(), "echo hi && echo bye".into()],
+                caches: vec![],
+                network: None,
+            }
         );
         // No shell, so `&&` is just two words inside one argument.
         assert_eq!(
             d[2],
-            Instruction::Run(vec!["echo".into(), "hi && bye".into()])
+            Instruction::Run {
+                argv: vec!["echo".into(), "hi && bye".into()],
+                caches: vec![],
+                network: None,
+            }
         );
     }
 
@@ -334,6 +487,9 @@ mod tests {
                 sources: vec!["a.txt".into(), "b.txt".into()],
                 dest: "/dst/".into(),
                 from: None,
+                chown: None,
+                chmod: None,
+                unpack: false,
             }
         );
     }
@@ -342,7 +498,10 @@ mod tests {
     fn instructions_we_do_not_implement_are_refused_by_name() {
         // Not skipped. An image that quietly ignored HEALTHCHECK is not
         // the image the file describes.
-        for line in ["HEALTHCHECK CMD true", "ONBUILD RUN x", "VOLUME /data"] {
+        for line in [
+            "ONBUILD RUN x",
+            "RUN --mount=type=secret,id=k cat /run/secrets/k",
+        ] {
             let e = parse(&format!("FROM a\n{line}\n")).unwrap_err().to_string();
             assert!(e.contains("not implemented"), "{line}: {e}");
         }
@@ -352,6 +511,58 @@ mod tests {
         assert!(e.contains("no checksum"), "{e}");
         let e = parse("FROM a\nFROB x\n").unwrap_err().to_string();
         assert!(e.contains("not a Dockerfile instruction"), "{e}");
+    }
+
+    #[test]
+    fn the_rest_of_the_language() {
+        let d = parse(
+            "FROM a\n\
+             SHELL [\"/bin/bash\", \"-c\"]\n\
+             RUN --mount=type=cache,target=/root/.cache --network=none pip install x\n\
+             COPY --chown=app:app --chmod=755 --link run.sh /usr/bin/\n\
+             HEALTHCHECK --interval=1m30s --timeout=3s --retries=5 CMD curl -f localhost\n\
+             HEALTHCHECK NONE\n\
+             VOLUME /data /logs\n\
+             STOPSIGNAL SIGQUIT\n\
+             MAINTAINER someone\n\
+             FROM b\n\
+             RUN true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            d[1],
+            Instruction::Run {
+                argv: vec!["/bin/bash".into(), "-c".into(), "pip install x".into()],
+                caches: vec![("/root/.cache".into(), "/root/.cache".into())],
+                network: Some("none".into()),
+            }
+        );
+        assert!(
+            matches!(&d[2], Instruction::Copy { chown: Some(o), chmod: Some(m), unpack: false, .. } if o == "app:app" && m == "755")
+        );
+        assert_eq!(
+            d[3],
+            Instruction::Healthcheck {
+                test: vec!["/bin/bash".into(), "-c".into(), "curl -f localhost".into()],
+                interval: 90,
+                retries: 5,
+            }
+        );
+        assert!(matches!(&d[4], Instruction::Healthcheck { test, .. } if test.is_empty()));
+        assert_eq!(
+            d[5],
+            Instruction::Volume(vec!["/data".into(), "/logs".into()])
+        );
+        assert_eq!(d[6], Instruction::StopSignal("SIGQUIT".into()));
+        assert_eq!(
+            d[7],
+            Instruction::Label("maintainer".into(), "someone".into())
+        );
+        // SHELL lasts for its stage, not the file.
+        assert!(matches!(&d[9], Instruction::Run { argv, .. } if argv[0] == "/bin/sh"));
+        assert_eq!(seconds("500ms"), Some(1));
+        assert_eq!(seconds("2h"), Some(7200));
+        assert_eq!(seconds("soon"), None);
     }
 
     #[test]

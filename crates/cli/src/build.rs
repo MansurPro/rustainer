@@ -40,6 +40,10 @@ pub struct Built {
     pub entrypoint: Vec<String>,
     pub labels: BTreeMap<String, String>,
     pub exposed: Vec<String>,
+    /// `(argv, interval, retries)`; an empty argv is `HEALTHCHECK NONE`.
+    pub healthcheck: Option<(Vec<String>, u64, u64)>,
+    pub stop_signal: Option<String>,
+    pub volumes: Vec<String>,
 }
 
 /// Substitute `$VAR` and `${VAR}` from the build arguments.
@@ -504,6 +508,84 @@ pub fn copy_merged(layers: &[PathBuf], rel: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `--chown=<user>[:<group>]` as numbers, the names looked up in the
+/// image being built, which is the only place they mean anything.
+pub fn owner(layers: &[PathBuf], spec: &str) -> Result<(u32, u32)> {
+    let id = |name: &str, file: &str| -> Result<u32> {
+        if let Ok(n) = name.parse() {
+            return Ok(n);
+        }
+        let text = visible(layers, Path::new(file))
+            .first()
+            // Not through a link: that would read the host's file.
+            .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        text.lines()
+            .map(|l| l.split(':').collect::<Vec<_>>())
+            .find(|f| f.first() == Some(&name))
+            .and_then(|f| f.get(2)?.parse().ok())
+            .with_context(|| format!("--chown: the image's /{file} has no {name:?}"))
+    };
+    let (user, group) = spec.split_once(':').unwrap_or((spec, ""));
+    let uid = id(user, "etc/passwd")?;
+    // No group means the same number as the user, as Docker has it.
+    let gid = if group.is_empty() {
+        uid
+    } else {
+        id(group, "etc/group")?
+    };
+    Ok((uid, gid))
+}
+
+/// Apply `--chown` and `--chmod` to everything a COPY just wrote.
+pub fn retouch(path: &Path, owner: Option<(u32, u32)>, mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let md = std::fs::symlink_metadata(path)?;
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+            .with_context(|| format!("--chown on {} (it needs root)", path.display()))?;
+    }
+    if let Some(mode) = mode
+        && !md.file_type().is_symlink()
+    {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    if md.is_dir() {
+        for e in std::fs::read_dir(path)? {
+            retouch(&e?.path(), owner, mode)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `ADD` unpacks this rather than copying it.
+// ponytail: decided by the name and limited to tar and tar.gz, where
+// Docker sniffs the content and also takes bzip2 and xz.
+pub fn is_archive(path: &Path) -> bool {
+    let name = path.to_string_lossy();
+    path.is_file()
+        && [".tar", ".tar.gz", ".tgz"]
+            .iter()
+            .any(|e| name.ends_with(e))
+}
+
+/// Unpack a tar archive into `dest`: what `ADD` does with one.
+pub fn unpack(archive: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    let file = std::fs::File::open(archive)?;
+    let reader: Box<dyn std::io::Read> = if archive.extension().is_some_and(|e| e == "tar") {
+        Box::new(file)
+    } else {
+        Box::new(flate2::read::GzDecoder::new(file))
+    };
+    let mut tar = tar::Archive::new(reader);
+    tar.set_preserve_permissions(true);
+    // `unpack` refuses an entry that would land outside `dest`.
+    tar.unpack(dest)?;
+    Ok(())
+}
+
 /// Copy a file or directory tree into `dest`, preserving modes and
 /// leaving out what `ignore` names.
 pub fn copy_into(src: &Path, dest: &Path, ignore: Option<&Ignore>) -> Result<()> {
@@ -568,11 +650,12 @@ pub fn settle_directory_times(dir: &Path) {
 pub fn describe(i: &Instruction) -> String {
     match i {
         Instruction::From { image, .. } => format!("FROM {image}"),
-        Instruction::Run(argv) => format!("RUN {}", argv.join(" ")),
+        Instruction::Run { argv, .. } => format!("RUN {}", argv.join(" ")),
         Instruction::Copy {
             sources,
             dest,
             from,
+            ..
         } => {
             let from = from
                 .as_ref()
@@ -588,6 +671,10 @@ pub fn describe(i: &Instruction) -> String {
         Instruction::Expose(p) => format!("EXPOSE {p}"),
         Instruction::Label(k, v) => format!("LABEL {k}={v}"),
         Instruction::Arg(k, _) => format!("ARG {k}"),
+        Instruction::Healthcheck { test, .. } if test.is_empty() => "HEALTHCHECK NONE".into(),
+        Instruction::Healthcheck { test, .. } => format!("HEALTHCHECK CMD {}", test.join(" ")),
+        Instruction::StopSignal(s) => format!("STOPSIGNAL {s}"),
+        Instruction::Volume(v) => format!("VOLUME {}", v.join(" ")),
     }
 }
 

@@ -111,7 +111,40 @@ pub struct Materialised {
     pub cmd: Vec<String>,
     pub working_dir: Option<String>,
     pub user: Option<String>,
+    /// The image's own healthcheck, if it has one.
+    pub healthcheck: Option<Health>,
     pub report: extract::Report,
+}
+
+/// A healthcheck ready to run: the command as an argv, times in seconds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Health {
+    pub test: Vec<String>,
+    pub interval: u64,
+    pub retries: u64,
+}
+
+impl Health {
+    fn from_config(h: registry::HealthConfig) -> Option<Self> {
+        let test = h.test.unwrap_or_default();
+        let test = match test.split_first() {
+            Some((kind, rest)) if kind == "CMD" && !rest.is_empty() => rest.to_vec(),
+            Some((kind, [cmd])) if kind == "CMD-SHELL" => {
+                vec!["/bin/sh".into(), "-c".into(), cmd.clone()]
+            }
+            // NONE, or nothing: the image says not to check.
+            _ => return None,
+        };
+        Some(Self {
+            test,
+            // Zero is how a config says "the default", which is Docker's.
+            interval: h
+                .interval
+                .filter(|n| *n > 0)
+                .map_or(30, |n| n.div_ceil(1_000_000_000)),
+            retries: h.retries.filter(|n| *n > 0).unwrap_or(3),
+        })
+    }
 }
 
 impl Materialised {
@@ -754,6 +787,7 @@ impl Store {
             // uid`, which blames the user for a field they never typed.
             working_dir: c.working_dir.filter(|s| !s.is_empty()),
             user: c.user.filter(|s| !s.is_empty()),
+            healthcheck: c.healthcheck.and_then(Health::from_config),
             report,
         })
     }
@@ -848,9 +882,26 @@ mod tests {
             cmd: vec!["echo hi".into()],
             working_dir: None,
             user: None,
+            healthcheck: None,
             report: extract::Report::default(),
         };
         assert_eq!(m.command(), vec!["/bin/sh", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn a_healthcheck_is_read_the_way_images_write_it() {
+        let h = |json: &str| Health::from_config(serde_json::from_str(json).unwrap());
+        assert_eq!(
+            h(r#"{"Test":["CMD-SHELL","curl -f localhost"],"Interval":5000000000,"Retries":0}"#),
+            Some(Health {
+                test: vec!["/bin/sh".into(), "-c".into(), "curl -f localhost".into()],
+                interval: 5,
+                retries: 3,
+            })
+        );
+        assert_eq!(h(r#"{"Test":["CMD","/ok"]}"#).unwrap().interval, 30);
+        assert_eq!(h(r#"{"Test":["NONE"]}"#), None);
+        assert_eq!(h("{}"), None);
     }
 
     #[test]
@@ -864,6 +915,7 @@ mod tests {
             cmd: vec!["/bin/sh".into()],
             working_dir: None,
             user: None,
+            healthcheck: None,
             report: extract::Report::default(),
         };
         assert_eq!(m.command(), vec!["/bin/sh"]);

@@ -296,6 +296,20 @@ pub struct ConfigSection {
     pub working_dir: Option<String>,
     #[serde(default, rename = "User")]
     pub user: Option<String>,
+    #[serde(default, rename = "Healthcheck")]
+    pub healthcheck: Option<HealthConfig>,
+}
+
+/// `HEALTHCHECK`, as an image config spells it: `Test` begins with
+/// `CMD`, `CMD-SHELL` or `NONE`, and the times are nanoseconds.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct HealthConfig {
+    #[serde(default, rename = "Test")]
+    pub test: Option<Vec<String>>,
+    #[serde(default, rename = "Interval")]
+    pub interval: Option<u64>,
+    #[serde(default, rename = "Retries")]
+    pub retries: Option<u64>,
 }
 
 pub struct Client {
