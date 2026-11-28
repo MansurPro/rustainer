@@ -21,6 +21,17 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+      # The binary this project ships is the static one, and musl's libc
+      # bindings are a subset of glibc's: a function that exists in one
+      # and not the other compiles everywhere above and nowhere that
+      # matters. It did, once, for a day.
+      - name: The static (musl) build compiles
+        run: |
+          sudo apt-get -qq install -y musl-tools >/dev/null
+          rustup target add x86_64-unknown-linux-musl
+          CC_x86_64_unknown_linux_musl=musl-gcc \
+            cargo build --release --target x86_64-unknown-linux-musl
+
       # RND.md section 18.3 and 15.8: "no async runtime near clone3" must be a
       # build failure, not a review rule. Threads cannot be un-spawned,
       # several namespace operations require a single-threaded caller, and a
