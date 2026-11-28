@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod build;
+mod cdi;
 mod compose;
 mod dockerfile;
 mod stack;
@@ -1726,11 +1727,56 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         .with_context(|| format!("container {id} already exists"))?;
 
     let (seccomp_profile, seccomp_unconfined) = resolve_seccomp(&args.security_opt)?;
+    // Devices named the way their vendor describes them, and `--gpus`
+    // when the vendor has described this machine's: see `cdi`.
+    let mut cdi_names: Vec<String> = args
+        .devices
+        .iter()
+        .filter(|d| cdi::is_name(d))
+        .cloned()
+        .collect();
+    let gpus_by_spec = args.gpus.is_some() && cdi::has_kind("nvidia.com/gpu");
+    if gpus_by_spec {
+        cdi_names.push("nvidia.com/gpu=all".into());
+    }
+    let cdi = cdi::resolve(&cdi_names)?;
+    for note in &cdi.notes {
+        eprintln!("rustainer: {note}");
+    }
+    if !layers.is_empty() {
+        // Links go into the container's own layer before it starts.
+        let upper = Store::default_root()
+            .join("containers")
+            .join(&id)
+            .join("upper");
+        for (path, target) in &cdi.links {
+            let Ok(rel) = path.strip_prefix("/") else {
+                continue;
+            };
+            if rel.components().any(|c| c.as_os_str() == "..") {
+                continue;
+            }
+            let at = upper.join(rel);
+            if let Some(parent) = at.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let _ = std::fs::remove_file(&at);
+            std::os::unix::fs::symlink(target, &at)
+                .with_context(|| format!("linking {} for a device", path.display()))?;
+        }
+    }
+    let cdi_env = cdi.env.clone();
     let volumes = args
         .volumes
         .iter()
         .map(|v| parse_volume(v))
-        .chain(args.devices.iter().map(|d| parse_device(d)))
+        .chain(
+            args.devices
+                .iter()
+                .filter(|d| !cdi::is_name(d))
+                .map(|d| parse_device(d)),
+        )
+        .chain(cdi.mounts.into_iter().map(Ok))
         .chain(args.tmpfs.iter().map(|t| parse_tmpfs(t)))
         // Mounted after the default 64m one, and so over it.
         .chain(
@@ -1741,7 +1787,11 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
         // The host's IPC namespace is not much use without the host's
         // shared memory files.
         .chain((args.ipc.as_deref() == Some("host")).then(|| parse_volume("/dev/shm:/dev/shm")))
-        .chain(gpu_devices(args.gpus.as_deref())?.into_iter().map(Ok))
+        .chain(
+            gpu_devices(args.gpus.as_deref().filter(|_| !gpus_by_spec))?
+                .into_iter()
+                .map(Ok),
+        )
         .collect::<Result<Vec<_>>>()?;
     let volumes = with_image_data(volumes, &image_volumes, &layers, &id)?;
     // A stack file reaches here without clap's list of values, and
@@ -1801,13 +1851,18 @@ fn cmd_run(paths: &Paths, args: RunArgs) -> Result<ExitCode> {
             // own environment, and dropped if we do not have one. It is
             // how a secret reaches a container without being written
             // on a command line that `ps` shows to everybody.
-            let wanted: Vec<String> = args
-                .env
-                .iter()
-                .filter_map(|e| match e.contains('=') {
+            // What a device asked for first, so that `-e` still wins.
+            let named = |e: &String, k: &str| e == k || e.starts_with(&format!("{k}="));
+            let wanted: Vec<String> = cdi_env
+                .into_iter()
+                .filter(|d| {
+                    let key = d.split('=').next().unwrap_or("");
+                    !args.env.iter().any(|e| named(e, key))
+                })
+                .chain(args.env.iter().filter_map(|e| match e.contains('=') {
                     true => Some(e.clone()),
                     false => std::env::var(e).ok().map(|v| format!("{e}={v}")),
-                })
+                }))
                 .collect();
             rustainer_core::exec::merge_env(&base, &wanted)
         },
